@@ -1,0 +1,69 @@
+//Reasoning
+
+Block ID's over 250 get bugged because 250 is where "Items" start. Items can't share the ID's of blocks. Nothing is allowed to share ID's 
+
+////////////////////////////////////////////////////////////////////////////////////////////
+
+//Block/Item Locations
+
+Blocks.cpp
+Blocks.h
+CraftWorld2.cpp
+StatePlayCreative.cpp
+Items.h
+Items.cpp
+
+////////////////////////////////////////////////////////////////////////////////////////////
+
+//Disabled Block/Items
+
+//BLOCKS
+
+OrangeGlassBlockPannel
+BrownGlassBlockPannel
+LGrayGlassBlockPannel
+DBlueGlassBlockPannel
+LBlueGlassBlockPannel
+DPurpleGlassBlockPannel
+DGreenGlassBlockPannel
+GrayGlassBlockPannel
+redstone_lamp
+lit_redstone_lamp
+light_gray_concrete_powder
+orange_concrete_powder
+light_blue_concrete_powder
+brown_concrete_powder
+WhiteGlassBlockPannel
+OrangeGlassBlock
+WhiteGlassBlock
+LGrayGlassBlock
+DBlueGlassBlock
+LBlueGlassBlock
+DPurpleGlassBlock
+DGreenGlassBlock
+GrayGlassBlock
+cyan_concrete_powder
+lime_concrete_powder
+magenta_concrete_powder
+
+//ITEMS
+
+OrangeGlassBlockPannelItem
+LGrayGlassBlockPannelItem
+DBlueGlassBlockPannelItem
+LBlueGlassBlockPannelItem
+DGreenGlassBlockPannelItem
+DPurpleGlassBlockPannelItem
+GrayGlassBlockPannelItem
+WhiteGlassBlockPannelItem
+BrownGlassBlockPannelItem
+
+//////////////////////////////////////////////////////////////////////////////////
+
+
+//What I've Tried To Resolve The Issue
+
+I've Tried
+-Changing all of the Items to even higher numbers. (Issue : Broke crafting system)
+-Making an Item cap so blocks could start over Item 411. (Issue : Source Code wouldn't compile)
+-Going to negative numbers after 249. (Issue : It just doesn't work)

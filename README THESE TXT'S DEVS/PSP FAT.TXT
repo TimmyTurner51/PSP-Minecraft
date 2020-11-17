@@ -1,0 +1,1 @@
+32mb RAM version needs the world size decreased to 112x98x112 many sounds need to be deleted to free more RAM. Decreasing world size makes "Chests" not open, so make sure to change "Chest2.cpp" to the correct world size.
