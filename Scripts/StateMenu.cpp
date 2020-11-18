@@ -3266,35 +3266,35 @@ void StateMenu::Draw(StateManager* sManager)
 
         if(mRender->GetFontLanguage() == ENGLISH)
         {
-			mRender->SetFontStyle(0.687, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
-			mRender->DebugPrint(40, 80 - 40, "-Performance Upgrade");
+			mRender->SetFontStyle(0.5, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
+			mRender->DebugPrint(40, 90 - 40, "-Performance Upgrade");
 
-			mRender->SetFontStyle(0.687, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
-			mRender->DebugPrint(40, 100 - 40, "-Fixed Incorrect Grammar");
+			mRender->SetFontStyle(0.5, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
+			mRender->DebugPrint(40, 105 - 40, "-Fixed Incorrect Grammar");
 
-			mRender->SetFontStyle(0.687, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
+			mRender->SetFontStyle(0.5, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
 			mRender->DebugPrint(40, 120 - 40, "-Fixed Headbob");
 
-			mRender->SetFontStyle(0.687, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
-			mRender->DebugPrint(40, 140 - 40, "-Fixed Loading Crash");
+			mRender->SetFontStyle(0.5, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
+			mRender->DebugPrint(40, 135 - 40, "-Fixed Loading Crash");
 
-			mRender->SetFontStyle(0.687, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
-			mRender->DebugPrint(40, 160 - 40, "-Fixed Fancy Graphics");
+			mRender->SetFontStyle(0.5, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
+			mRender->DebugPrint(40, 150 - 40, "-Fixed Fancy Graphics");
 
-			mRender->SetFontStyle(0.687, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
-			mRender->DebugPrint(40, 180 - 40, "-Changed Render Distance");
+			mRender->SetFontStyle(0.5, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
+			mRender->DebugPrint(40, 165 - 40, "-Changed Render Distance");
 
-			mRender->SetFontStyle(0.687, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
-			mRender->DebugPrint(40, 200 - 40, "-Changed Crop Breaking Time");
+			mRender->SetFontStyle(0.5, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
+			mRender->DebugPrint(40, 180 - 40, "-Changed Crop Breaking Time");
 
-			mRender->SetFontStyle(0.687, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
-			mRender->DebugPrint(40, 220 - 40, "-Changed Fog");
+			mRender->SetFontStyle(0.5, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
+			mRender->DebugPrint(40, 195 - 40, "-Changed Fog");
 
-			mRender->SetFontStyle(0.687, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
-			mRender->DebugPrint(40, 240 - 40, "-Changed HUD Size");
+			mRender->SetFontStyle(0.5, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
+			mRender->DebugPrint(40, 210 - 40, "-Changed HUD Size");
 
-			mRender->SetFontStyle(0.687, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
-			mRender->DebugPrint(40, 240 - 40, "-Changed Block Count (Creative)");
+			mRender->SetFontStyle(0.5, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
+			mRender->DebugPrint(40, 225 - 40, "-Changed Block Count (Creative)");
 
             aboutPos == 0 ? DrawText(240,234,GU_COLOR(1,1,0.25,1) ,default_size,"Converter") : DrawText(240,234,GU_COLOR(1,1,1,1) ,default_size,"Converter");
             aboutPos == 1 ? DrawText(240,264,GU_COLOR(1,1,0.25,1) ,default_size,"Cancel") : DrawText(240,264,GU_COLOR(1,1,1,1) ,default_size,"Cancel");

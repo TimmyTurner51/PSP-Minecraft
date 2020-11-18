@@ -274,6 +274,7 @@ private:
     Sprite *chtSprite;
     Sprite *selectInvSprite;
 	Sprite *barSprite;
+	Sprite* xpSprite;
 	Sprite *crossSprite;
 	Sprite *selectSprite;
 

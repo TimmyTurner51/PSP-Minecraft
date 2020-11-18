@@ -382,7 +382,6 @@ void StatePlay::LoadTextures()
 {
     //terrain texure
     texture = TextureHelper::Instance()->GetTexture(TextureHelper::Terrain1);
-	Xpbar = TextureHelper::Instance()->GetTexture(TextureHelper::Xpbar);
     texture_mips = TextureHelper::Instance()->GetTexture(TextureHelper::Terrain2);
     waterAnimation = TextureHelper::Instance()->GetTexture(TextureHelper::WaterAnimation);
 
@@ -419,6 +418,10 @@ void StatePlay::LoadTextures()
     barSprite = new Sprite(TextureHelper::Instance()->GetTexture(TextureHelper::Utils),0*utilsSize/182,0*utilsSize/182,182*utilsSize/182,22*utilsSize/182);
     barSprite->SetPosition(240,230);
     barSprite->Scale(utilScale,utilScale);
+
+	xpSprite = new Sprite(TextureHelper::Instance()->GetTexture(TextureHelper::Xpbar), 0 * utilsSize / 182, 0 * utilsSize / 182, 182 * utilsSize / 182, 5 * utilsSize / 182);
+	xpSprite->SetPosition(240, 210);
+	xpSprite->Scale(utilScale, utilScale);
 
     selectSprite = new Sprite(TextureHelper::Instance()->GetTexture(TextureHelper::Utils),0*utilsSize/182,22*utilsSize/182,24*utilsSize/182,24*utilsSize/182);
     selectSprite->SetPosition(125,230);
@@ -607,6 +610,7 @@ void StatePlay::CleanUp()
     delete nbuttonSprite;
     delete moverSprite;
     delete barSprite;
+	delete xpSprite;
     delete selectSprite;
     delete crossSprite;
     delete invSprite;
@@ -10826,19 +10830,6 @@ void StatePlay::Draw(StateManager* sManager)
 	/// GUI
 	mRender->SetOrtho(0,0,0,0,0,0);
 
-	DrawSetDepthTest(false);
-    DrawSetDepthMask(true);
-    DrawSetBlend(true);
-    DrawPlaceTexture(true);
-
-    TextureManager::Instance()->SetTextureModeulate(Xpbar);
-	advancedBlit(0,0,SCR_WIDTH,SCR_HEIGHT,0,0,32);
-
-    DrawPlaceTexture(false);
-    DrawSetBlend(false);
-    DrawSetDepthMask(false);
-    DrawSetDepthTest(true);
-
     if(mWorld->HP <= 0)
 	{
         DrawSetDepthTest(false);
@@ -10999,6 +10990,7 @@ void StatePlay::Draw(StateManager* sManager)
             hpAnim = 0.0f;
         }
         barSprite->Draw();
+		xpSprite->Draw();
         if (menuState != 1 || makeScreen == true)
         {
             /// HP and HG RENDERING
