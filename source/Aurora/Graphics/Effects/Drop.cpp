@@ -50,7 +50,7 @@ void Drop::CheckOtherDrops()
             if(num != TestDrop->num)
             {
                 float distance = 1.0f;
-                if(id < 250)
+                if(IsBlockId(id))
                 {
                     distance = 1.09f;
                 }
@@ -230,7 +230,7 @@ void Drop::Render(Frustum &camFrustum, Vector3 playerPos, float camAngle)
             sceGuEnable(GU_BLEND);
 
 
-            if(id < 250)
+            if(IsBlockId(id))
             {
                 sceGumPushMatrix();
 

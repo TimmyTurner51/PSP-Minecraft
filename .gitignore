@@ -1,0 +1,42 @@
+# Build products
+*.o
+*.d
+*.elf
+*.prx
+*.PBP
+*.ppmap
+*.map
+*.lmsd
+*.lmsdd
+
+# Runtime and local scratch
+Log.txt
+UPDLOG.TXT
+UpdaterLog.txt
+trace.txt
+boot.txt
+build.log
+phase.txt
+Minecraft - Compiled/
+update-server/
+_emupkg/
+_pkgfull/
+_tmp_*/
+.svn/
+__pycache__/
+*.pyc
+
+# OS
+Thumbs.db
+.DS_Store
+Desktop.ini
+
+# Local scratch that must not ship
+tmp_*.png
+_cur_*.png
+_pack_*.png
+_after*.txt
+_baseline*.txt
+_tmp_*
+serve-update-log.txt
+time.txt

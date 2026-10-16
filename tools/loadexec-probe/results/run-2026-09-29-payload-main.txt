@@ -1,0 +1,4 @@
+the payload reached main() -- the handoff WORKS on this console
+
+cwd  : "(failed)"
+argc : 0

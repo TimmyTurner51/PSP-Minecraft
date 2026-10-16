@@ -1,6 +1,6 @@
 .PHONY: all build_libs build_game clean_libs clean_game clean_all clean
 
-all: build_game
+all: build_libs build_game
 clean_all: clean_game
 clean: clean_game
 

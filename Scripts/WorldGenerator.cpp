@@ -1,8 +1,11 @@
 #include "WorldGenerator.h"
 #include "CraftWorld2.h"
 #include "LoadingScreen.h"
+#include "DebugConfig.h"
 
 #include <Aurora/Utils/Logger.h>
+#include <psputils.h>
+#include <pspkernel.h>
 
 #define PI 3.1415926535897f
 
@@ -15,9 +18,75 @@
 #define FlatDesertLakes 5
 #define FlatSnowyTaiga 6
 #define FlatOcean 7
-#define FlatNETHER 8
+// The nether world type. Defined in terms of CraftWorld's constant so the one place that has to
+// recover a dimension from a saved world type and this generator cannot drift apart.
+#define FlatNETHER CraftWorld::kWorldTypeNether
 
 using namespace noisepp;
+
+static int RandGenX(CraftWorld *world, int pad)
+{
+    int a = world->genMinX + pad;
+    int b = world->genMaxX - pad;
+    if(b <= a)
+        return (world->genMinX + world->genMaxX) / 2;
+    return a + rand() % (b - a);
+}
+
+static int RandGenZ(CraftWorld *world, int pad)
+{
+    int a = world->genMinZ + pad;
+    int b = world->genMaxZ - pad;
+    if(b <= a)
+        return (world->genMinZ + world->genMaxZ) / 2;
+    return a + rand() % (b - a);
+}
+
+static bool NearGenRim(CraftWorld *world, int x, int z, int rim)
+{
+    return x < world->genMinX + rim || x >= world->genMaxX - rim ||
+           z < world->genMinZ + rim || z >= world->genMaxZ - rim;
+}
+
+static int ScaleGenCount(CraftWorld *world, int fullMapCount)
+{
+    int w = world->genMaxX - world->genMinX;
+    int d = world->genMaxZ - world->genMinZ;
+    if(w < 1) w = 1;
+    if(d < 1) d = 1;
+    int n = (int)(((long long)fullMapCount * w * d) / (256LL * 256LL));
+    if(fullMapCount > 0 && n < 1)
+        n = 1;
+    return n;
+}
+
+static int CaveStartY(CraftWorld *world, int x, int z)
+{
+    int gh = world->groundHeight(x, z);
+    if(gh < 40)
+        return 12;
+    return 6 + rand() % (gh - 32);
+}
+
+static void BounceCaveXZ(CraftWorld *world, int &x, int &z, bool &reverseX, bool &reverseZ)
+{
+    if(x > world->genMaxX - 5 || x < world->genMinX + 4)
+    {
+        if(x > (world->genMinX + world->genMaxX) / 2)
+            x = world->genMaxX - 6;
+        else
+            x = world->genMinX + 5;
+        reverseX = !reverseX;
+    }
+    if(z > world->genMaxZ - 5 || z < world->genMinZ + 4)
+    {
+        if(z > (world->genMinZ + world->genMaxZ) / 2)
+            z = world->genMaxZ - 6;
+        else
+            z = world->genMinZ + 5;
+        reverseZ = !reverseZ;
+    }
+}
 
 void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSize, CraftWorld *world, bool makeTrees,bool makeWater,bool makeCaves, unsigned int seedII, int worldType)
 {
@@ -27,8 +96,6 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
     loading->stateName = 1;
 
     int WORLD_SIZE = worldSize;
-    int CHUNK_SIZE = chunkSize;
-    int WORLD_HEIGHT = 98;
 
     if (seedII == 0)
     {
@@ -37,8 +104,25 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
     unsigned int seed = seedII;
     srand(seed);
 
+    noiseGridOn = false;
     world->worldSeed = seed;
+    // per-world id: same seed twice still gets different column files
+    world->worldStamp = (int)sceKernelLibcTime(0) ^ (int)(seed * 2654435761u);
+    if(world->worldStamp == 0)
+        world->worldStamp = 1;
     SetSeed(seed);
+    world->worldType = worldType;
+    // A world created with the nether biome *is* the nether, so record it on the world rather than
+    // leaving every later reader to work it out from the biome number: the lighting needs to know,
+    // and it must not disagree with the generator about which world this is.
+    world->dimension = (worldType == FlatNETHER) ? 1 : 0;
+    world->makeTrees = makeTrees;
+    world->makeWater = makeWater;
+    world->makeCaves = makeCaves;
+    world->waterLevel = 58;
+    world->worldGenerating = true;
+    world->SetupSpawnGeneration();
+    const int WORLD_MID = (world->genMinX + world->genMaxX) / 2;
 
     int grass_;
     bool genGrass = true;
@@ -103,116 +187,19 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
             genGrass = false;
         }
 
+        world->waterLevel = waterLevel;
         PerlinModule* perlin = new PerlinModule();
         perlin->setQuality(noisepp::NOISE_QUALITY_HIGH);
 
-        float *dataBeach = new float[WORLD_SIZE * WORLD_SIZE];
-        perlin->setSeed(seed+10);
-        perlin->setOctaveCount(4);
-        perlin->setPersistence(0.17f);
-        perlin->setFrequency(0.8f);
-        perlin->setScale(4.5f);
-        perlin->setLacunarity(3.5f);
-
-        noisepp::utils::PlaneBuilder2D builderTrees;
-        builderTrees.setModule(perlin);
-        builderTrees.setSize(WORLD_SIZE, WORLD_SIZE);
-        builderTrees.setBounds(0, 0, 4, 5.5f);
-        builderTrees.setDestination(dataBeach);
-        builderTrees.build ();
-
-
         loading->stateName = 1; // terrain generation
-        for (int z = 0; z < WORLD_SIZE; z++)
+        for (int z = world->genMinZ; z < world->genMaxZ; z++)
         {
-            for (int x = 0; x < WORLD_SIZE; x++)
+            for (int x = world->genMinX; x < world->genMaxX; x++)
             {
-                //int distanceToCenter = world->FastDistance2d(abs(x-WORLD_SIZE/2),abs(z-WORLD_SIZE/2));
-                loading->readiness = ((float)(x+z*WORLD_SIZE)/(66503.0f))*100;
-
-                //int Height  = data[x + z*WORLD_SIZE]* 128/12 + middleHeight;
-                float HillFrequency = (GetValue2D(x,z,1,0.05f,1)+1.0f)/2.0f;
-
-                int Height = (InterpolateElevationNoise(x,z) + InterpolateRoughnessNoise(x,z)*GetValue2D3(x,z,6,0.1f,1))*64*HillFrequency+62;
-
-                if(Height <= 48)
-                {
-                    Height = 48-(48-Height)/2;
-                }
-                if(Height >= 68)
-                {
-                   Height = 68+(Height-68)/2;
-                }
-
-                float perlinHeight = dataBeach[x + z*WORLD_SIZE]* 1048576.0f/12.0f + 69;
-
-                for (int y = Height; y >= 0; y--)
-                {
-                    if(y == Height)
-                    {
-                        if(world->GetBlock(x,y+1,z) == 0)
-                        {
-                            if(Height <= waterLevel+2)
-                            {
-                                world->GetBlock(x, y, z) = SandBlock::getID();
-                                if(perlinHeight > 75.0f)
-                                {
-                                    world->GetBlock(x, y, z) = GrassBlock::getID();
-									if(y < waterLevel)
-                                    {
-                                        world->GetBlock(x, y, z) = DirtBlock::getID();
-                                    }
-                                }
-                            }
-                            else
-                            {
-                                world->GetBlock(x, y, z) = GrassBlock::getID();
-                            }
-                        }
-                    }
-                    else if(y < Height-4)
-                    {
-                        if(world->GetBlock(x,y,z) == RockBlock::getID())
-                        {
-                            break;
-                        }
-                        world->GetBlock(x, y, z) = RockBlock::getID();
-                    }
-                    else
-                    {
-                        if(Height <= waterLevel+3)
-                        {
-                            world->GetBlock(x, y, z) = SandBlock::getID();
-                            if(perlinHeight > 75.0f)
-                            {
-                                world->GetBlock(x, y, z) = DirtBlock::getID();
-                            }
-
-							world->GetBlock(x, y, z) = RockBlock::getID();
-                            if(perlinHeight > 75.0f)
-                            {
-                                world->GetBlock(x, y, z) = DirtBlock::getID();
-                            }
-                        }
-                        else
-                        {
-							world->GetBlock(x, y, z) = DirtBlock::getID();
-                        }       
-                    }
-                }
-
-                if(Height < waterLevel)
-                {
-                    for (int y = waterLevel; y > Height; y--)
-                    {
-                        world->GetBlock(x, y, z) = WaterBlock::getID();
-                    }
-                }
+                loading->readiness = (int)(((float)((x - world->genMinX) + (z - world->genMinZ) * (world->genMaxX - world->genMinX)) / (float)((world->genMaxX - world->genMinX) * (world->genMaxZ - world->genMinZ) + 1)) * 60.0f);
+                PlaceDefaultTerrainColumn(world, x, z, worldType, waterLevel, world->WORLD_HEIGHT);
             }
         }
-
-       // delete []data;
-        delete []dataBeach;
 
         loading->readiness = 60;
         loading->stateName = 2; // cave generation
@@ -227,7 +214,7 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
             int probY = -1;
             int probZ = -1;
 
-            int numWorms = 100 + rand() % 6;
+            int numWorms = ScaleGenCount(world, 100) + rand() % 3;
             for(int i = 0; i < numWorms; i++)
             {
                 int steps = 50 + rand() % 100;
@@ -266,9 +253,9 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 
                 if(probX == -1)
                 {
-                    x = 10 + rand() % (WORLD_SIZE-10);
-                    z = 10 + rand() % (WORLD_SIZE-10);
-                    y = 6 + rand() % (world->groundHeight(x,z)-32);
+                    x = RandGenX(world, 10);
+                    z = RandGenZ(world, 10);
+                    y = CaveStartY(world, x, z);
                 }
                 else
                 {
@@ -325,7 +312,8 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 
                     if(haveWater == false)
                     {
-                        world->BuildBlockSphere(radius,0,x,y,z);
+                        if(!NearGenRim(world, x, z, world->CHUNK_SIZE + 4))
+                            world->BuildBlockSphere(radius,0,x,y,z);
 
                         if(rand()%14 == 0)
                         {
@@ -348,31 +336,7 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
                         reverseY = !reverseY;
                     }
 
-                    if(x > WORLD_SIZE-5 || x <= 4)
-                    {
-                        if(x > 30)
-                        {
-                            x = WORLD_SIZE-6;
-                        }
-                        else
-                        {
-                            x = 5;
-                        }
-                        reverseX = !reverseX;
-                    }
-
-                    if(z > WORLD_SIZE-5 || z <= 4)
-                    {
-                        if(z > 30)
-                        {
-                            z = WORLD_SIZE-6;
-                        }
-                        else
-                        {
-                            z = 5;
-                        }
-                        reverseZ = !reverseZ;
-                    }
+                    BounceCaveXZ(world, x, z, reverseX, reverseZ);
                 }
             }
             delete [] dataVer;
@@ -382,36 +346,21 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
         initDirt(WORLD_SIZE, world);
         initGravel(WORLD_SIZE, world);
         //initErosion(WORLD_HEIGHT, world);
-        initBiome(WORLD_SIZE,world,perlin,seed);
-
-        initPumpkins(WORLD_SIZE,world);
-        initCanes(WORLD_SIZE,world,waterLevel);
 
         loading->readiness = 80;
         loading->stateName = 4; // trees planting
 
-        initFlowers(WORLD_SIZE, world);
-
-        if(makeTrees)
-        {
-            initRandomTrees(WORLD_SIZE, world);
-        }
+        // trees, plants, canes, cactus, pumpkins, pockets: same code streamed columns use
+        DecorateSpawnRegion(world);
 
         loading->readiness = 85;
         loading->stateName = 5; // ore placing
 
         initBedrock(WORLD_SIZE, world);
-        initClay(WORLD_SIZE, world);
 
         loading->readiness = 90;
         loading->stateName = 6;
 
-        if(genGrass)
-        {
-            initGrass(WORLD_SIZE, world);
-        }
-
-        //initOtherVegetation(WORLD_SIZE, world);
         world->initWorldBlocksLight();
 
         loading->readiness = 100;
@@ -428,29 +377,7 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 
         initDungeons(WORLD_SIZE, world);
 
-        for(int i = 0; i <= 1; i++)
-        {
-            int spawnX,spawnY,spawnZ;
-
-            spawnX = 20 + rand() % (WORLD_SIZE-20);
-            spawnZ = 20 + rand() % (WORLD_SIZE-20);
-            spawnY = world->groundHeightWater(spawnX,spawnZ);
-
-            world->SpawnCow(spawnX+0.5f,spawnY+2.0f,spawnZ+0.5f);
-            world->SpawnCow(spawnX+2.0f+0.5f,world->groundHeightWater(spawnX+2.0f,spawnZ+2.0f)+2.0f,spawnZ+2.0f+0.5f);
-        }
-
-        for(int i = 0; i < 1; i++)
-        {
-            int spawnX,spawnY,spawnZ;
-
-            spawnX = 30 + rand() % (WORLD_SIZE-30);
-            spawnZ = 30 + rand() % (WORLD_SIZE-30);
-            spawnY = world->groundHeightWater(spawnX,spawnZ);
-
-            world->SpawnSheep(spawnX+0.5f,spawnY+2.0f,spawnZ+0.5f);
-            world->SpawnSheep(spawnX+2.5f,world->groundHeightWater(spawnX+2.0f,spawnZ+2.0f)+2.0f,spawnZ+2.5f);
-        }
+        world->SpawnStartAnimals(2, 1);
 
         int tries = 0;
         Vector3 newPlayerSpawnPosition = Vector3(1,0,1);
@@ -470,7 +397,7 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
                 border -= 8;
             }
 
-            newPlayerSpawnPosition = Vector3(border+rand()%(WORLD_SIZE-border-1),0,border+rand()%(WORLD_SIZE-border-1));
+            newPlayerSpawnPosition = Vector3(RandGenX(world, border),0,RandGenZ(world, border));
             int groundBlock = world->GetBlock(newPlayerSpawnPosition.x,world->groundHeightWater(newPlayerSpawnPosition.x,newPlayerSpawnPosition.z),newPlayerSpawnPosition.z);
             if(groundBlock != WaterBlock::getID())
             {
@@ -487,7 +414,7 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
             }
             if(tries == 3071)
             {
-                world->SetPlayerSpawnPosition(Vector3(WORLD_SIZE/2+0.5f,world->groundHeightWater(WORLD_SIZE/2,WORLD_SIZE/2)+world->playerGrowth-0.05f-0.5f,WORLD_SIZE/2+0.5f));
+                world->SetPlayerSpawnPosition(Vector3(WORLD_MID+0.5f,world->groundHeightWater(WORLD_MID,WORLD_MID)+world->playerGrowth-0.05f-0.5f,WORLD_MID+0.5f));
             }
             tries ++;
         }
@@ -495,10 +422,6 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
         delete perlin;
     }
 
-    int spawnX = 128;
-    int spawnZ = 128;
-    int spawnY = world->groundHeightWater(spawnX,spawnZ);
-    world->SpawnSheep(spawnX,spawnY+12.0f/16.0f,spawnZ);
 	if (worldType == SnowyTaiga)
 	{
 		bool snowBiomeIncluded = true;
@@ -563,116 +486,19 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 			genGrass = false;
 		}
 
+		world->waterLevel = waterLevel;
 		PerlinModule* perlin = new PerlinModule();
 		perlin->setQuality(noisepp::NOISE_QUALITY_HIGH);
 
-		float* dataBeach = new float[WORLD_SIZE * WORLD_SIZE];
-		perlin->setSeed(seed + 10);
-		perlin->setOctaveCount(4);
-		perlin->setPersistence(0.17f);
-		perlin->setFrequency(0.8f);
-		perlin->setScale(4.5f);
-		perlin->setLacunarity(3.5f);
-
-		noisepp::utils::PlaneBuilder2D builderTrees;
-		builderTrees.setModule(perlin);
-		builderTrees.setSize(WORLD_SIZE, WORLD_SIZE);
-		builderTrees.setBounds(0, 0, 4, 5.5f);
-		builderTrees.setDestination(dataBeach);
-		builderTrees.build();
-
-
 		loading->stateName = 1; // terrain generation
-		for (int z = 0; z < WORLD_SIZE; z++)
+		for (int z = world->genMinZ; z < world->genMaxZ; z++)
 		{
-			for (int x = 0; x < WORLD_SIZE; x++)
+			for (int x = world->genMinX; x < world->genMaxX; x++)
 			{
-				//int distanceToCenter = world->FastDistance2d(abs(x-WORLD_SIZE/2),abs(z-WORLD_SIZE/2));
 				loading->readiness = ((float)(x + z * WORLD_SIZE) / (66503.0f)) * 100;
-
-				//int Height  = data[x + z*WORLD_SIZE]* 128/12 + middleHeight;
-				float HillFrequency = (GetValue2D(x, z, 1, 0.05f, 1) + 1.0f) / 2.0f;
-
-				int Height = (InterpolateElevationNoise(x, z) + InterpolateRoughnessNoise(x, z) * GetValue2D3(x, z, 6, 0.1f, 1)) * 64 * HillFrequency + 62;
-
-				if (Height <= 48)
-				{
-					Height = 48 - (48 - Height) / 2;
-				}
-				if (Height >= 68)
-				{
-					Height = 68 + (Height - 68) / 2;
-				}
-
-				float perlinHeight = dataBeach[x + z * WORLD_SIZE] * 1048576.0f / 12.0f + 69;
-
-				for (int y = Height; y >= 0; y--)
-				{
-					if (y == Height)
-					{
-						if (world->GetBlock(x, y + 1, z) == 0)
-						{
-							if (Height <= waterLevel + 2)
-							{
-								world->GetBlock(x, y, z) = DirtBlock::getID();
-								if (perlinHeight > 75.0f)
-								{
-									world->GetBlock(x, y, z) = SnowSoil::getID();
-									if (y < waterLevel)
-									{
-										world->GetBlock(x, y, z) = DirtBlock::getID();
-									}
-								}
-							}
-							else
-							{
-								world->GetBlock(x, y, z) = SnowSoil::getID();
-							}
-						}
-					}
-					else if (y < Height - 4)
-					{
-						if (world->GetBlock(x, y, z) == RockBlock::getID())
-						{
-							break;
-						}
-						world->GetBlock(x, y, z) = RockBlock::getID();
-					}
-					else
-					{
-						if (Height <= waterLevel + 3)
-						{
-							world->GetBlock(x, y, z) = DirtBlock::getID();
-							if (perlinHeight > 75.0f)
-							{
-								world->GetBlock(x, y, z) = DirtBlock::getID();
-							}
-
-							world->GetBlock(x, y, z) = RockBlock::getID();
-							if (perlinHeight > 75.0f)
-							{
-								world->GetBlock(x, y, z) = DirtBlock::getID();
-							}
-						}
-						else
-						{
-							world->GetBlock(x, y, z) = DirtBlock::getID();
-						}
-					}
-				}
-
-				if (Height < waterLevel)
-				{
-					for (int y = waterLevel; y > Height; y--)
-					{
-						world->GetBlock(x, y, z) = WaterBlock::getID();
-					}
-				}
+				PlaceDefaultTerrainColumn(world, x, z, worldType, waterLevel, world->WORLD_HEIGHT);
 			}
 		}
-
-		// delete []data;
-		delete[]dataBeach;
 
 		loading->readiness = 60;
 		loading->stateName = 2; // cave generation
@@ -687,7 +513,7 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 			int probY = -1;
 			int probZ = -1;
 
-			int numWorms = 100 + rand() % 6;
+			int numWorms = ScaleGenCount(world, 100) + rand() % 3;
 			for (int i = 0; i < numWorms; i++)
 			{
 				int steps = 50 + rand() % 100;
@@ -726,9 +552,9 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 
 				if (probX == -1)
 				{
-					x = 10 + rand() % (WORLD_SIZE - 10);
-					z = 10 + rand() % (WORLD_SIZE - 10);
-					y = 6 + rand() % (world->groundHeight(x, z) - 32);
+					x = RandGenX(world, 10);
+					z = RandGenZ(world, 10);
+                    y = CaveStartY(world, x, z);
 				}
 				else
 				{
@@ -775,7 +601,7 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 						{
 							for (int yy = y - radius; yy <= y + radius; yy++)
 							{
-								if (world->GetBlock(xx, yy, zz) == world->GetBlock(xx, yy, zz) == WaterBlock::getID())
+								if (world->GetBlock(xx, yy, zz) == WaterBlock::getID())
 								{
 									haveWater = true;
 								}
@@ -785,7 +611,8 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 
 					if (haveWater == false)
 					{
-						world->BuildBlockSphere(radius, 0, x, y, z);
+						if(!NearGenRim(world, x, z, world->CHUNK_SIZE + 4))
+							world->BuildBlockSphere(radius, 0, x, y, z);
 
 						if (rand() % 14 == 0)
 						{
@@ -808,31 +635,7 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 						reverseY = !reverseY;
 					}
 
-					if (x > WORLD_SIZE - 5 || x <= 4)
-					{
-						if (x > 30)
-						{
-							x = WORLD_SIZE - 6;
-						}
-						else
-						{
-							x = 5;
-						}
-						reverseX = !reverseX;
-					}
-
-					if (z > WORLD_SIZE - 5 || z <= 4)
-					{
-						if (z > 30)
-						{
-							z = WORLD_SIZE - 6;
-						}
-						else
-						{
-							z = 5;
-						}
-						reverseZ = !reverseZ;
-					}
+					BounceCaveXZ(world, x, z, reverseX, reverseZ);
 				}
 			}
 			delete[] dataVer;
@@ -846,28 +649,16 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 		loading->readiness = 80;
 		loading->stateName = 4; // trees planting
 
-		initFlowers(WORLD_SIZE, world);
-
-		if (makeTrees)
-		{
-			initRandomTrees(WORLD_SIZE, world);
-		}
+		DecorateSpawnRegion(world);
 
 		loading->readiness = 85;
 		loading->stateName = 5; // ore placing
 
 		initBedrock(WORLD_SIZE, world);
-		initClay(WORLD_SIZE, world);
 
 		loading->readiness = 90;
 		loading->stateName = 6;
 
-		if (genGrass)
-		{
-			initGrass(WORLD_SIZE, world);
-		}
-
-		//initOtherVegetation(WORLD_SIZE, world);
 		world->initWorldBlocksLight();
 
 		loading->readiness = 100;
@@ -884,29 +675,7 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 
 		initDungeons(WORLD_SIZE, world);
 
-		for (int i = 0; i <= 1; i++)
-		{
-			int spawnX, spawnY, spawnZ;
-
-			spawnX = 20 + rand() % (WORLD_SIZE - 20);
-			spawnZ = 20 + rand() % (WORLD_SIZE - 20);
-			spawnY = world->groundHeightWater(spawnX, spawnZ);
-
-			world->SpawnCow(spawnX + 0.5f, spawnY + 2.0f, spawnZ + 0.5f);
-			world->SpawnCow(spawnX + 2.0f + 0.5f, world->groundHeightWater(spawnX + 2.0f, spawnZ + 2.0f) + 2.0f, spawnZ + 2.0f + 0.5f);
-		}
-
-		for (int i = 0; i < 1; i++)
-		{
-			int spawnX, spawnY, spawnZ;
-
-			spawnX = 30 + rand() % (WORLD_SIZE - 30);
-			spawnZ = 30 + rand() % (WORLD_SIZE - 30);
-			spawnY = world->groundHeightWater(spawnX, spawnZ);
-
-			world->SpawnSheep(spawnX + 0.5f, spawnY + 2.0f, spawnZ + 0.5f);
-			world->SpawnSheep(spawnX + 2.5f, world->groundHeightWater(spawnX + 2.0f, spawnZ + 2.0f) + 2.0f, spawnZ + 2.5f);
-		}
+		world->SpawnStartAnimals(2, 1);
 
 		int tries = 0;
 		Vector3 newPlayerSpawnPosition = Vector3(1, 0, 1);
@@ -926,7 +695,7 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 				border -= 8;
 			}
 
-			newPlayerSpawnPosition = Vector3(border + rand() % (WORLD_SIZE - border - 1), 0, border + rand() % (WORLD_SIZE - border - 1));
+			newPlayerSpawnPosition = Vector3(RandGenX(world, border), 0, RandGenZ(world, border));
 			int groundBlock = world->GetBlock(newPlayerSpawnPosition.x, world->groundHeightWater(newPlayerSpawnPosition.x, newPlayerSpawnPosition.z), newPlayerSpawnPosition.z);
 			if (groundBlock != WaterBlock::getID())
 			{
@@ -936,7 +705,7 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 			}
 			if (tries == 3071)
 			{
-				world->SetPlayerSpawnPosition(Vector3(WORLD_SIZE / 2 + 0.5f, world->groundHeightWater(WORLD_SIZE / 2, WORLD_SIZE / 2) + world->playerGrowth - 0.05f - 0.5f, WORLD_SIZE / 2 + 0.5f));
+				world->SetPlayerSpawnPosition(Vector3(WORLD_MID + 0.5f, world->groundHeightWater(WORLD_MID, WORLD_MID) + world->playerGrowth - 0.05f - 0.5f, WORLD_MID + 0.5f));
 			}
 			tries++;
 		}
@@ -1007,116 +776,19 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 			genGrass = false;
 		}
 
+		world->waterLevel = waterLevel;
 		PerlinModule* perlin = new PerlinModule();
 		perlin->setQuality(noisepp::NOISE_QUALITY_HIGH);
 
-		float* dataBeach = new float[WORLD_SIZE * WORLD_SIZE];
-		perlin->setSeed(seed + 10);
-		perlin->setOctaveCount(4);
-		perlin->setPersistence(0.17f);
-		perlin->setFrequency(0.8f);
-		perlin->setScale(4.5f);
-		perlin->setLacunarity(3.5f);
-
-		noisepp::utils::PlaneBuilder2D builderTrees;
-		builderTrees.setModule(perlin);
-		builderTrees.setSize(WORLD_SIZE, WORLD_SIZE);
-		builderTrees.setBounds(0, 0, 4, 5.5f);
-		builderTrees.setDestination(dataBeach);
-		builderTrees.build();
-
-
 		loading->stateName = 1; // terrain generation
-		for (int z = 0; z < WORLD_SIZE; z++)
+		for (int z = world->genMinZ; z < world->genMaxZ; z++)
 		{
-			for (int x = 0; x < WORLD_SIZE; x++)
+			for (int x = world->genMinX; x < world->genMaxX; x++)
 			{
-				//int distanceToCenter = world->FastDistance2d(abs(x-WORLD_SIZE/2),abs(z-WORLD_SIZE/2));
 				loading->readiness = ((float)(x + z * WORLD_SIZE) / (66503.0f)) * 100;
-
-				//int Height  = data[x + z*WORLD_SIZE]* 128/12 + middleHeight;
-				float HillFrequency = (GetValue2D(x, z, 1, 0.05f, 1) + 1.0f) / 2.0f;
-
-				int Height = (InterpolateElevationNoise(x, z) + InterpolateRoughnessNoise(x, z) * GetValue2D3(x, z, 6, 0.1f, 1)) * 64 * HillFrequency + 62;
-
-				if (Height <= 48)
-				{
-					Height = 48 - (48 - Height) / 2;
-				}
-				if (Height >= 68)
-				{
-					Height = 68 + (Height - 68) / 2;
-				}
-
-				float perlinHeight = dataBeach[x + z * WORLD_SIZE] * 1048576.0f / 12.0f + 69;
-
-				for (int y = Height; y >= 0; y--)
-				{
-					if (y == Height)
-					{
-						if (world->GetBlock(x, y + 1, z) == 0)
-						{
-							if (Height <= waterLevel + 2)
-							{
-								world->GetBlock(x, y, z) = DirtBlock::getID();
-								if (perlinHeight > 75.0f)
-								{
-									world->GetBlock(x, y, z) = GrassBlock::getID();
-									if (y < waterLevel)
-									{
-										world->GetBlock(x, y, z) = DirtBlock::getID();
-									}
-								}
-							}
-							else
-							{
-								world->GetBlock(x, y, z) = GrassBlock::getID();
-							}
-						}
-					}
-					else if (y < Height - 4)
-					{
-						if (world->GetBlock(x, y, z) == RockBlock::getID())
-						{
-							break;
-						}
-						world->GetBlock(x, y, z) = RockBlock::getID();
-					}
-					else
-					{
-						if (Height <= waterLevel + 3)
-						{
-							world->GetBlock(x, y, z) = DirtBlock::getID();
-							if (perlinHeight > 75.0f)
-							{
-								world->GetBlock(x, y, z) = DirtBlock::getID();
-							}
-
-							world->GetBlock(x, y, z) = RockBlock::getID();
-							if (perlinHeight > 75.0f)
-							{
-								world->GetBlock(x, y, z) = DirtBlock::getID();
-							}
-						}
-						else
-						{
-							world->GetBlock(x, y, z) = DirtBlock::getID();
-						}
-					}
-				}
-
-				if (Height < waterLevel)
-				{
-					for (int y = waterLevel; y > Height; y--)
-					{
-						world->GetBlock(x, y, z) = WaterBlock::getID();
-					}
-				}
+				PlaceDefaultTerrainColumn(world, x, z, worldType, waterLevel, world->WORLD_HEIGHT);
 			}
 		}
-
-		// delete []data;
-		delete[]dataBeach;
 
 		loading->readiness = 60;
 		loading->stateName = 2; // cave generation
@@ -1131,7 +803,7 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 			int probY = -1;
 			int probZ = -1;
 
-			int numWorms = 100 + rand() % 6;
+			int numWorms = ScaleGenCount(world, 100) + rand() % 3;
 			for (int i = 0; i < numWorms; i++)
 			{
 				int steps = 50 + rand() % 100;
@@ -1170,9 +842,9 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 
 				if (probX == -1)
 				{
-					x = 10 + rand() % (WORLD_SIZE - 10);
-					z = 10 + rand() % (WORLD_SIZE - 10);
-					y = 6 + rand() % (world->groundHeight(x, z) - 32);
+					x = RandGenX(world, 10);
+					z = RandGenZ(world, 10);
+                    y = CaveStartY(world, x, z);
 				}
 				else
 				{
@@ -1219,7 +891,7 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 						{
 							for (int yy = y - radius; yy <= y + radius; yy++)
 							{
-								if (world->GetBlock(xx, yy, zz) == world->GetBlock(xx, yy, zz) == WaterBlock::getID())
+								if (world->GetBlock(xx, yy, zz) == WaterBlock::getID())
 								{
 									haveWater = true;
 								}
@@ -1229,7 +901,8 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 
 					if (haveWater == false)
 					{
-						world->BuildBlockSphere(radius, 0, x, y, z);
+						if(!NearGenRim(world, x, z, world->CHUNK_SIZE + 4))
+							world->BuildBlockSphere(radius, 0, x, y, z);
 
 						if (rand() % 14 == 0)
 						{
@@ -1252,31 +925,7 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 						reverseY = !reverseY;
 					}
 
-					if (x > WORLD_SIZE - 5 || x <= 4)
-					{
-						if (x > 30)
-						{
-							x = WORLD_SIZE - 6;
-						}
-						else
-						{
-							x = 5;
-						}
-						reverseX = !reverseX;
-					}
-
-					if (z > WORLD_SIZE - 5 || z <= 4)
-					{
-						if (z > 30)
-						{
-							z = WORLD_SIZE - 6;
-						}
-						else
-						{
-							z = 5;
-						}
-						reverseZ = !reverseZ;
-					}
+					BounceCaveXZ(world, x, z, reverseX, reverseZ);
 				}
 			}
 			delete[] dataVer;
@@ -1290,28 +939,16 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 		loading->readiness = 80;
 		loading->stateName = 4; // trees planting
 
-		initFlowers(WORLD_SIZE, world);
-
-		if (makeTrees)
-		{
-			initRandomTrees(WORLD_SIZE, world);
-		}
+		DecorateSpawnRegion(world);
 
 		loading->readiness = 85;
 		loading->stateName = 5; // ore placing
 
 		initBedrock(WORLD_SIZE, world);
-		initClay(WORLD_SIZE, world);
 
 		loading->readiness = 90;
 		loading->stateName = 6;
 
-		if (genGrass)
-		{
-			initGrass(WORLD_SIZE, world);
-		}
-
-		//initOtherVegetation(WORLD_SIZE, world);
 		world->initWorldBlocksLight();
 
 		loading->readiness = 100;
@@ -1328,29 +965,7 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 
 		initDungeons(WORLD_SIZE, world);
 
-		for (int i = 0; i <= 1; i++)
-		{
-			int spawnX, spawnY, spawnZ;
-
-			spawnX = 20 + rand() % (WORLD_SIZE - 20);
-			spawnZ = 20 + rand() % (WORLD_SIZE - 20);
-			spawnY = world->groundHeightWater(spawnX, spawnZ);
-
-			world->SpawnCow(spawnX + 0.5f, spawnY + 2.0f, spawnZ + 0.5f);
-			world->SpawnCow(spawnX + 2.0f + 0.5f, world->groundHeightWater(spawnX + 2.0f, spawnZ + 2.0f) + 2.0f, spawnZ + 2.0f + 0.5f);
-		}
-
-		for (int i = 0; i < 1; i++)
-		{
-			int spawnX, spawnY, spawnZ;
-
-			spawnX = 30 + rand() % (WORLD_SIZE - 30);
-			spawnZ = 30 + rand() % (WORLD_SIZE - 30);
-			spawnY = world->groundHeightWater(spawnX, spawnZ);
-
-			world->SpawnSheep(spawnX + 0.5f, spawnY + 2.0f, spawnZ + 0.5f);
-			world->SpawnSheep(spawnX + 2.5f, world->groundHeightWater(spawnX + 2.0f, spawnZ + 2.0f) + 2.0f, spawnZ + 2.5f);
-		}
+		world->SpawnStartAnimals(2, 1);
 
 		int tries = 0;
 		Vector3 newPlayerSpawnPosition = Vector3(1, 0, 1);
@@ -1370,7 +985,7 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 				border -= 8;
 			}
 
-			newPlayerSpawnPosition = Vector3(border + rand() % (WORLD_SIZE - border - 1), 0, border + rand() % (WORLD_SIZE - border - 1));
+			newPlayerSpawnPosition = Vector3(RandGenX(world, border), 0, RandGenZ(world, border));
 			int groundBlock = world->GetBlock(newPlayerSpawnPosition.x, world->groundHeightWater(newPlayerSpawnPosition.x, newPlayerSpawnPosition.z), newPlayerSpawnPosition.z);
 			if (groundBlock != WaterBlock::getID())
 			{
@@ -1380,7 +995,7 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 			}
 			if (tries == 3071)
 			{
-				world->SetPlayerSpawnPosition(Vector3(WORLD_SIZE / 2 + 0.5f, world->groundHeightWater(WORLD_SIZE / 2, WORLD_SIZE / 2) + world->playerGrowth - 0.05f - 0.5f, WORLD_SIZE / 2 + 0.5f));
+				world->SetPlayerSpawnPosition(Vector3(WORLD_MID + 0.5f, world->groundHeightWater(WORLD_MID, WORLD_MID) + world->playerGrowth - 0.05f - 0.5f, WORLD_MID + 0.5f));
 			}
 			tries++;
 		}
@@ -1451,115 +1066,19 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 			genGrass = false;
 		}
 
+		world->waterLevel = waterLevel;
 		PerlinModule* perlin = new PerlinModule();
 		perlin->setQuality(noisepp::NOISE_QUALITY_HIGH);
 
-		float* dataBeach = new float[WORLD_SIZE * WORLD_SIZE];
-		perlin->setSeed(seed + 10);
-		perlin->setOctaveCount(4);
-		perlin->setPersistence(0.17f);
-		perlin->setFrequency(0.8f);
-		perlin->setScale(4.5f);
-		perlin->setLacunarity(3.5f);
-
-		noisepp::utils::PlaneBuilder2D builderTrees;
-		builderTrees.setModule(perlin);
-		builderTrees.setSize(WORLD_SIZE, WORLD_SIZE);
-		builderTrees.setBounds(0, 0, 4, 5.5f);
-		builderTrees.setDestination(dataBeach);
-		builderTrees.build();
-
-
 		loading->stateName = 1; // terrain generation
-		for (int z = 0; z < WORLD_SIZE; z++)
+		for (int z = world->genMinZ; z < world->genMaxZ; z++)
 		{
-			for (int x = 0; x < WORLD_SIZE; x++)
+			for (int x = world->genMinX; x < world->genMaxX; x++)
 			{
-				//int distanceToCenter = world->FastDistance2d(abs(x-WORLD_SIZE/2),abs(z-WORLD_SIZE/2));
 				loading->readiness = ((float)(x + z * WORLD_SIZE) / (66503.0f)) * 100;
-
-				//int Height  = data[x + z*WORLD_SIZE]* 128/12 + middleHeight;
-				float HillFrequency = (GetValue2D(x, z, 1, 0.05f, 1) + 1.0f) / 2.0f;
-
-				int Height = (InterpolateElevationNoise(x, z) + InterpolateRoughnessNoise(x, z) * GetValue2D3(x, z, 6, 0.1f, 1)) * 64 * HillFrequency + 62;
-
-				if (Height <= 48)
-				{
-					Height = 48 - (48 - Height) / 2;
-				}
-				if (Height >= 68)
-				{
-					Height = 68 + (Height - 68) / 2;
-				}
-
-				float perlinHeight = dataBeach[x + z * WORLD_SIZE] * 1048576.0f / 12.0f + 69;
-
-				for (int y = Height; y >= 0; y--)
-				{
-					if (y == Height)
-					{
-						if (world->GetBlock(x, y + 1, z) == 0)
-						{
-							if (Height <= waterLevel + 2)
-							{
-								world->GetBlock(x, y, z) = SandBlock::getID();
-								if (perlinHeight > 75.0f)
-								{
-									if (y < waterLevel)
-									{
-										world->GetBlock(x, y, z) = SandStone::getID();
-									}
-								}
-							}
-							else
-							{
-								world->GetBlock(x, y, z) = SandBlock::getID();
-							}
-						}
-					}
-					else if (y < Height - 4)
-					{
-						if (world->GetBlock(x, y, z) == RockBlock::getID())
-						{
-							break;
-						}
-						world->GetBlock(x, y, z) = RockBlock::getID();
-					}
-					else
-					{
-						if (Height <= waterLevel + 3)
-						{
-							world->GetBlock(x, y, z) = SandBlock::getID();
-							if (perlinHeight > 75.0f)
-							{
-								world->GetBlock(x, y, z) = SandStone::getID();
-							}
-
-							world->GetBlock(x, y, z) = RockBlock::getID();
-							if (perlinHeight > 75.0f)
-							{
-								world->GetBlock(x, y, z) = SandStone::getID();
-							}
-						}
-						else
-						{
-							world->GetBlock(x, y, z) = SandStone::getID();
-						}
-					}
-				}
-
-				if (Height < waterLevel)
-				{
-					for (int y = waterLevel; y > Height; y--)
-					{
-						world->GetBlock(x, y, z) = WaterBlock::getID();
-					}
-				}
+				PlaceDefaultTerrainColumn(world, x, z, worldType, waterLevel, world->WORLD_HEIGHT);
 			}
 		}
-
-		// delete []data;
-		delete[]dataBeach;
 
 		loading->readiness = 60;
 		loading->stateName = 2; // cave generation
@@ -1574,7 +1093,7 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 			int probY = -1;
 			int probZ = -1;
 
-			int numWorms = 100 + rand() % 6;
+			int numWorms = ScaleGenCount(world, 100) + rand() % 3;
 			for (int i = 0; i < numWorms; i++)
 			{
 				int steps = 50 + rand() % 100;
@@ -1613,9 +1132,9 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 
 				if (probX == -1)
 				{
-					x = 10 + rand() % (WORLD_SIZE - 10);
-					z = 10 + rand() % (WORLD_SIZE - 10);
-					y = 6 + rand() % (world->groundHeight(x, z) - 32);
+					x = RandGenX(world, 10);
+					z = RandGenZ(world, 10);
+                    y = CaveStartY(world, x, z);
 				}
 				else
 				{
@@ -1672,7 +1191,8 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 
 					if (haveWater == false)
 					{
-						world->BuildBlockSphere(radius, 0, x, y, z);
+						if(!NearGenRim(world, x, z, world->CHUNK_SIZE + 4))
+							world->BuildBlockSphere(radius, 0, x, y, z);
 
 						if (rand() % 14 == 0)
 						{
@@ -1695,31 +1215,7 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 						reverseY = !reverseY;
 					}
 
-					if (x > WORLD_SIZE - 5 || x <= 4)
-					{
-						if (x > 30)
-						{
-							x = WORLD_SIZE - 6;
-						}
-						else
-						{
-							x = 5;
-						}
-						reverseX = !reverseX;
-					}
-
-					if (z > WORLD_SIZE - 5 || z <= 4)
-					{
-						if (z > 30)
-						{
-							z = WORLD_SIZE - 6;
-						}
-						else
-						{
-							z = 5;
-						}
-						reverseZ = !reverseZ;
-					}
+					BounceCaveXZ(world, x, z, reverseX, reverseZ);
 				}
 			}
 			delete[] dataVer;
@@ -1730,34 +1226,19 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 		initGravel(WORLD_SIZE, world);
 		//initErosion(WORLD_HEIGHT, world);
 
-		initPumpkins(WORLD_SIZE, world);
-		initCanes(WORLD_SIZE, world, waterLevel);
-
 		loading->readiness = 80;
 		loading->stateName = 4; // trees planting
 
-		initFlowers(WORLD_SIZE, world);
-
-		if (makeTrees)
-		{
-
-		}
+		DecorateSpawnRegion(world);
 
 		loading->readiness = 85;
 		loading->stateName = 5; // ore placing
 
 		initBedrock(WORLD_SIZE, world);
-		initClay(WORLD_SIZE, world);
 
 		loading->readiness = 90;
 		loading->stateName = 6;
 
-		if (genGrass)
-		{
-			initGrass(WORLD_SIZE, world);
-		}
-
-		//initOtherVegetation(WORLD_SIZE, world);
 		world->initWorldBlocksLight();
 
 		loading->readiness = 100;
@@ -1774,29 +1255,7 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 
 		initDungeons(WORLD_SIZE, world);
 
-		for (int i = 0; i <= 1; i++)
-		{
-			int spawnX, spawnY, spawnZ;
-
-			spawnX = 20 + rand() % (WORLD_SIZE - 20);
-			spawnZ = 20 + rand() % (WORLD_SIZE - 20);
-			spawnY = world->groundHeightWater(spawnX, spawnZ);
-
-			world->SpawnCow(spawnX + 0.5f, spawnY + 2.0f, spawnZ + 0.5f);
-			world->SpawnCow(spawnX + 2.0f + 0.5f, world->groundHeightWater(spawnX + 2.0f, spawnZ + 2.0f) + 2.0f, spawnZ + 2.0f + 0.5f);
-		}
-
-		for (int i = 0; i < 1; i++)
-		{
-			int spawnX, spawnY, spawnZ;
-
-			spawnX = 30 + rand() % (WORLD_SIZE - 30);
-			spawnZ = 30 + rand() % (WORLD_SIZE - 30);
-			spawnY = world->groundHeightWater(spawnX, spawnZ);
-
-			world->SpawnSheep(spawnX + 0.5f, spawnY + 2.0f, spawnZ + 0.5f);
-			world->SpawnSheep(spawnX + 2.5f, world->groundHeightWater(spawnX + 2.0f, spawnZ + 2.0f) + 2.0f, spawnZ + 2.5f);
-		}
+		world->SpawnStartAnimals(2, 1);
 
 		int tries = 0;
 		Vector3 newPlayerSpawnPosition = Vector3(1, 0, 1);
@@ -1816,7 +1275,7 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 				border -= 8;
 			}
 
-			newPlayerSpawnPosition = Vector3(border + rand() % (WORLD_SIZE - border - 1), 0, border + rand() % (WORLD_SIZE - border - 1));
+			newPlayerSpawnPosition = Vector3(RandGenX(world, border), 0, RandGenZ(world, border));
 			int groundBlock = world->GetBlock(newPlayerSpawnPosition.x, world->groundHeightWater(newPlayerSpawnPosition.x, newPlayerSpawnPosition.z), newPlayerSpawnPosition.z);
 			if (groundBlock != WaterBlock::getID())
 			{
@@ -1826,7 +1285,7 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 			}
 			if (tries == 3071)
 			{
-				world->SetPlayerSpawnPosition(Vector3(WORLD_SIZE / 2 + 0.5f, world->groundHeightWater(WORLD_SIZE / 2, WORLD_SIZE / 2) + world->playerGrowth - 0.05f - 0.5f, WORLD_SIZE / 2 + 0.5f));
+				world->SetPlayerSpawnPosition(Vector3(WORLD_MID + 0.5f, world->groundHeightWater(WORLD_MID, WORLD_MID) + world->playerGrowth - 0.05f - 0.5f, WORLD_MID + 0.5f));
 			}
 			tries++;
 		}
@@ -1838,10 +1297,10 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
         loading->readiness = 1;
         loading->stateName = 1;
         int superflatWorldHeight = 46;
-        for(int x = 0; x < WORLD_SIZE; x++)
+        for(int x = world->genMinX; x < world->genMaxX; x++)
         {
             loading->readiness = ((float)x/WORLD_SIZE)*50 + 1;
-            for(int z = 0; z < WORLD_SIZE; z++)
+            for(int z = world->genMinZ; z < world->genMaxZ; z++)
             {
                 for(int y = 0; y <= superflatWorldHeight; y++)
                 {
@@ -1876,56 +1335,99 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
         loading->stateName = 7;
         loading->stateName = 90;
         world->initWorldBlocksLight();
-        world->SetPlayerSpawnPosition(Vector3(WORLD_SIZE/2,world->groundHeight(WORLD_SIZE/2,WORLD_SIZE/2)+world->playerGrowth-0.05f+1,WORLD_SIZE/2));
+        world->SetPlayerSpawnPosition(Vector3(WORLD_MID,world->groundHeight(WORLD_MID,WORLD_MID)+world->playerGrowth-0.05f+1,WORLD_MID));
     }
 	if (worldType == FlatNETHER)
 	{
 		loading->readiness = 1;
 		loading->stateName = 1;
-		int superflatWorldHeight = 8;
-		for (int x = 0; x < WORLD_SIZE; x++)
+		// A column at a time, through the same function the streamed columns use, so the spawn
+		// region and everything beyond it are the same nether. This branch used to build a flat
+		// slab eight blocks thick here while GenerateColumn built a full column out there.
+		int cs = world->CHUNK_SIZE;
+		for (int cx = world->genMinX / cs; cx < world->genMaxX / cs; cx++)
 		{
-			loading->readiness = ((float)x / WORLD_SIZE) * 50 + 1;
-			for (int z = 0; z < WORLD_SIZE; z++)
-			{
-				for (int y = 0; y <= superflatWorldHeight; y++)
-				{
-					if (y == 2)
-					{
-						world->GetBlock(x, y, z) = bedrock::getID(); // bedrock
-					}
-					else
-					{
-						world->GetBlock(x, y, z) = bedrock::getID();
-						if (rand() % 384 == 2)
-						{
-							//world->GetBlock(x,y,z) = 41 + rand() % 5; // stuff for survival mod
-						}
-
-						if (y >= superflatWorldHeight - 2)
-						{
-							world->GetBlock(x, y, z) = Netherrack::getID();
-							if (rand() % 384 == 0)
-							{
-								//world->GetBlock(x,y,z) = WoodBlock::getID(); // stuff for survival mod
-							}
-						}
-						if (y >= superflatWorldHeight - 20)
-						{
-							world->GetBlock(x, y, z) = Netherrack::getID();
-							if (rand() % 384 == 0)
-							{
-								//world->GetBlock(x,y,z) = WoodBlock::getID(); // stuff for survival mod
-							}
-						}
-					}
-				}
-			}
+			loading->readiness = ((float)(cx * cs) / WORLD_SIZE) * 50 + 1;
+			for (int cz = world->genMinZ / cs; cz < world->genMaxZ / cs; cz++)
+				GenerateNetherColumn(world, cx, cz);
 		}
 		loading->stateName = 7;
 		loading->stateName = 90;
 		world->initWorldBlocksLight();
-		world->SetPlayerSpawnPosition(Vector3(WORLD_SIZE / 2, world->groundHeight(WORLD_SIZE / 2, WORLD_SIZE / 2) + world->playerGrowth - 0.05f + 1, WORLD_SIZE / 2));
+		// Deliberately not groundHeight(): that scans down from the top of the world, so under a
+		// bedrock ceiling it returns the ceiling and the player is placed on top of the world.
+		int spawnX = WORLD_MID, spawnY = 64, spawnZ = WORLD_MID;
+		if (!FindNetherSpawn(world, spawnX, spawnY, spawnZ))
+		{
+			// No real room anywhere near the middle: make one, rather than dropping the player into
+			// whatever happens to be there. Sized like the one the finder looks for.
+			for (int dx = -1; dx <= 1; dx++)
+			{
+				for (int dz = -1; dz <= 1; dz++)
+				{
+					world->GetBlock(WORLD_MID + dx, spawnY - 1, WORLD_MID + dz) = Netherrack::getID();
+					for (int dy = 0; dy < 4; dy++)
+						world->GetBlock(WORLD_MID + dx, spawnY + dy, WORLD_MID + dz) = 0;
+				}
+			}
+		}
+		world->SetPlayerSpawnPosition(Vector3(spawnX, spawnY + world->playerGrowth - 0.05f, spawnZ));
+#if MC_NETHER_PROBE
+		// What the generator actually produced for the spawn region. "It looks like the nether" would
+		// not catch an all-solid world, one that is all lava, or a spawn inside the lava sea; these
+		// numbers would. Temporary -- see MC_NETHER_PROBE in DebugConfig.h.
+		{
+			int air = 0, netherrackCount = 0, lava = 0, glowstone = 0, soulsand = 0, other = 0;
+			int bandTotal[8] = {0};
+			int bandOpen[8] = {0};
+			int h = world->WORLD_HEIGHT;
+			for (int x = world->genMinX; x < world->genMaxX; x++)
+			{
+				for (int z = world->genMinZ; z < world->genMaxZ; z++)
+				{
+					for (int y = 1; y < h; y++)
+					{
+						block_t b = world->GetBlock(x, y, z);
+						if (b == 0) air++;
+						else if (b == Netherrack::getID()) netherrackCount++;
+						else if (b == Lava::getID()) lava++;
+						else if (b == GlowstoneBlock::getID()) glowstone++;
+						else if (b == Soulsand::getID()) soulsand++;
+						else other++;
+						int band = (y * 8) / h;
+						if (band > 7) band = 7;
+						bandTotal[band]++;
+						if (b == 0 || b == Lava::getID()) bandOpen[band]++;
+					}
+				}
+			}
+			Aurora::Utils::Logger::Instance()->LogMessage("[netherprobe] region x%d..%d z%d..%d y1..%d\n",
+				world->genMinX, world->genMaxX, world->genMinZ, world->genMaxZ, h - 1);
+			Aurora::Utils::Logger::Instance()->LogMessage(
+				"[netherprobe] air=%d netherrack=%d lava=%d glowstone=%d soulsand=%d other=%d\n",
+				air, netherrackCount, lava, glowstone, soulsand, other);
+			for (int b = 0; b < 8; b++)
+				Aurora::Utils::Logger::Instance()->LogMessage("[netherprobe] band y%3d..%3d open=%d%%\n",
+					(b * h) / 8, ((b + 1) * h) / 8 - 1, bandTotal[b] ? (bandOpen[b] * 100) / bandTotal[b] : 0);
+			Aurora::Utils::Logger::Instance()->LogMessage("[netherprobe] spawn %d %d %d\n", spawnX, spawnY, spawnZ);
+			// The pocket the player wakes up in, as a 5x5 map five levels around the spawn: '#' solid,
+			// '.' air. A one-wide shaft is the failure mode this exists to catch -- it passes any block
+			// count and is unplayable to stand in.
+			for (int lvl = spawnY - 1; lvl <= spawnY + 3; lvl++)
+			{
+				char row[64];
+				int p = 0;
+				for (int dz = -2; dz <= 2; dz++)
+				{
+					for (int dx = -2; dx <= 2; dx++)
+						row[p++] = (world->GetBlock(spawnX + dx, lvl, spawnZ + dz) == 0) ? '.' : '#';
+					row[p++] = ' ';
+				}
+				row[p] = 0;
+				Aurora::Utils::Logger::Instance()->LogMessage("[netherprobe] y=%3d (%+d) %s\n", lvl, lvl - spawnY, row);
+			}
+		}
+#endif
 	}
 	if (worldType == FlatSnowyTaiga)
 	{
@@ -1934,10 +1436,10 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 		loading->readiness = 1;
 		loading->stateName = 1;
 		int superflatWorldHeight = 46;
-		for (int x = 0; x < WORLD_SIZE; x++)
+		for (int x = world->genMinX; x < world->genMaxX; x++)
 		{
 			loading->readiness = ((float)x / WORLD_SIZE) * 50 + 1;
-			for (int z = 0; z < WORLD_SIZE; z++)
+			for (int z = world->genMinZ; z < world->genMaxZ; z++)
 			{
 				for (int y = 0; y <= superflatWorldHeight; y++)
 				{
@@ -1972,17 +1474,17 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 		loading->stateName = 7;
 		loading->stateName = 90;
 		world->initWorldBlocksLight();
-		world->SetPlayerSpawnPosition(Vector3(WORLD_SIZE / 2, world->groundHeight(WORLD_SIZE / 2, WORLD_SIZE / 2) + world->playerGrowth - 0.05f + 1, WORLD_SIZE / 2));
+		world->SetPlayerSpawnPosition(Vector3(WORLD_MID, world->groundHeight(WORLD_MID, WORLD_MID) + world->playerGrowth - 0.05f + 1, WORLD_MID));
 	}
 	if (worldType == FlatDesertLakes)
 	{
 		loading->readiness = 1;
 		loading->stateName = 1;
 		int superflatWorldHeight = 46;
-		for (int x = 0; x < WORLD_SIZE; x++)
+		for (int x = world->genMinX; x < world->genMaxX; x++)
 		{
 			loading->readiness = ((float)x / WORLD_SIZE) * 50 + 1;
-			for (int z = 0; z < WORLD_SIZE; z++)
+			for (int z = world->genMinZ; z < world->genMaxZ; z++)
 			{
 				for (int y = 0; y <= superflatWorldHeight; y++)
 				{
@@ -2017,17 +1519,17 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 		loading->stateName = 7;
 		loading->stateName = 90;
 		world->initWorldBlocksLight();
-		world->SetPlayerSpawnPosition(Vector3(WORLD_SIZE / 2, world->groundHeight(WORLD_SIZE / 2, WORLD_SIZE / 2) + world->playerGrowth - 0.05f + 1, WORLD_SIZE / 2));
+		world->SetPlayerSpawnPosition(Vector3(WORLD_MID, world->groundHeight(WORLD_MID, WORLD_MID) + world->playerGrowth - 0.05f + 1, WORLD_MID));
 	}
 	if (worldType == FlatOcean)
 	{
 		loading->readiness = 1;
 		loading->stateName = 1;
 		int superflatWorldHeight = 32;
-		for (int x = 0; x < WORLD_SIZE; x++)
+		for (int x = world->genMinX; x < world->genMaxX; x++)
 		{
 			loading->readiness = ((float)x / WORLD_SIZE) * 50 + 1;
-			for (int z = 0; z < WORLD_SIZE; z++)
+			for (int z = world->genMinZ; z < world->genMaxZ; z++)
 			{
 				for (int y = 0; y <= superflatWorldHeight; y++)
 				{
@@ -2177,10 +1679,11 @@ void WorldGenerator::initRandompMap(int worldSize, int worldHeight, int chunkSiz
 		loading->stateName = 7;
 		loading->stateName = 90;
 		world->initWorldBlocksLight();
-		world->SetPlayerSpawnPosition(Vector3(WORLD_SIZE / 2, world->groundHeight(WORLD_SIZE / 2, WORLD_SIZE / 2) + world->playerGrowth - 0.05f + 1, WORLD_SIZE / 2));
+		world->SetPlayerSpawnPosition(Vector3(WORLD_MID, world->groundHeight(WORLD_MID, WORLD_MID) + world->playerGrowth - 0.05f + 1, WORLD_MID));
 	}
     loading->KillLoadingScreen();
     delete loading;
+    world->MarkAllColumnsGenerated();
 }
 
 float WorldGenerator::InterpolateBiomeNoise(int wx, int wz)
@@ -2258,6 +1761,60 @@ float WorldGenerator::InterpolateMoistureNoise(int wx, int wz)
 	return r3;
 }
 
+void WorldGenerator::PrepareColumnNoise(int x0, int z0, int chunkSize)
+{
+    noiseGridOn = false;
+    if(chunkSize <= 0 || chunkSize > 16)
+        return;
+    const int x1 = x0 + chunkSize - 1;
+    const int z1 = z0 + chunkSize - 1;
+
+    elevX0 = (int)floor(x0 / 4.0f);
+    elevZ0 = (int)floor(z0 / 4.0f);
+    elevNX = (int)ceil(x1 / 4.0f) - elevX0 + 1;
+    elevNZ = (int)ceil(z1 / 4.0f) - elevZ0 + 1;
+    roughX0 = (int)floor(x0 / 2.0f);
+    roughZ0 = (int)floor(z0 / 2.0f);
+    roughNX = (int)ceil(x1 / 2.0f) - roughX0 + 1;
+    roughNZ = (int)ceil(z1 / 2.0f) - roughZ0 + 1;
+    if(elevNX <= 0 || elevNZ <= 0 || elevNX > 8 || elevNZ > 8)
+        return;
+    if(roughNX <= 0 || roughNZ <= 0 || roughNX > 12 || roughNZ > 12)
+        return;
+
+    for(int iz = 0; iz < elevNZ; iz++)
+        for(int ix = 0; ix < elevNX; ix++)
+            elevGrid[ix][iz] = GetValue2D(elevX0 + ix, elevZ0 + iz, 1, 0.1f, 1.0f);
+    for(int iz = 0; iz < roughNZ; iz++)
+        for(int ix = 0; ix < roughNX; ix++)
+            roughGrid[ix][iz] = GetValue2D(roughX0 + ix, roughZ0 + iz, 3, 0.1f, 1.0f);
+    noiseGridOn = true;
+}
+
+float WorldGenerator::SampleElevation(int ix, int iz)
+{
+    if(noiseGridOn)
+    {
+        const int dx = ix - elevX0;
+        const int dz = iz - elevZ0;
+        if((unsigned)dx < (unsigned)elevNX && (unsigned)dz < (unsigned)elevNZ)
+            return elevGrid[dx][dz];
+    }
+    return GetValue2D(ix, iz, 1, 0.1f, 1.0f);
+}
+
+float WorldGenerator::SampleRoughness(int ix, int iz)
+{
+    if(noiseGridOn)
+    {
+        const int dx = ix - roughX0;
+        const int dz = iz - roughZ0;
+        if((unsigned)dx < (unsigned)roughNX && (unsigned)dz < (unsigned)roughNZ)
+            return roughGrid[dx][dz];
+    }
+    return GetValue2D(ix, iz, 3, 0.1f, 1.0f);
+}
+
 float WorldGenerator::InterpolateElevationNoise(int wx, int wz)
 {
 	float q1, q2, q3, q4, xinterp, yinterp, r1, r2, r3;
@@ -2269,10 +1826,10 @@ float WorldGenerator::InterpolateElevationNoise(int wx, int wz)
 	minz = floor(wz/4.0f);
 	maxz = ceil(wz/4.0f);
 
-	q1 = GetValue2D(minx,minz,1,0.1f,1.0f);
-	q2 = GetValue2D(maxx,minz,1,0.1f,1.0f);
-	q3 = GetValue2D(minx,maxz,1,0.1f,1.0f);
-	q4 = GetValue2D(maxx,maxz,1,0.1f,1.0f);
+	q1 = SampleElevation(minx,minz);
+	q2 = SampleElevation(maxx,minz);
+	q3 = SampleElevation(minx,maxz);
+	q4 = SampleElevation(maxx,maxz);
 
 	xinterp = (wx/4.0f - minx);
 	yinterp = (wz/4.0f - minz);
@@ -2296,10 +1853,10 @@ float WorldGenerator::InterpolateRoughnessNoise(int wx, int wz)
 	minz = floor(wz/2.0f);
 	maxz = ceil(wz/2.0f);
 
-	q1 = GetValue2D(minx,minz,3,0.1f,1.0f);
-	q2 = GetValue2D(maxx,minz,3,0.1f,1.0f);
-	q3 = GetValue2D(minx,maxz,3,0.1f,1.0f);
-	q4 = GetValue2D(maxx,maxz,3,0.1f,1.0f);
+	q1 = SampleRoughness(minx,minz);
+	q2 = SampleRoughness(maxx,minz);
+	q3 = SampleRoughness(minx,maxz);
+	q4 = SampleRoughness(maxx,maxz);
 
 	xinterp = (wx/2.0f - minx);
 	yinterp = (wz/2.0f - minz);
@@ -2310,6 +1867,144 @@ float WorldGenerator::InterpolateRoughnessNoise(int wx, int wz)
 	r3 = func1.Linear(r1,r2,yinterp);
 
 	return r3;
+}
+
+int WorldGenerator::DefaultTerrainHeight(int x, int z, int worldHeight)
+{
+    float HillFrequency = (GetValue2D(x,z,1,0.05f,1)+1.0f)/2.0f;
+    int Height = (int)((InterpolateElevationNoise(x,z) + InterpolateRoughnessNoise(x,z)*GetValue2D3(x,z,6,0.1f,1))*64*HillFrequency+62);
+    if(Height <= 48)
+        Height = 48-(48-Height)/2;
+    if(Height >= 68)
+        Height = 68+(Height-68)/2;
+
+    // Large scale "continent" noise: pulls wide regions down into seas and lakes.
+    float ocean = GetValue2D2(x, z, 1, 0.028f, 1.0f);
+    if(ocean < -0.22f)
+        Height -= (int)((-0.22f - ocean) * 46.0f);
+    // Small scale dips give ponds without needing a separate lake pass.
+    float pond = GetValue2D3(x, z, 1, 0.45f, 1.0f);
+    if(pond > 0.62f)
+        Height -= (int)((pond - 0.62f) * 14.0f);
+
+    if(Height < 4)
+        Height = 4;
+    if(Height >= worldHeight - 2)
+        Height = worldHeight - 3;
+    return Height;
+}
+
+int WorldGenerator::BiomeAt(int x, int z, int worldType)
+{
+    if(worldType == SnowyTaiga || worldType == FlatSnowyTaiga)
+        return BIOME_SNOW;
+    if(worldType == DesertLakes || worldType == FlatDesertLakes)
+        return BIOME_DESERT;
+
+    float temp = GetValue2D3(x, z, 1, 0.022f, 1.0f);      // ~700 block wavelength
+    float wet  = GetValue2D2(x, z, 1, 0.031f, 1.0f);
+    float edge = GetValue2D(x, z, 2, 0.55f, 0.16f);       // jagged biome borders
+    temp += edge;
+    wet  += edge * 0.5f;
+
+    if(worldType == Forest)
+    {
+        if(temp < -0.55f)
+            return BIOME_SNOW;
+        return BIOME_FOREST;
+    }
+
+    if(temp < -0.34f)
+        return BIOME_SNOW;
+    if(temp > 0.36f && wet < 0.12f)
+        return BIOME_DESERT;
+    if(wet > 0.02f)
+        return BIOME_FOREST;
+    return BIOME_PLAINS;
+}
+
+void WorldGenerator::PlaceDefaultTerrainColumn(CraftWorld *world, int x, int z, int worldType, int waterLevel, int worldHeight)
+{
+    int Height = DefaultTerrainHeight(x, z, worldHeight);
+    int biome = BiomeAt(x, z, worldType);
+    PlaceTerrainColumn(world, x, z, Height, biome, waterLevel, worldHeight);
+}
+
+void WorldGenerator::PlaceTerrainColumn(CraftWorld *world, int x, int z, int Height, int biome, int waterLevel, int worldHeight)
+{
+    // patch noise breaks up shorelines / river beds so they are not one material
+    float patch = GetValue2D2(x, z, 2, 0.35f, 1.0f);
+    bool underWater = Height < waterLevel;
+    bool shore = Height >= waterLevel - 1 && Height <= waterLevel + 1;
+
+    world->GetBlock(x, 0, z) = bedrock::getID();
+    world->GetBlock(x, 1, z) = bedrock::getID();
+    if(rand() % 2 == 0)
+        world->GetBlock(x, 2, z) = bedrock::getID();
+
+    for(int y = Height; y >= 2; y--)
+    {
+        block_t put = RockBlock::getID();
+        int depth = Height - y;   // 0 = surface block
+
+        if(biome == BIOME_DESERT)
+        {
+            if(depth < 4)
+                put = SandBlock::getID();
+            else if(depth < 8)
+                put = SandStone::getID();
+            if(underWater && depth == 0 && patch > 0.3f)
+                put = ClayBlock::getID();
+        }
+        else if(depth == 0)
+        {
+            if(underWater)
+            {
+                // sea / lake floor
+                if(patch > 0.45f)
+                    put = ClayBlock::getID();
+                else if(patch < -0.35f)
+                    put = Gravel::getID();
+                else if(Height < waterLevel - 6)
+                    put = Gravel::getID();
+                else
+                    put = SandBlock::getID();
+            }
+            else if(shore && patch > -0.25f)
+                put = SandBlock::getID();
+            else if(biome == BIOME_SNOW)
+                put = SnowSoil::getID();
+            else
+                put = GrassBlock::getID();
+        }
+        else if(depth < 4)
+        {
+            if((underWater || shore) && patch > -0.25f && depth < 3)
+                put = SandBlock::getID();
+            else
+                put = DirtBlock::getID();
+        }
+
+        world->GetBlock(x, y, z) = put;
+    }
+
+    if(underWater)
+    {
+        for(int y = waterLevel; y > Height; y--)
+        {
+            if(y <= 0 || y >= worldHeight)
+                continue;
+            world->GetBlock(x, y, z) = WaterBlock::getID();
+        }
+        if(biome == BIOME_SNOW && waterLevel > 0 && waterLevel < worldHeight)
+            world->GetBlock(x, waterLevel, z) = IceBlock::getID();
+    }
+    else if(biome == BIOME_SNOW && Height + 1 < worldHeight)
+    {
+        block_t top = world->GetBlock(x, Height, z);
+        if(top != IceBlock::getID())
+            world->GetBlock(x, Height + 1, z) = Snow2::getID();
+    }
 }
 
 void WorldGenerator::SetSeed(int seed)
@@ -2419,17 +2114,19 @@ float WorldGenerator::GetValue2D3(int wx, int wz, int octaves, float startFreque
 
 void WorldGenerator::initErosion(int WORLD_SIZE, CraftWorld *world)
 {
+    WORLD_SIZE = world->worldLimit;
     int num = 13 + rand() % 8;
 
     for(int i = 0; i < num; i++)
     {
-        int x = 6 + rand() % WORLD_SIZE-9;
-        int z = 6 + rand() % WORLD_SIZE-9;
+        int x = RandGenX(world, 6);
+        int z = RandGenZ(world, 6);
+        if(NearGenRim(world, x, z, world->CHUNK_SIZE + 4))
+            continue;
         int y = world->groundHeight(x,z);
 
         if(y <= 60)
         {
-            i--;
             continue;
         }
 
@@ -2520,18 +2217,19 @@ void WorldGenerator::initErosion(int WORLD_SIZE, CraftWorld *world)
 
 void WorldGenerator::initLavaPools(int WORLD_SIZE, CraftWorld *world)
 {
+    WORLD_SIZE = world->worldLimit;
     int num = 2 + rand() % 2;
 
     for(int i = 0; i < num; i++)
     {
-        int x = 9 + rand() % WORLD_SIZE-12;
-        int z = 9 + rand() % WORLD_SIZE-12;
+        int x = RandGenX(world, 9);
+        int z = RandGenZ(world, 9);
         int y = 0;
 
         while(world->groundHeight(x,z) < 70)
         {
-            x = 9 + rand() % WORLD_SIZE-12;
-            z = 9 + rand() % WORLD_SIZE-12;
+            x = RandGenX(world, 9);
+            z = RandGenZ(world, 9);
         }
         y = world->groundHeight(x,z);
 
@@ -2556,12 +2254,15 @@ void WorldGenerator::initLavaPools(int WORLD_SIZE, CraftWorld *world)
 
 void WorldGenerator::initLavaLakes(int WORLD_SIZE, CraftWorld *world)
 {
+    WORLD_SIZE = world->worldLimit;
     char lavaLakesNum = 7 + rand() % 4;
 
     for(int i = 0; i <= lavaLakesNum; i++)
     {
-        int x = 8 + rand() % WORLD_SIZE-9;
-        int z = 8 + rand() % WORLD_SIZE-9;
+        int x = RandGenX(world, 8);
+        int z = RandGenZ(world, 8);
+        if(NearGenRim(world, x, z, world->CHUNK_SIZE + 8))
+            continue;
         int y = 9 + rand() % 16;
 
         float radius = 3 + (rand() % 21)/10.0f;
@@ -2620,7 +2321,6 @@ void WorldGenerator::initLavaLakes(int WORLD_SIZE, CraftWorld *world)
         }
         else
         {
-            i--;
             continue;
         }
     }
@@ -2628,12 +2328,15 @@ void WorldGenerator::initLavaLakes(int WORLD_SIZE, CraftWorld *world)
 
 void WorldGenerator::initWaterLakes(int WORLD_SIZE, CraftWorld *world)
 {
+    WORLD_SIZE = world->worldLimit;
     char waterLakesNum = 10 + rand() % 7;
 
     for(int i = 0; i <= waterLakesNum; i++)
     {
-        int x = 5 + rand() % WORLD_SIZE-9;
-        int z = 5 + rand() % WORLD_SIZE-9;
+        int x = RandGenX(world, 5);
+        int z = RandGenZ(world, 5);
+        if(NearGenRim(world, x, z, world->CHUNK_SIZE + 8))
+            continue;
         int y = 14 + rand() % 32;
 
         float radius = 2.5 + (rand() % 18)/10.0f;
@@ -2690,7 +2393,6 @@ void WorldGenerator::initWaterLakes(int WORLD_SIZE, CraftWorld *world)
         }
         else
         {
-            i--;
             continue;
         }
     }
@@ -2698,6 +2400,8 @@ void WorldGenerator::initWaterLakes(int WORLD_SIZE, CraftWorld *world)
 
 void WorldGenerator::initBiome(int WORLD_SIZE, CraftWorld *world, PerlinModule* perlin, int seed)
 {
+    WORLD_SIZE = world->worldLimit;
+    const int WORLD_MID = (world->genMinX + world->genMaxX) / 2;
     /// ANOMALIES SECTION
     bool snowBiomeIncluded = true;
     bool snowBiomeSuperLarge = false;
@@ -2723,8 +2427,8 @@ void WorldGenerator::initBiome(int WORLD_SIZE, CraftWorld *world, PerlinModule* 
 
     /// SNOW BIOME
     float angle = (rand() % (629))/100.0f;
-    int biomeCenterX = WORLD_SIZE/2+sinf(angle)*(126);
-    int biomeCenterZ = WORLD_SIZE/2+cosf(angle)*(126);
+    int biomeCenterX = WORLD_MID+sinf(angle)*(126);
+    int biomeCenterZ = WORLD_MID+cosf(angle)*(126);
     int biomeRadius = 75+rand()%11+snowBiomeSuperLarge*(25+rand()%140);
 
     if(snowBiomeIncluded)
@@ -2776,8 +2480,8 @@ void WorldGenerator::initBiome(int WORLD_SIZE, CraftWorld *world, PerlinModule* 
 
         int rad = rand() % 15;
 
-        biomeCenterX = WORLD_SIZE/2+sinf(angle)*(126+rad);
-        biomeCenterZ = WORLD_SIZE/2+cosf(angle)*(126+rad);
+        biomeCenterX = WORLD_MID+sinf(angle)*(126+rad);
+        biomeCenterZ = WORLD_MID+cosf(angle)*(126+rad);
         biomeRadius = 75+rand()%11+snowBiomeSuperLarge*(25+rand()%140);
 
         world->desertBiomePosition = Vector3(biomeCenterX,0,biomeCenterZ);
@@ -2837,9 +2541,10 @@ void WorldGenerator::initBiome(int WORLD_SIZE, CraftWorld *world, PerlinModule* 
 
 void WorldGenerator::initCanes(int WORLD_SIZE, CraftWorld *world, int waterLevel)
 {
-    for (int z = 1; z < WORLD_SIZE-1; z++)
+    WORLD_SIZE = world->worldLimit;
+    for (int z = world->genMinZ + 1; z < world->genMaxZ - 1; z++)
     {
-        for (int x = 1; x < WORLD_SIZE-1; x++)
+        for (int x = world->genMinX + 1; x < world->genMaxX - 1; x++)
         {
             if (world->GetBlock(x,waterLevel,z) == SandBlock::getID())
             {
@@ -2861,17 +2566,17 @@ void WorldGenerator::initCanes(int WORLD_SIZE, CraftWorld *world, int waterLevel
 
 void WorldGenerator::initBedrock(int WORLD_SIZE, CraftWorld *world)
 {	
-	for (int z = 1; z < WORLD_SIZE; ++z)
+	for (int z = world->genMinZ; z < world->genMaxZ; ++z)
     {
-        for (int x = 1; x < WORLD_SIZE; ++x)
+        for (int x = world->genMinX; x < world->genMaxX; ++x)
         {
             world->GetBlock(x, 2, z) = bedrock::getID();//last one in set
         }
     }
 
-    for (int z = 1; z < WORLD_SIZE; ++z)
+    for (int z = world->genMinZ; z < world->genMaxZ; ++z)
     {
-        for (int x = 1; x < WORLD_SIZE; ++x)
+        for (int x = world->genMinX; x < world->genMaxX; ++x)
         {
             short r = rand() % 2;
             if (r == 1)
@@ -2881,9 +2586,9 @@ void WorldGenerator::initBedrock(int WORLD_SIZE, CraftWorld *world)
         }
     }
 
-    for (int z = 1; z < WORLD_SIZE; ++z)
+    for (int z = world->genMinZ; z < world->genMaxZ; ++z)
     {
-        for (int x = 1; x < WORLD_SIZE; ++x)
+        for (int x = world->genMinX; x < world->genMaxX; ++x)
         {
             short r = rand() % 3;
             if (r == 1)
@@ -2896,9 +2601,10 @@ void WorldGenerator::initBedrock(int WORLD_SIZE, CraftWorld *world)
 
 void WorldGenerator::initBeachSand(int WORLD_SIZE, CraftWorld *world)
 {
-    for (int z = 0; z < WORLD_SIZE; ++z)
+    WORLD_SIZE = world->worldLimit;
+    for (int z = world->genMinZ; z < world->genMaxZ; ++z)
     {
-        for (int x = 0; x < WORLD_SIZE; ++x)
+        for (int x = world->genMinX; x < world->genMaxX; ++x)
         {
             if (world->GetBlock(x,62,z) != 0 && world->GetBlock(x,63,z) == 0)
             {
@@ -2963,6 +2669,7 @@ void WorldGenerator::GeneratePileOfLeaves(CraftWorld *world, int x, int y, int z
 
 void WorldGenerator::GenerateClassicTree(int WORLD_SIZE, CraftWorld *world, int x, int y, int z, int trunkBlock, int leavesBlock)
 {
+    WORLD_SIZE = world->worldLimit;
     int trunkHeight = 3 + rand() % 3;
     if(trunkBlock == WhiteWoodBlock::getID()) // if it is oak
     {
@@ -3004,7 +2711,7 @@ void WorldGenerator::GenerateClassicTree(int WORLD_SIZE, CraftWorld *world, int 
         Block = trunkBlock;
     }
 
-    bool mooshroomTree = 1*(rand() % 12 == 0);
+    bool mooshroomTree = (rand() % 12 == 0);
     if(trunkBlock == WoodBlock::getID() && mooshroomTree)
     {
         for(int xx = x-2; xx <= x+2; xx++)
@@ -3207,6 +2914,7 @@ void WorldGenerator::GenerateClassicTree(int WORLD_SIZE, CraftWorld *world, int 
 
 void WorldGenerator::GenerateSpruceTree(int WORLD_SIZE, CraftWorld *world, int x, int y, int z)
 {
+    WORLD_SIZE = world->worldLimit;
     int trunkBlock = DarkWoodBlock::getID();
 
     int trunkHeight = 6+rand()%2;
@@ -3455,18 +3163,18 @@ void WorldGenerator::GenerateSpruceTree(int WORLD_SIZE, CraftWorld *world, int x
 
 void WorldGenerator::initRandomTrees(int WORLD_SIZE, CraftWorld *world)
 {
-    int treesNum = 256+rand()%51;
+    WORLD_SIZE = world->worldLimit;
+    int treesNum = ScaleGenCount(world, 256)+rand()%13;
 
 
     for (int i = 0; i < treesNum; i ++)
     {
-        int x = 3+rand()%(WORLD_SIZE-4);
-        int z = 3+rand()%(WORLD_SIZE-4);
+        int x = RandGenX(world, 3);
+        int z = RandGenZ(world, 3);
         int y = world->groundHeight(x,z);
 
         if(y >= 85)
         {
-            i--;
             continue;
         }
 
@@ -3503,6 +3211,10 @@ void WorldGenerator::initRandomTrees(int WORLD_SIZE, CraftWorld *world)
 
 void WorldGenerator::initTrees(int WORLD_SIZE, CraftWorld *world, PerlinModule* perlin, int seed)
 {
+    // only the spawn region is generated up front; a worldLimit² buffer would be 64 MB
+    WORLD_SIZE = world->genMaxX - world->genMinX;
+    if(WORLD_SIZE <= 0)
+        return;
     float *dataTrees = new float[WORLD_SIZE * WORLD_SIZE];
     perlin->setSeed(seed+10);
     perlin->setOctaveCount(8);
@@ -3519,25 +3231,24 @@ void WorldGenerator::initTrees(int WORLD_SIZE, CraftWorld *world, PerlinModule* 
     builderTrees.build ();
 
     float perlinHeight;
-    char woodBlock;
-    char leavesBlock;
+    block_t woodBlock;
+    block_t leavesBlock;
     bool snowTree = false;
 
     int treesNum = 1700;
 
     for (int i = 0; i < treesNum; i ++)
     {
-        int x = 5+rand()%(WORLD_SIZE-6);
-        int z = 5+rand()%(WORLD_SIZE-6);
+        int x = RandGenX(world, 5);
+        int z = RandGenZ(world, 5);
         int y = world->groundHeight(x,z);
 
         if(y >= 85)
         {
-            i--;
             continue;
         }
 
-        perlinHeight = dataTrees[x + z*WORLD_SIZE]* 128.0f/12.0f + 69;
+        perlinHeight = dataTrees[(x - world->genMinX) + (z - world->genMinZ)*WORLD_SIZE]* 128.0f/12.0f + 69;
         if(perlinHeight >=  72)
         {
             bool snowTree = false;
@@ -3583,14 +3294,15 @@ void WorldGenerator::initTrees(int WORLD_SIZE, CraftWorld *world, PerlinModule* 
 
 void WorldGenerator::initPumpkins(int WORLD_SIZE, CraftWorld *world)
 {
+    WORLD_SIZE = world->worldLimit;
     int NumPumpkinsSpawns = 12 + rand() % 4;
     int Frequency = 4; // 1 - 100
 
     for (int i = 0; i < NumPumpkinsSpawns; ++i)
     {
         //Choose the tpumpkin position
-        int x = rand() % WORLD_SIZE;
-        int z = rand() % WORLD_SIZE;
+        int x = RandGenX(world, 0);
+        int z = RandGenZ(world, 0);
         //check if there is an water on there or another tree
         int rad = 0;
 
@@ -3624,12 +3336,13 @@ void WorldGenerator::initPumpkins(int WORLD_SIZE, CraftWorld *world)
 
 void WorldGenerator::initFlowers(int WORLD_SIZE, CraftWorld *world) //generate flowers
 {
+    WORLD_SIZE = world->worldLimit;
     int num = 32 + rand() % 10;
 
     for (int i = 0; i < num; ++i)
     {
-        int centerX = 10 + rand() % (WORLD_SIZE-10);
-        int centerZ = 10 + rand() % (WORLD_SIZE-10);
+        int centerX = RandGenX(world, 10);
+        int centerZ = RandGenZ(world, 10);
 
         int size = 2 + rand() % 3;
         int typeProcent = 40 + rand() % 20;
@@ -3706,14 +3419,15 @@ void WorldGenerator::initFlowers(int WORLD_SIZE, CraftWorld *world) //generate f
 
 void WorldGenerator::initGrass(int WORLD_SIZE, CraftWorld *world)
 {
+    WORLD_SIZE = world->worldLimit;
 
     int NumTypes = 600;
 
     for (int i = 0; i < NumTypes; ++i)
     {
         //Choose the tpumpkin position
-        int x2 = rand() % WORLD_SIZE;
-        int z2 = rand() % WORLD_SIZE;
+        int x2 = RandGenX(world, 0);
+        int z2 = RandGenZ(world, 0);
 
 
         if(world->GetBlock(x2, world->groundHeight(x2, z2)+1, z2 ) == 0 && world->GetBlock(x2, world->groundHeight(x2, z2), z2 ) == 1)
@@ -3725,14 +3439,15 @@ void WorldGenerator::initGrass(int WORLD_SIZE, CraftWorld *world)
 
 void WorldGenerator::initOtherVegetation(int WORLD_SIZE, CraftWorld *world)
 {
+    WORLD_SIZE = world->worldLimit;
 
     int NumTypes = 100 + rand() % 100;
 
     for (int i = 0; i < NumTypes; ++i)
     {
         //Choose the tpumpkin position
-        int x2 = rand() % WORLD_SIZE;
-        int z2 = rand() % WORLD_SIZE;
+        int x2 = RandGenX(world, 0);
+        int z2 = RandGenZ(world, 0);
 
 
         if(world->GetBlock(x2, world->groundHeight(x2, z2)+1, z2 ) == 0)
@@ -3747,6 +3462,7 @@ void WorldGenerator::initOtherVegetation(int WORLD_SIZE, CraftWorld *world)
 
 int WorldGenerator::GenerateOreVine(int WORLD_SIZE, CraftWorld *world, int x, int y, int z, int oreID, int type)
 {
+    WORLD_SIZE = world->worldLimit;
     // type = {0 - sm, 1 - med, 2 - big}
     int orePlaced = 0;
     int m = rand() % 3;
@@ -3864,10 +3580,15 @@ int WorldGenerator::GenerateOreVine(int WORLD_SIZE, CraftWorld *world, int x, in
 
 void WorldGenerator::initOre(int WORLD_SIZE, CraftWorld *world, int oreID, float oreConcentration, int oreLowestBoundary, int oreHighestBoundary, int variations) // brief and sweet function
 {
+    WORLD_SIZE = world->worldLimit;
     // oreConcentration - var between 0 and 100
 
     oreConcentration = oreConcentration / 100.0f; // percents
-    int oreAmount = oreConcentration*(WORLD_SIZE*WORLD_SIZE*(oreHighestBoundary-oreLowestBoundary));
+    int gw = world->genMaxX - world->genMinX;
+    int gd = world->genMaxZ - world->genMinZ;
+    if(gw < 4) gw = 4;
+    if(gd < 4) gd = 4;
+    int oreAmount = oreConcentration*(gw*gd*(oreHighestBoundary-oreLowestBoundary));
 
     switch(oreID)
     {
@@ -3879,30 +3600,37 @@ void WorldGenerator::initOre(int WORLD_SIZE, CraftWorld *world, int oreID, float
         case 5: world->mainWorldVariables.worldGoldenOre = oreAmount;
     }
 
-    while(oreAmount > 0)
+    int attempts = 0;
+    int maxAttempts = oreAmount * 4 + 32;
+    while(oreAmount > 0 && attempts < maxAttempts)
     {
-        int x = 1+rand()%(WORLD_SIZE-2);
+        attempts++;
+        int x = RandGenX(world, 1);
         int y = oreLowestBoundary+rand()%(oreHighestBoundary-oreLowestBoundary+1);
-        int z = 1+rand()%(WORLD_SIZE-2);
+        int z = RandGenZ(world, 1);
 
-        oreAmount -= GenerateOreVine(WORLD_SIZE,world,x,y,z,oreID,rand()%variations);
+        int placed = GenerateOreVine(WORLD_SIZE,world,x,y,z,oreID,rand()%variations);
+        if(placed > 0)
+            oreAmount -= placed;
+        else
+            oreAmount--;
     }
 }
 
 void WorldGenerator::initClay(int WORLD_SIZE, CraftWorld *world)
 {
+    WORLD_SIZE = world->worldLimit;
     int NumOres = 40 + rand() % 20;
 
     for (int i = 0; i < NumOres; ++i)
     {
         //Choose the tpumpkin positionh
-        int x = rand() % WORLD_SIZE;
-        int z = rand() % WORLD_SIZE;
+        int x = RandGenX(world, 0);
+        int z = RandGenZ(world, 0);
         int y = world->groundHeight(x,z);
 
-        if(y >= 63)
+        if(y >= 63 || y < 0)
         {
-            i--;
             continue;
         }
         float radius = 1.5+(rand()%12)/10.0f;
@@ -3915,16 +3643,20 @@ void WorldGenerator::initClay(int WORLD_SIZE, CraftWorld *world)
 
 void WorldGenerator::initDirt(int WORLD_SIZE, CraftWorld *world)
 {
-    int NumBlocks = 1500;
+    WORLD_SIZE = world->worldLimit;
+    int NumBlocks = ScaleGenCount(world, 1500);
     float radius = 2.0f + (rand() % 35)/10.0f;
 
     short PlaceBlock = DirtBlock::getID();
 
     for (int i = 0; i < NumBlocks; ++i)
     {
-        int x = rand() % WORLD_SIZE;
-        int z = rand() % WORLD_SIZE;
-        int y = 4 + rand() % (world->groundHeight(x,z)-1);
+        int x = RandGenX(world, 0);
+        int z = RandGenZ(world, 0);
+        int gh = world->groundHeight(x,z);
+        if(gh < 6)
+            continue;
+        int y = 4 + rand() % (gh-1);
 
         world->BuildBlockSphere(radius, PlaceBlock, x, y, z, RockBlock::getID());
 
@@ -3933,16 +3665,20 @@ void WorldGenerator::initDirt(int WORLD_SIZE, CraftWorld *world)
 
 void WorldGenerator::initGravel(int WORLD_SIZE, CraftWorld *world)
 {
-    int NumBlocks = 400;
+    WORLD_SIZE = world->worldLimit;
+    int NumBlocks = ScaleGenCount(world, 400);
     float radius = 2.0f + (rand() % 30)/10.0f;
 
     short PlaceBlock = RockBlock::getID();
 
     for (int i = 0; i < NumBlocks; ++i)
     {
-        int x = rand() % WORLD_SIZE;
-        int z = rand() % WORLD_SIZE;
-        int y = 4 + rand() % (world->groundHeight(x,z)-1);
+        int x = RandGenX(world, 0);
+        int z = RandGenZ(world, 0);
+        int gh = world->groundHeight(x,z);
+        if(gh < 6)
+            continue;
+        int y = 4 + rand() % (gh-1);
 
         world->BuildBlockSphere(radius, PlaceBlock, x, y, z, RockBlock::getID());
     }
@@ -3951,18 +3687,20 @@ void WorldGenerator::initGravel(int WORLD_SIZE, CraftWorld *world)
 
 void WorldGenerator::initDungeons(int WORLD_SIZE, CraftWorld *world)
 {
+    WORLD_SIZE = world->worldLimit;
     int xSize, ySize, zSize;
     int x, y, z;
 
     ySize = 5;
+    int dungeonTries = 0;
 
-    for(int t = 0; t <= 4; t++)
+    for(int t = 0; t <= 4 && dungeonTries < 24; t++)
     {
         xSize = 5+rand()%3;
         zSize = 5+rand()%3;
 
-        x = 1 + rand() % (WORLD_SIZE-8);
-        z = 1 + rand() % (WORLD_SIZE-8);
+        x = RandGenX(world, 1);
+        z = RandGenZ(world, 1);
 
         y = 42-(t*12) + rand() % 12;
         if(t == 4)
@@ -4002,6 +3740,7 @@ void WorldGenerator::initDungeons(int WORLD_SIZE, CraftWorld *world)
 
         if(no)
         {
+            dungeonTries++;
             t--;
             continue;
         }
@@ -4127,4 +3866,738 @@ void WorldGenerator::initDungeons(int WORLD_SIZE, CraftWorld *world)
             world->mChests.push_back(NewChest);
         }
     }
+}
+
+// ============================== the Nether ==============================
+//
+// The nether is not terrain built up from a surface: it is one solid mass with caverns carved out
+// of it. Bedrock floor, netherrack body, bedrock ceiling, and then a single 3D noise field whose
+// threshold slides with height, so the middle of the column opens into a connected cavern layer
+// while the floor and ceiling stay whole.
+//
+// The thresholds come from measuring this exact field offline (probe in _tmp_nether). fBm over
+// SimplexNoise is centred on zero, so a threshold of t leaves about (50 - 214*t) per cent of a band
+// open -- that is how the control points below were placed.
+static const int NETHER_LAVA_LEVEL = 31;
+
+static float NetherCarveThreshold(int y)
+{
+    // Interpolated rather than stepped: a hard step would terrace the carving into flat bands.
+    static const float pts[][2] = {
+        {   0, 0.62f },   // floor: no carve at all
+        {   8, 0.35f },
+        {  20, 0.10f },
+        {  31, -0.02f },  // the lava sea level, and the most open band
+        {  55, -0.02f },
+        {  70, 0.10f },
+        {  90, 0.28f },
+        { 104, 0.62f },
+        { 111, 0.95f },   // ceiling: no carve at all again
+    };
+    const int n = (int)(sizeof(pts) / sizeof(pts[0]));
+    if(y <= (int)pts[0][0])
+        return pts[0][1];
+    if(y >= (int)pts[n - 1][0])
+        return pts[n - 1][1];
+    for(int i = 0; i + 1 < n; i++)
+    {
+        if(y <= (int)pts[i + 1][0])
+        {
+            float f = (y - pts[i][0]) / (pts[i + 1][0] - pts[i][0]);
+            return pts[i][1] + f * (pts[i + 1][1] - pts[i][1]);
+        }
+    }
+    return pts[n - 1][1];
+}
+
+void WorldGenerator::GenerateNetherColumn(CraftWorld *world, int cx, int cz)
+{
+    int CHUNK_SIZE = world->CHUNK_SIZE;
+    int WORLD_HEIGHT = world->WORLD_HEIGHT;
+    int worldLimit = world->worldLimit;
+    int x0 = cx * CHUNK_SIZE;
+    int z0 = cz * CHUNK_SIZE;
+    if(x0 < 0 || z0 < 0 || x0 >= worldLimit || z0 >= worldLimit)
+        return;
+
+    const int ceiling = WORLD_HEIGHT - 1;
+    const block_t netherrack = Netherrack::getID();
+    const block_t bedrockId = bedrock::getID();
+    const block_t lava = Lava::getID();
+
+    // ---- 1. the solid mass ----
+    for(int lz = 0; lz < CHUNK_SIZE; lz++)
+    {
+        int z = z0 + lz;
+        if(z < 0 || z >= worldLimit)
+            continue;
+        for(int lx = 0; lx < CHUNK_SIZE; lx++)
+        {
+            int x = x0 + lx;
+            if(x < 0 || x >= worldLimit)
+                continue;
+            world->GetBlock(x, 0, z) = bedrockId;
+            for(int y = 1; y < ceiling; y++)
+                world->GetBlock(x, y, z) = netherrack;
+            world->GetBlock(x, ceiling, z) = bedrockId;
+            // a ragged floor: bedrock climbs a few blocks here and there, so the bottom of the
+            // world does not read as a flat sheet
+            for(int y = 1; y <= 5; y++)
+                if((rand() % 8) < (6 - y))
+                    world->GetBlock(x, y, z) = bedrockId;
+        }
+    }
+
+    // ---- 2. carve the caverns ----
+    //
+    // The field is sampled every 2 blocks and the blocks between the samples are filled in by
+    // interpolation. The previous version thresholded the 2-block samples directly, so every carve
+    // boundary landed on the 2-block lattice and the cavern walls came out stepped in 2x2 and 3x3
+    // patches -- "chunky", and the reason the nether did not read as clean.
+    //
+    // Interpolating is nearly free: 81 samples per 2-block band instead of 64, so almost no extra
+    // noise, and the interpolation itself is a handful of multiplies per block. Sampling at every
+    // block instead would have been four times the noise calls, which on the PSP is generation time
+    // paid while the player is waiting to see the world.
+    const int kBandSamples = CHUNK_SIZE / 2 + 1;   // 9: the far edge is needed as the basis for the last block
+    // Fixed-size rather than CHUNK_SIZE-derived: the bounds are used as array dimensions and as a
+    // reference type in the lambdas below, and a variable-length array there is not something the PSP
+    // toolchain is comfortable with. 17 covers a CHUNK_SIZE of 32, twice what the game uses.
+    const int kBandGridMax = 17;
+    float bandNear[kBandGridMax][kBandGridMax];
+    float bandFar[kBandGridMax][kBandGridMax];
+    float bandMid[kBandGridMax][kBandGridMax];
+
+    auto sampleBand = [&](float (&grid)[kBandGridMax][kBandGridMax], int wy)
+    {
+        for(int i = 0; i < kBandSamples; i++)
+            for(int j = 0; j < kBandSamples; j++)
+                grid[i][j] = GetValue3D(x0 + i * 2, wy, z0 + j * 2, 3, 0.45f, 1.0f);
+    };
+
+    // Carve the cells of one y layer, reading the field from grid by bilinear interpolation in x and z.
+    auto carveLayer = [&](float (&grid)[kBandGridMax][kBandGridMax], int yy)
+    {
+        if(yy <= 1 || yy >= ceiling)
+            return;
+        const float threshold = NetherCarveThreshold(yy);
+        for(int lz = 0; lz < CHUNK_SIZE; lz++)
+        {
+            const int z = z0 + lz;
+            if(z < 0 || z >= worldLimit)
+                continue;
+            const int j = lz >> 1;
+            const float fz = (lz & 1) ? 0.5f : 0.0f;
+            for(int lx = 0; lx < CHUNK_SIZE; lx++)
+            {
+                const int x = x0 + lx;
+                if(x < 0 || x >= worldLimit)
+                    continue;
+                const int i = lx >> 1;
+                const float fx = (lx & 1) ? 0.5f : 0.0f;
+                const float near = grid[i][j] * (1.0f - fx) + grid[i + 1][j] * fx;
+                const float far  = grid[i][j + 1] * (1.0f - fx) + grid[i + 1][j + 1] * fx;
+                if(near * (1.0f - fz) + far * fz <= threshold)
+                    continue;
+                block_t& b = world->GetBlock(x, yy, z);
+                if(b == netherrack)
+                    // everything below the lava level is the sea itself
+                    b = (yy <= NETHER_LAVA_LEVEL) ? lava : 0;
+            }
+        }
+    };
+
+    sampleBand(bandNear, 2);
+    for(int y = 2; y < ceiling - 1; y += 2)
+    {
+        sampleBand(bandFar, y + 2);
+        // bandNear is the field at y and bandFar at y + 2, so y takes bandNear unchanged and y + 1 is
+        // halfway between the two. That is the whole of the vertical interpolation.
+        for(int i = 0; i < kBandSamples; i++)
+            for(int j = 0; j < kBandSamples; j++)
+                bandMid[i][j] = 0.5f * (bandNear[i][j] + bandFar[i][j]);
+
+        carveLayer(bandNear, y);
+        carveLayer(bandMid, y + 1);
+
+        // This band becomes the near side of the next pair.
+        for(int i = 0; i < kBandSamples; i++)
+            for(int j = 0; j < kBandSamples; j++)
+                bandNear[i][j] = bandFar[i][j];
+    }
+
+    // ---- 3. the surfaces the caverns expose ----
+    for(int lz = 0; lz < CHUNK_SIZE; lz++)
+    {
+        int z = z0 + lz;
+        if(z < 0 || z >= worldLimit)
+            continue;
+        for(int lx = 0; lx < CHUNK_SIZE; lx++)
+        {
+            int x = x0 + lx;
+            if(x < 0 || x >= worldLimit)
+                continue;
+            for(int y = 1; y < ceiling; y++)
+            {
+                if(world->GetBlock(x, y, z) != netherrack)
+                    continue;
+                block_t above = world->GetBlock(x, y + 1, z);
+                if(above != 0 && above != lava && above != Fire::getID())
+                    continue;
+
+                if(y >= NETHER_LAVA_LEVEL - 2 && y <= NETHER_LAVA_LEVEL + 8)
+                {
+                    // soul sand: shallow floor patches beside the lava, the nether's beach
+                    if(GetValue2D3(x, z, 2, 0.25f, 1.0f) > 0.18f && (rand() % 5) < 3)
+                    {
+                        world->GetBlock(x, y, z) = Soulsand::getID();
+                        continue;
+                    }
+                    if((rand() % 55) == 0)
+                    {
+                        world->GetBlock(x, y, z) = MagmaBlock::getID();
+                        continue;
+                    }
+                    // fire on the exposed netherrack at the lava's edge. Fire needs a block to sit
+                    // on, which is this one; it is placed above, not in place of.
+                    if(above == 0 && y <= NETHER_LAVA_LEVEL + 4 && (rand() % 40) == 0)
+                        world->GetBlock(x, y + 1, z) = Fire::getID();
+                    continue;
+                }
+
+                // glowstone: clusters hanging off the underside of the mass, in the upper half of
+                // the column, where they light the caverns rather than sitting in the lava
+                if(above == 0 && y > 45 && y < ceiling - 3 && (rand() % 190) == 0)
+                {
+                    int r = 1 + rand() % 2;
+                    for(int dx = -r; dx <= r; dx++)
+                    {
+                        for(int dz = -r; dz <= r; dz++)
+                        {
+                            for(int dy = -r; dy <= 0; dy++)
+                            {
+                                if(abs(dx) + abs(dz) + abs(dy) > r + 1)
+                                    continue;
+                                int gx = x + dx, gy = y + dy, gz = z + dz;
+                                if(gy <= 1 || gy >= ceiling)
+                                    continue;
+                                if(gx < 0 || gz < 0 || gx >= worldLimit || gz >= worldLimit)
+                                    continue;
+                                if(world->GetBlock(gx, gy, gz) == 0)
+                                {
+                                    world->GetBlock(gx, gy, gz) = GlowstoneBlock::getID();
+                                    // Placed light, not just a placed block: the nether runs no light pass of
+                                    // its own (see the note at the end of this function), so a source the
+                                    // generation writes is a source that never glows until something seeds
+                                    // it. Once per cluster, at its origin, rather than once per cell.
+                                    if(gx == x && gy == y && gz == z)
+                                        world->SetLigtSourcePosition(gx, gy, gz, GlowstoneBlock::getID());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- 4. glowstone ----
+    //
+    // Glowstone is seeded where it is placed, above: it is a genuine light source whose glow spreads into
+    // the cavern, and one flood per cluster at the cluster's origin is the shape SetLigtSourcePosition
+    // wants.
+    //
+    // Lava is deliberately NOT seeded. It is a light source too, but LightTravel stops dead at a
+    // light-source block once its level drops below 11, so a seed inside the sea lights its own cell and
+    // the air above it and can never reach the next lava block along -- which lit isolated cells and left
+    // the rest of the surface at the 0.4 ambient, the bright squares the sea was covered in. Lava is
+    // drawn at full brightness instead, from the block itself; see BlockFinalLightNoCheck. There is
+    // nothing to seed and nothing to keep in step with the light data.
+}
+
+// Is the player-sized volume above this floor actually open? A three-block shaft in one column is not
+// enough: the player lands in a one-wide hole in the middle of solid netherrack, the camera ends up
+// inside the walls, and the view is netherrack seen from inside with the faces culled -- which reads
+// as having spawned inside the ground, looking straight through it.
+static bool NetherVolumeOpen(CraftWorld *world, int x, int y, int z)
+{
+    // y is the first air block; the player stands here and their head is one block up, so a 3x3
+    // footprint at both levels has to be clear.
+    for(int dy = 0; dy < 2; dy++)
+        for(int dz = -1; dz <= 1; dz++)
+            for(int dx = -1; dx <= 1; dx++)
+                if(world->GetBlock(x + dx, y + dy, z + dz) != 0)
+                    return false;
+    return true;
+}
+
+// The nether cannot use groundHeight() for its spawn: that scans down from the top of the world, so
+// in a dimension with a bedrock ceiling it returns the ceiling and the player would be placed on
+// top of the world. This looks for a netherrack floor with a room above it instead, nearest the
+// middle first, and above the lava sea so the player does not land in it.
+bool WorldGenerator::FindNetherSpawn(CraftWorld *world, int &outX, int &outY, int &outZ)
+{
+    const block_t netherrack = Netherrack::getID();
+    int worldLimit = world->worldLimit;
+    int mid = worldLimit / 2;
+    for(int r = 0; r <= 24; r++)
+    {
+        for(int dz = -r; dz <= r; dz++)
+        {
+            for(int dx = -r; dx <= r; dx++)
+            {
+                if(r > 0 && abs(dx) != r && abs(dz) != r)
+                    continue;   // ring only, so nearer ground wins
+                int x = mid + dx;
+                int z = mid + dz;
+                if(x < 3 || z < 3 || x >= worldLimit - 3 || z >= worldLimit - 3)
+                    continue;
+                // Highest floor first: the top of a cavern, so the player is under the ceiling
+                // rather than on a ledge under an open shaft.
+                for(int y = 70; y >= NETHER_LAVA_LEVEL + 2; y--)
+                {
+                    if(world->GetBlock(x, y, z) != netherrack)
+                        continue;
+                    if(!NetherVolumeOpen(world, x, y + 1, z))
+                        continue;
+                    outX = x;
+                    outY = y + 1;
+                    outZ = z;
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static bool SliceBudgetSpent(unsigned int startUs, unsigned int budgetUs)
+{
+    if(budgetUs == 0)
+        return false;
+    unsigned int now = sceKernelGetSystemTimeLow();
+    return (unsigned int)((int)now - (int)startUs) >= budgetUs;
+}
+
+void WorldGenerator::GenerateColumn(CraftWorld *world, int cx, int cz)
+{
+    int step = 0;
+    GenerateColumnSlice(world, cx, cz, step, 0, 0);
+}
+
+bool WorldGenerator::GenerateColumnSlice(CraftWorld *world, int cx, int cz, int &step, unsigned int startUs, unsigned int budgetUs)
+{
+    int CHUNK_SIZE = world->CHUNK_SIZE;
+    int WORLD_HEIGHT = world->WORLD_HEIGHT;
+    int worldType = world->worldType;
+    int waterLevel = world->waterLevel;
+    if(waterLevel < 8)
+        waterLevel = 58;
+    int x0 = cx * CHUNK_SIZE;
+    int z0 = cz * CHUNK_SIZE;
+
+    // A dimension is generated by what the world *is*, not by the biome option that happened to be
+    // picked when it was created, so this is checked before worldType. FlatNETHER routes here too:
+    // it used to be a hardcoded slab in the spawn region and a full column when streamed, which is
+    // why that world looked like one thing where it spawned and another thing past the spawn ring.
+    // The nether column is still one piece. Its carve is a single noise field with state between
+    // every y band, and splitting it would be a different generator. The overworld, which is what
+    // a sprint through new ground actually pays for, yields between rows.
+    if(world->dimension == 1 || worldType == FlatNETHER)
+    {
+        if(step == 0)
+            GenerateNetherColumn(world, cx, cz);
+        step = 1;
+        return true;
+    }
+
+    // One column at a time, and the noise grid is that column's. Cleared when the terrain rows
+    // finish so a later height sample cannot read a stale grid. The pin stays for the caves and
+    // the trees, which write the same column.
+    world->PinLastColumn(world->FindColumn(cx, cz));
+    if(step == 0 || (step < CHUNK_SIZE && !noiseGridOn))
+        PrepareColumnNoise(x0, z0, CHUNK_SIZE);
+    while(step < CHUNK_SIZE)
+    {
+        int lz = step;
+        for(int lx = 0; lx < CHUNK_SIZE; lx++)
+        {
+            int x = x0 + lx;
+            int z = z0 + lz;
+            if(x < 0 || z < 0 || x >= world->worldLimit || z >= world->worldLimit)
+                continue;
+
+            if(worldType == SUPERFLAT || worldType == FlatDesertLakes || worldType == FlatSnowyTaiga || worldType == FlatOcean)
+            {
+                world->GetBlock(x, 0, z) = bedrock::getID();
+                world->GetBlock(x, 1, z) = DirtBlock::getID();
+                world->GetBlock(x, 2, z) = DirtBlock::getID();
+                world->GetBlock(x, 3, z) = DirtBlock::getID();
+                if(worldType == FlatOcean)
+                {
+                    world->GetBlock(x, 4, z) = SandBlock::getID();
+                    for(int y = 5; y <= waterLevel && y < WORLD_HEIGHT; y++)
+                        world->GetBlock(x, y, z) = WaterBlock::getID();
+                }
+                else
+                    world->GetBlock(x, 4, z) = GrassBlock::getID();
+                if(lx < 16 && lz < 16)
+                    colHeights[lx][lz] = (worldType == FlatOcean) ? waterLevel : 4;
+                continue;
+            }
+
+            int Height = DefaultTerrainHeight(x, z, WORLD_HEIGHT);
+            int biome = BiomeAt(x, z, worldType);
+            if(lx < 16 && lz < 16)
+            {
+                colHeights[lx][lz] = Height;
+                colBiomes[lx][lz] = biome;
+            }
+            PlaceTerrainColumn(world, x, z, Height, biome, waterLevel, WORLD_HEIGHT);
+
+            for(int y = 5; y < Height-4; y++)
+            {
+                if(world->GetBlock(x, y, z) != RockBlock::getID())
+                    continue;
+                int r = rand() % 400;
+                if(r < 2)
+                    world->GetBlock(x, y, z) = CoalOre::getID();
+                else if(r == 2 && y < 56)
+                    world->GetBlock(x, y, z) = IronOre::getID();
+                else if(r == 3 && y < 30)
+                    world->GetBlock(x, y, z) = GoldBlock::getID();
+                else if(r == 4 && y < 15)
+                    world->GetBlock(x, y, z) = RedstoneOre::getID();
+                else if(r == 5 && y < 34 && rand() % 2 == 0)
+                    world->GetBlock(x, y, z) = LapisOre::getID();
+                else if(r == 6 && y < 14 && rand() % 3 == 0)
+                    world->GetBlock(x, y, z) = DiamondOre::getID();
+            }
+        }
+        step++;
+        if(SliceBudgetSpent(startUs, budgetUs))
+            return false;
+    }
+
+    // Hand the streamed column back once, with the surface and its water in place and the caves not
+    // started. The caller lights that surface and the mesher draws it while the slices below carve.
+    // A sync caller (budget 0) never stops here, so spawn terrain is unchanged.
+    if(budgetUs != 0 && step == CHUNK_SIZE && world->pauseAfterTerrain)
+    {
+        world->pauseAfterTerrain = false;
+        ChunkColumn* col = world->FindColumn(cx, cz);
+        if(col)
+        {
+            int maxH = 0;
+            int minH = 0x7fffffff;
+            int n = CHUNK_SIZE < 16 ? CHUNK_SIZE : 16;
+            for(int lz = 0; lz < n; lz++)
+                for(int lx = 0; lx < n; lx++)
+                {
+                    if(colHeights[lx][lz] > maxH)
+                        maxH = colHeights[lx][lz];
+                    if(colHeights[lx][lz] < minH)
+                        minH = colHeights[lx][lz];
+                }
+            if(minH > maxH)
+                minH = maxH;
+            // The whole band, not just the summit: the mesher draws every section the ground passes
+            // through, so a hillside's lower half does not wait for the caves under it.
+            col->surfaceY = maxH;
+            col->surfaceMinY = minH;
+            col->surfaceKnown = true;
+        }
+        noiseGridOn = false;
+        return false;
+    }
+
+    int caveSteps = 0;
+    for(int lz = 0; lz + 1 < CHUNK_SIZE && lz + 1 < 16; lz += 2)
+        caveSteps++;
+    int decorateAt = CHUNK_SIZE + caveSteps;
+    bool carve = world->makeCaves && worldType != SUPERFLAT && worldType != FlatOcean && worldType != FlatNETHER;
+    if(!carve)
+        step = decorateAt;
+
+    // Caves: one 3D noise sample is shared by a 2x2 block footprint (4x fewer sdnoise3
+    // calls, this was the most expensive part of a streamed column) and nothing is
+    // carved under the sea floor. One 2-block strip per resume, so a strip that runs
+    // long is the frame, not the whole column.
+    while(step < decorateAt)
+    {
+        int lz = (step - CHUNK_SIZE) * 2;
+        for(int lx = 0; lx + 1 < CHUNK_SIZE && lx + 1 < 16; lx += 2)
+        {
+            int x = x0 + lx;
+            int z = z0 + lz;
+            if(x < 0 || z < 0 || x + 1 >= world->worldLimit || z + 1 >= world->worldLimit)
+                continue;
+            int h = colHeights[lx][lz];
+            int h2 = colHeights[lx + 1][lz];
+            if(h2 < h) h = h2;
+            h2 = colHeights[lx][lz + 1];
+            if(h2 < h) h = h2;
+            h2 = colHeights[lx + 1][lz + 1];
+            if(h2 < h) h = h2;
+            if(h < waterLevel - 1)
+                continue;
+            int yEnd = h - 8;
+            if(yEnd > WORLD_HEIGHT - 2)
+                yEnd = WORLD_HEIGHT - 2;
+            for(int y = 8; y < yEnd; y++)
+            {
+                if(GetValue3D(x, y, z, 1, 0.09f, 1.0f) <= 0.52f)
+                    continue;
+                for(int dz = 0; dz < 2; dz++)
+                {
+                    for(int dx = 0; dx < 2; dx++)
+                    {
+                        block_t& b = world->GetBlock(x + dx, y, z + dz);
+                        if(b == RockBlock::getID() || b == DirtBlock::getID() || b == CoalOre::getID() || b == IronOre::getID())
+                            b = 0;
+                    }
+                }
+            }
+        }
+        step++;
+        if(SliceBudgetSpent(startUs, budgetUs))
+            return false;
+    }
+
+    if(step == decorateAt)
+    {
+        if(SliceBudgetSpent(startUs, budgetUs))
+            return false;
+        if(worldType != SUPERFLAT && worldType != FlatOcean && worldType != FlatNETHER && worldType != FlatDesertLakes && worldType != FlatSnowyTaiga)
+            DecorateColumn(world, cx, cz, true);
+        step++;
+    }
+    noiseGridOn = false;
+    // A finished overworld column may grow one animal pair. A column read back from the card
+    // never reaches here, so a saved herd is not joined by a second one.
+    world->TryAnimalPack(cx, cz);
+    return true;
+}
+
+// Surface / underground features for one 16x16 column. Used for spawn columns and
+// streamed columns alike so both look the same. Everything here stays inside the
+// column except tree canopies and pockets, which may spill into loaded neighbours.
+void WorldGenerator::DecorateColumn(CraftWorld *world, int cx, int cz, bool useCache)
+{
+    int CHUNK_SIZE = world->CHUNK_SIZE;
+    int WORLD_HEIGHT = world->WORLD_HEIGHT;
+    int worldType = world->worldType;
+    int waterLevel = world->waterLevel;
+    if(waterLevel < 8)
+        waterLevel = 58;
+    int x0 = cx * CHUNK_SIZE;
+    int z0 = cz * CHUNK_SIZE;
+    if(x0 < 0 || z0 < 0 || x0 >= world->worldLimit || z0 >= world->worldLimit)
+        return;
+    if(CHUNK_SIZE > 16)
+        useCache = false;
+
+    int biome = useCache ? colBiomes[CHUNK_SIZE / 2][CHUNK_SIZE / 2] : BiomeAt(x0 + CHUNK_SIZE / 2, z0 + CHUNK_SIZE / 2, worldType);
+    // forest density varies inside a biome so woods have clearings and thickets
+    float forestNoise = GetValue2D3(x0 + 8, z0 + 8, 1, 0.12f, 1.0f);
+
+    // ---- underground pockets: dirt, gravel, lava, water ----
+    for(int p = 0; p < 2; p++)
+    {
+        int px = x0 + rand() % CHUNK_SIZE;
+        int pz = z0 + rand() % CHUNK_SIZE;
+        int py = 6 + rand() % 50;
+        if(world->GetBlock(px, py, pz) == RockBlock::getID())
+            world->BuildBlockSphere(1.5f + (rand() % 10) / 10.0f, (p == 0) ? DirtBlock::getID() : Gravel::getID(), px, py, pz, RockBlock::getID());
+    }
+    if(rand() % 9 == 0)
+    {
+        int px = x0 + 4 + rand() % (CHUNK_SIZE - 8);
+        int pz = z0 + 4 + rand() % (CHUNK_SIZE - 8);
+        int py = 9 + rand() % 14;
+        bool solid = true;
+        for(int dx = -3; dx <= 3 && solid; dx++)
+            for(int dy = -3; dy <= 4 && solid; dy++)
+                for(int dz = -3; dz <= 3 && solid; dz++)
+                    if(world->GetBlock(px + dx, py + dy, pz + dz) == 0)
+                        solid = false;
+        if(solid)
+        {
+            float r = 2.0f + (rand() % 10) / 10.0f;
+            world->BuildBlockSphere(r, Lava::getID(), px, py, pz);
+            for(int dx = -3; dx <= 3; dx++)
+                for(int dy = 0; dy <= 4; dy++)
+                    for(int dz = -3; dz <= 3; dz++)
+                        if(world->GetBlock(px + dx, py + dy, pz + dz) == Lava::getID())
+                            world->GetBlock(px + dx, py + dy, pz + dz) = 0;
+        }
+    }
+
+    // ---- surface pass ----
+    for(int lz = 0; lz < CHUNK_SIZE; lz++)
+    {
+        for(int lx = 0; lx < CHUNK_SIZE; lx++)
+        {
+            int x = x0 + lx;
+            int z = z0 + lz;
+            int y;
+            if(useCache)
+            {
+                // terrain top is known; only a tree/pocket could have changed it, so a
+                // short scan from a few blocks above is enough (no 112-block walk)
+                int top = colHeights[lx][lz] + 3;
+                if(top >= WORLD_HEIGHT) top = WORLD_HEIGHT - 1;
+                y = -1;
+                for(int yy = top; yy >= 0; yy--)
+                {
+                    block_t b = world->GetBlock(x, yy, z);
+                    if(b != 0 && b != Snow2::getID())
+                    {
+                        y = yy;
+                        break;
+                    }
+                }
+            }
+            else
+                y = world->groundHeightExcept(x, z, Snow2::getID());
+            if(y < 3 || y + 3 >= WORLD_HEIGHT)
+                continue;
+            block_t ground = world->GetBlock(x, y, z);
+            block_t above = world->GetBlock(x, y + 1, z);
+            bool open = (above == 0 || above == Snow2::getID());
+            if(!open)
+                continue;
+            bool onGrass = (ground == GrassBlock::getID());
+            bool onDirt = (ground == DirtBlock::getID());
+            bool onSnow = (ground == SnowSoil::getID());
+            bool onSand = (ground == SandBlock::getID());
+            bool inner = (lx >= 2 && lx < CHUNK_SIZE - 2 && lz >= 2 && lz < CHUNK_SIZE - 2);
+            int localBiome = biome;
+            if(lx == 0 || lz == 0 || lx == CHUNK_SIZE - 1 || lz == CHUNK_SIZE - 1)
+                localBiome = useCache ? colBiomes[lx][lz] : BiomeAt(x, z, worldType);
+
+            // sugar cane on sand next to water at sea level
+            if(onSand && y == waterLevel && rand() % 14 == 0)
+            {
+                if(world->GetBlock(x - 1, y, z) == WaterBlock::getID() || world->GetBlock(x + 1, y, z) == WaterBlock::getID() ||
+                   world->GetBlock(x, y, z - 1) == WaterBlock::getID() || world->GetBlock(x, y, z + 1) == WaterBlock::getID())
+                {
+                    int h = 1 + rand() % 3;
+                    for(int cy = y + 1; cy <= y + h && cy < WORLD_HEIGHT - 1; cy++)
+                        world->GetBlock(x, cy, z) = CaneBlock::getID();
+                    continue;
+                }
+            }
+
+            if(localBiome == BIOME_DESERT)
+            {
+                if(onSand && y > waterLevel && rand() % 90 == 0 && world->GetBlock(x, y + 2, z) == 0)
+                {
+                    int h = 1 + rand() % 3;
+                    bool room = true;
+                    for(int cy = y + 1; cy <= y + h && room; cy++)
+                        if(world->GetBlock(x - 1, cy, z) != 0 || world->GetBlock(x + 1, cy, z) != 0 || world->GetBlock(x, cy, z - 1) != 0 || world->GetBlock(x, cy, z + 1) != 0)
+                            room = false;
+                    if(room)
+                        for(int cy = y + 1; cy <= y + h && cy < WORLD_HEIGHT - 1; cy++)
+                            world->GetBlock(x, cy, z) = CactusBlock::getID();
+                }
+                continue;
+            }
+
+            if(localBiome == BIOME_SNOW)
+            {
+                if(!world->makeTrees || !onSnow || !inner || y <= waterLevel)
+                    continue;
+                int chance = 70 - (int)(forestNoise * 40.0f);
+                if(chance < 24) chance = 24;
+                if(rand() % chance == 0)
+                {
+                    // spruce trunk starts at the block passed in; ground below becomes dirt
+                    world->GetBlock(x, y + 1, z) = 0;
+                    GenerateSpruceTree(world->worldLimit, world, x, y + 1, z);
+                    if(world->GetBlock(x, y + 1, z) == 0)
+                        world->GetBlock(x, y + 1, z) = Snow2::getID();
+                }
+                continue;
+            }
+
+            // plains / forest
+            if(!(onGrass || onDirt))
+                continue;
+            if(y <= waterLevel)
+                continue;
+
+            if(world->makeTrees && inner)
+            {
+                int chance;
+                if(localBiome == BIOME_FOREST)
+                    chance = 26 - (int)(forestNoise * 14.0f);
+                else
+                    chance = 190 - (int)(forestNoise * 90.0f);
+                if(chance < 12) chance = 12;
+                if(rand() % chance == 0)
+                {
+                    if(onDirt)
+                        world->GetBlock(x, y, z) = GrassBlock::getID();
+                    int kind = rand() % 10;
+                    if(kind < 2)
+                        GenerateClassicTree(world->worldLimit, world, x, y, z, WhiteWoodBlock::getID(), BirchLeaves::getID());
+                    else if(kind == 2 && localBiome == BIOME_FOREST)
+                        GenerateSpruceTree(world->worldLimit, world, x, y + 1, z);
+                    else
+                        GenerateClassicTree(world->worldLimit, world, x, y, z, WoodBlock::getID(), LeavesBlock::getID());
+                    continue;
+                }
+            }
+
+            if(!onGrass)
+                continue;
+
+            // pumpkin patches (rare, clustered)
+            if(rand() % 700 == 0)
+            {
+                for(int dx = -1; dx <= 1; dx++)
+                    for(int dz = -1; dz <= 1; dz++)
+                    {
+                        if(rand() % 3 != 0)
+                            continue;
+                        int gy = world->groundHeight(x + dx, z + dz);
+                        if(gy <= 0 || gy + 1 >= WORLD_HEIGHT)
+                            continue;
+                        block_t g = world->GetBlock(x + dx, gy, z + dz);
+                        if((g == GrassBlock::getID() || g == DirtBlock::getID()) && world->GetBlock(x + dx, gy + 1, z + dz) == 0)
+                        {
+                            world->GetBlock(x + dx, gy, z + dz) = DirtBlock::getID();
+                            world->GetBlock(x + dx, gy + 1, z + dz) = 73 + rand() % 4;
+                        }
+                    }
+                continue;
+            }
+
+            int plant = rand() % 100;
+            int grassChance = (localBiome == BIOME_FOREST) ? 14 : 9;
+            if(plant < grassChance)
+                world->GetBlock(x, y + 1, z) = TallGrass::getID();
+            else if(plant < grassChance + 2)
+                world->GetBlock(x, y + 1, z) = (rand() % 2 == 0) ? Flower1::getID() : Flower2::getID();
+            else if(plant == 99 && localBiome == BIOME_FOREST)
+                world->GetBlock(x, y + 1, z) = Fern::getID();
+            else if(plant == 98 && localBiome == BIOME_FOREST && rand() % 4 == 0)
+            {
+                // mushrooms hide in darker forest
+                world->GetBlock(x, y + 1, z) = (rand() % 2 == 0) ? Mooshroom1::getID() : Mooshroom2::getID();
+            }
+        }
+    }
+}
+
+void WorldGenerator::DecorateSpawnRegion(CraftWorld *world)
+{
+    int cs = world->CHUNK_SIZE;
+    if(cs <= 0)
+        return;
+    for(int z = world->genMinZ; z < world->genMaxZ; z += cs)
+        for(int x = world->genMinX; x < world->genMaxX; x += cs)
+            DecorateColumn(world, x / cs, z / cs);
 }

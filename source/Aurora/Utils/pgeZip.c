@@ -50,6 +50,27 @@
 #define zdecode(pkeys, crc32tab, c) (pgeZipUpdateKeys(pkeys, crc32tab, c ^= pgeZipDecryptByte(pkeys, crc32tab)))
 #define PGE_ZIP_BUF_READ_COMMENT (0x400)
 
+/* ---------------------------------------------------------------------------
+ * Diagnostics.
+ *
+ * pgeZip prints to stdout from every one of its error paths, and it names both the step that failed and,
+ * where it can, the file. That is worth keeping. What is not safe to assume is that there is a stdout to
+ * print to: a build with no debug screen sends these nowhere, and a failure with no record on it reads
+ * exactly like a crash -- which is the shape of problem this project has had to rule out before.
+ *
+ * So the destination is a macro. Left alone it is printf and behaviour is unchanged. A build that has
+ * somewhere better to put them defines PGE_ZIP_LOG to a function of this signature; the standalone
+ * Updater EBOOT does exactly that and points it at its log (see UpdaterApp/Makefile, UpdateZipLog).
+ *
+ * The declaration is here rather than in a header because pgeZip.c includes no project header and is
+ * also compiled by builds that have no logger at all, which is worth keeping true.
+ * --------------------------------------------------------------------------- */
+#ifndef PGE_ZIP_LOG
+#define PGE_ZIP_LOG(...) printf(__VA_ARGS__)
+#else
+int UpdateZipLog(const char *format, ...);
+#endif
+
 typedef struct
 {
     unsigned long version;
@@ -750,7 +771,7 @@ static int pgeZipOpenCurrentFile(pgeZip* file, const char *password)
 	if(password != NULL)
 	{
 		int i;
-		s->crc32tab = get_crc_table();
+		s->crc32tab = (const unsigned long*)get_crc_table();
 		pgeZipInitKeys(password, s->keys, s->crc32tab);
 		
 		if(fseek(pfileinzipreadinfo->file, s->currentzipfileinfo->posinzip + s->currentzipfileinfo->bytebeforezip, SEEK_SET) != 0)
@@ -991,11 +1012,81 @@ int pgeZipClose(pgeZip* zip)
 	if(s->currentzipfileinfo != NULL)
 		pgeZipCloseCurrentFile(zip);
 
-	//printf("Fclose: %d\n", fclose(s->file));
-	
+	// The fclose here was commented out in the original Phoenix Game Engine source, and leaving it out
+	// does not merely leak a FILE*: it leaves the ARCHIVE OPEN ON THE CARD for the rest of the process's
+	// life, because nothing else ever has that handle. Two measured consequences on real hardware, and
+	// the first is what made it visible:
+	//
+	//   - sceIoRemove() of the package returned 0x8001000D for as long as the handle was open, so an
+	//     installed update.zip could never be cleaned up. It survived every install.
+	//   - the process then handed over to loadexec while holding an open handle to a file on ms0:,
+	//     which is the device the NEXT program has to be read from. That run powered the console off
+	//     with nothing in the log past the launch line.
+	//
+	// This program opens the archive once per read rather than once per run -- the manifest is read
+	// separately from the extraction, and by both callers -- so the unclosed version leaked one handle
+	// per open, which is why the failure was reproducible here and less obvious elsewhere.
+	//
+	// fclose is the only way to release a FILE*, so it is called, with the NULL and error checks that
+	// the commented-out line did not have. The result is logged because this is the call that was
+	// missing when the launch failed, so if the console ever goes down here the log will say so
+	// instead of stopping one line earlier and leaving it to inference.
+	if(s->file != NULL)
+	{
+		PGE_ZIP_LOG("zip: closing the archive (fclose)\n");
+		if(fclose(s->file) != 0)
+			PGE_ZIP_LOG("zip: fclose failed, the archive may still be open\n");
+		s->file = NULL;
+	}
+
 	free(s);
 
 	return 1;
+}
+
+// Creates every missing directory component of `path`, not just the last one.
+//
+// The original code called mkdir() once, on the parent of the file it was about to write, and only
+// after fopen() had already failed. That is enough for a flat archive and quietly loses files for a
+// nested one: a package containing "Assets/Textures/Minecraft/entity/pig/pig.png" needs three levels
+// created, and mkdir() on the deepest one fails with ENOENT while the ones above it are missing. The
+// failure is invisible -- the file is simply never written -- which is exactly the shape of bug that
+// leaves a game reporting a successful install and then loading with missing art.
+//
+// Works on a copy so the caller's path is untouched, and treats both '/' and '\\' as separators
+// because a zip built on Windows may use either. Handles a directory entry ("foo/bar/") as well as a
+// file, since both reduce to "create everything up to the last separator".
+static void pgeZipMakeDirs(const char *path)
+{
+	char scratch[256];
+	size_t len = strlen(path);
+	size_t lastSep = 0;
+
+	if(len == 0 || len >= sizeof(scratch))
+		return;
+
+	strcpy(scratch, path);
+
+	for(size_t i = 0; i < len; i++)
+	{
+		if(scratch[i] == '/' || scratch[i] == '\\')
+			lastSep = i;
+	}
+
+	if(lastSep == 0)
+		return;   // no separator: the entry sits in the current directory
+
+	// Start at 1 so a leading separator is never made into a directory of its own.
+	for(size_t i = 1; i <= lastSep; i++)
+	{
+		if(scratch[i] == '/' || scratch[i] == '\\')
+		{
+			char saved = scratch[i];
+			scratch[i] = '\0';
+			mkdir(scratch, 0777);   // EEXIST is the normal case here and is deliberately ignored
+			scratch[i] = saved;
+		}
+	}
 }
 
 int pgeZipExtractCurrentFile(pgeZip *zip, int *nopath, const char *password)
@@ -1017,7 +1108,7 @@ int pgeZipExtractCurrentFile(pgeZip *zip, int *nopath, const char *password)
 
 	if(err != 0)
 	{
-		printf("error %d with zipfile in pgeZipGetCurrentFileInfo\n", err);
+		PGE_ZIP_LOG("error %d with zipfile in pgeZipGetCurrentFileInfo\n", err);
 		return -1;
 	}
 	
@@ -1025,7 +1116,7 @@ int pgeZipExtractCurrentFile(pgeZip *zip, int *nopath, const char *password)
 	
 	if(!buffer)
 	{
-		printf("Error allocating buffer\n");
+		PGE_ZIP_LOG("Error allocating buffer\n");
 		
 		return 0;
 	}
@@ -1044,8 +1135,9 @@ int pgeZipExtractCurrentFile(pgeZip *zip, int *nopath, const char *password)
 	{
 		if((*nopath) == 0)
 		{
-			//printf("Creating directory: %s\n", filenameinzip);
-			mkdir(filenameinzip, 0777);
+			// A directory entry. Recursive, so "a/b/c/" works when only "a" exists -- the original
+			// single mkdir() could not create a chain either.
+			pgeZipMakeDirs(filenameinzip);
 		}
 	}
 	else
@@ -1060,21 +1152,27 @@ int pgeZipExtractCurrentFile(pgeZip *zip, int *nopath, const char *password)
 		err = pgeZipOpenCurrentFile(zip, password);
 		
 		if(err != PGE_ZIP_OK)
-			printf("Error with zipfile in pgeZipOpenCurrentFile\n");
+			PGE_ZIP_LOG("Error with zipfile in pgeZipOpenCurrentFile\n");
+		
+		// Everything the file needs to live in, before trying to open it. Unconditional rather than
+		// a retry after fopen fails: by then the only thing left to do is report the failure.
+		if((*nopath) == 0)
+			pgeZipMakeDirs(writeFilename);
 			
 		fout = fopen(writeFilename, "wb");
 		
-		if((fout == NULL) && ((*nopath) == 0) && (filenameWithoutPath != (char *)filenameinzip))
-		{
-			char c = *(filenameWithoutPath - 1);
-			*(filenameWithoutPath - 1) = '\0';
-			mkdir(writeFilename, 0777);
-			*(filenameWithoutPath - 1) = c;
-			fout = fopen(writeFilename, "wb");
-		}
-		
 		if(fout == NULL)
-			printf("Error opening file\n");
+		{
+			// Report and stop. The original printed a message here and then carried straight on to
+			// fwrite(buffer, 1, err, fout) and fclose(fout) with fout == NULL, so a single unwritable
+			// path did not skip one file -- it took the whole extractor down.
+			PGE_ZIP_LOG("Error opening file: %s\n", writeFilename);
+			
+			if(buffer)
+				free(buffer);
+				
+			return -1;
+		}
 			
 		do
 		{
@@ -1082,7 +1180,7 @@ int pgeZipExtractCurrentFile(pgeZip *zip, int *nopath, const char *password)
 			
 			if(err < 0)
 			{
-				printf("Error with zipfile in pgeZipReadCurrentFile\n");
+				PGE_ZIP_LOG("Error with zipfile in pgeZipReadCurrentFile\n");
 				break;
 			}
 			
@@ -1098,7 +1196,7 @@ int pgeZipExtractCurrentFile(pgeZip *zip, int *nopath, const char *password)
 		err = pgeZipCloseCurrentFile(zip);
 		
 		if(err != PGE_ZIP_OK)
-			printf("Error with zipfile in pgeZipCloseCurrentFile\n");
+			PGE_ZIP_LOG("Error with zipfile in pgeZipCloseCurrentFile\n");
 	}
 			
 	if(buffer)
@@ -1107,34 +1205,103 @@ int pgeZipExtractCurrentFile(pgeZip *zip, int *nopath, const char *password)
 	return err;
 }
 
-int pgeZipExtract(pgeZip* zip, const char *password)
+// Extracts every entry and reports what happened. Returns 1 only if all of them were written.
+//
+// `okCount` and `failCount` are optional (pass NULL). The counts exist because "the install failed"
+// is not actionable on a handheld: "112 of 115 files, 3 failed" tells you whether it was a full disk,
+// a permissions problem or one odd filename, and those have different fixes.
+//
+// Known limitation, stated rather than hidden: the entry count comes from the archive's own central
+// directory, so a zip whose central directory is intact but whose data is truncated cannot be
+// detected here. That is what the package's crc32 check is for, and why the install verifies
+// afterwards instead of trusting this function's success.
+int pgeZipExtractCounted(pgeZip* zip, const char *password, int *okCount, int *failCount)
 {
 	unsigned int i;
 	zipGlobalInfo gi;
 	memset(&gi, 0, sizeof(zipGlobalInfo));
 	int err;
 	int nopath = 0;
+	int ok = 0;
+	int failed = 0;
+	
+	if(okCount)
+		*okCount = 0;
+	
+	if(failCount)
+		*failCount = 0;
 	
 	err = pgeZipGetGlobalInfo(zip, &gi);
 	
 	if(err != PGE_ZIP_OK)
-		printf("Error with zipfile in pgeZipGetGlobalInfo\n");
+	{
+		// Fatal, and it has to be: without the entry count there is no way to walk the archive. The
+		// original printed this and then carried on with countentries still zero, so a corrupt zip
+		// extracted "successfully" while writing nothing at all.
+		PGE_ZIP_LOG("Error with zipfile in pgeZipGetGlobalInfo\n");
 		
+		if(failCount)
+			*failCount = 1;
+			
+		return 0;
+	}
+	
+	PGE_ZIP_LOG("zip: %u entries to extract\n", (unsigned int)gi.countentries);
+	
 	for(i = 0;i < gi.countentries;i++)
 	{
+		// Named before it is attempted, not after. This is the line that says which file a failure
+		// happened on, and a file that gets this far and then takes the program down leaves no later
+		// line to read it from -- which is exactly the position this call left the updater in.
+		char entryname[PGE_ZIP_MAX_FILENAME_SIZE];
+		zipFileInfo entryinfo;
+		entryname[0] = '\0';
+		memset(&entryinfo, 0, sizeof(entryinfo));
+		
+		if(pgeZipGetCurrentFileInfo(zip, &entryinfo, entryname, sizeof(entryname), NULL, 0, NULL, 0) == PGE_ZIP_OK)
+			PGE_ZIP_LOG("zip: [%u/%u] '%s' (%u bytes)\n", i + 1, (unsigned int)gi.countentries,
+				entryname, (unsigned int)entryinfo.uncompressedsize);
+		else
+			PGE_ZIP_LOG("zip: [%u/%u] (name unavailable)\n", i + 1, (unsigned int)gi.countentries);
+		
+		// Counted rather than breaking out. One unwritable file should be reported at the end
+		// together with the others, not abandon the rest of the package half-installed.
 		if(pgeZipExtractCurrentFile(zip, &nopath, password) != PGE_ZIP_OK)
-			break;
+			failed++;
+		else
+			ok++;
+		
+		PGE_ZIP_LOG("zip: [%u/%u] done, %d ok, %d failed so far\n", i + 1, (unsigned int)gi.countentries,
+			ok, failed);
 			
 		if((i + 1) < gi.countentries)
 		{
 			err = pgeZipGotoNextFile(zip);
 			
 			if(err != PGE_ZIP_OK)
-				printf("Error with zipfile in pgeZipGotoNextFile\n");
+			{
+				PGE_ZIP_LOG("Error with zipfile in pgeZipGotoNextFile\n");
+				failed++;
+				break;
+			}
 		}
 	}
 	
-	return 1;	
+	if(okCount)
+		*okCount = ok;
+	
+	if(failCount)
+		*failCount = failed;
+	
+	return failed == 0 ? 1 : 0;
+}
+
+// The old signature, kept because Updater/main.c uses it. It used to `return 1` unconditionally --
+// the return value was not merely unreliable, it was a constant, so every caller that checked it was
+// checking nothing.
+int pgeZipExtract(pgeZip* zip, const char *password)
+{
+	return pgeZipExtractCounted(zip, password, NULL, NULL);
 }
 
 pgeZipFile* pgeZipFileRead(pgeZip* zip, const char *filename, const char *password)
@@ -1219,11 +1386,67 @@ pgeZipFile* pgeZipFileRead(pgeZip* zip, const char *filename, const char *passwo
 	}
 }
 
-void pgeZipFileFree(pgeZipFile* file)
-{
+void pgeZipFileFree(pgeZipFile* file){
 	if(file->data)
 		free(file->data);
 		
 	if(file)
 		free(file);
+}
+
+// -------------------------------------------------------------------------------------------------
+// Streaming read
+//
+// The same decoder pgeZipFileRead drives, exposed a chunk at a time. See the note on pgeZipStreamOpen
+// in pgeZip.h for why: pgeZipFileRead mallocs the whole uncompressed entry, which puts a hard ceiling
+// on what can be extracted from an archive that the caller's heap may not be able to meet -- and it
+// reports that as a plain allocation failure, which the caller then sees as a missing file.
+//
+// The three calls map one-to-one onto the files already here. The only thing being added is the ability
+// to stop between chunks, which is what pgeZipFileRead's single-shot loop cannot do.
+// -------------------------------------------------------------------------------------------------
+
+int pgeZipStreamOpen(pgeZip* zip, const char *filename, const char *password, unsigned int *outSize)
+{
+	char filenameinzip[256];
+	zipFileInfo fileinfo;
+
+	if(zip == NULL || filename == NULL)
+		return PGE_ZIP_PARAM_ERROR;
+
+	// pgeZipLocateFile positions the archive on the entry; pgeZipGetCurrentFileInfo then describes it,
+	// and pgeZipOpenCurrentFile starts the decoder. That is the same order pgeZipFileRead uses, and the
+	// order matters: the info call reads the entry the locate call selected.
+	if(pgeZipLocateFile(zip, filename, 0) != 0)
+		return PGE_ZIP_ERRNO;
+
+	if(pgeZipGetCurrentFileInfo(zip, &fileinfo, filenameinzip, sizeof(filenameinzip), NULL, 0, NULL, 0) != 0)
+		return PGE_ZIP_ERRNO;
+
+	if(pgeZipOpenCurrentFile(zip, password) != PGE_ZIP_OK)
+		return PGE_ZIP_ERRNO;
+
+	// Reported from the directory record rather than counted as the stream is read, so the caller knows
+	// the size up front and can size a progress bar -- and so a caller comparing bytes read against the
+	// expected total does not have to consume the stream first to learn what to expect.
+	if(outSize != NULL)
+		*outSize = (unsigned int)fileinfo.uncompressedsize;
+
+	return PGE_ZIP_OK;
+}
+
+int pgeZipStreamRead(pgeZip* zip, void *buf, unsigned int len)
+{
+	if(zip == NULL || buf == NULL)
+		return PGE_ZIP_PARAM_ERROR;
+
+	return pgeZipReadCurrentFile(zip, buf, len);
+}
+
+int pgeZipStreamClose(pgeZip* zip)
+{
+	if(zip == NULL)
+		return PGE_ZIP_PARAM_ERROR;
+
+	return pgeZipCloseCurrentFile(zip);
 }

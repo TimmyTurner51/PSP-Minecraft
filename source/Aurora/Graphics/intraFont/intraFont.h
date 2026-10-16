@@ -136,7 +136,7 @@ typedef struct {
 	unsigned char junk05[4];
 	unsigned long shadowscale[2];
 	//currently no need ;
-} PGF_Header;
+} __attribute__((packed)) PGF_Header;
 
 /**
  * A Font struct

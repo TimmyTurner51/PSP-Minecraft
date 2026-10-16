@@ -36,6 +36,7 @@ typedef struct
 	unsigned int bitPerSample;	/**<  The bit rate of the WAV */
     float leftvolume;			/**<  The left volume of the WAV */
 	float rightvolume;			/**<  The right volume of the WAV */
+	unsigned int reverse;		/**<  Internal: 1 = play backwards */
 
 } pgeWav;
 
@@ -88,6 +89,47 @@ void pgeWavUnload(pgeWav *wav);
 int pgeWavPlay(pgeWav *wav);
 
 /**
+ * Start playing a WAV from a sample offset, optionally reversed.
+ *
+ * @param wav A pointer to a valid ::pgeWav struct.
+ * @param startSample Sample frame to begin at.
+ * @param reverse Set to 1 to play backwards.
+ *
+ * @returns 1 on success
+ */
+int pgeWavPlayAt(pgeWav *wav, unsigned long startSample, unsigned int reverse);
+
+/**
+ * Start one voice at its own volume (0..1) and pitch. The WAV's defaults and its other voices are
+ * left as they are.
+ *
+ * @returns 1 on success
+ */
+int pgeWavPlayWith(pgeWav *wav, float volume, float pitch);
+
+/**
+ * Start a self-renewing chain of grains from a WAV: each grain is a random stretch of the clip,
+ * minSeconds..maxSeconds long, randomly reversed, pitched within +-pitchSpread, with equal-power
+ * fades of fadeSeconds. The audio thread starts the next grain as each one begins to fade out, so
+ * the chain does not depend on the game's frame rate. It keeps going until leaseSeconds have passed
+ * without pgeWavKeepGrains, then the last grain fades out on its own.
+ *
+ * @returns 1 on success
+ */
+int pgeWavPlayGrains(pgeWav *wav, float minSeconds, float maxSeconds, float fadeSeconds, float pitchSpread, float leaseSeconds);
+
+/**
+ * Extend the lease of every grain chain of this WAV to leaseSeconds from now.
+ */
+void pgeWavKeepGrains(pgeWav *wav, float leaseSeconds);
+
+/**
+ * Fade every playing voice of this WAV to silence over `seconds` and end any grain chain. Calling it
+ * again while a fade is running leaves that fade alone.
+ */
+void pgeWavFadeOut(pgeWav *wav, float seconds);
+
+/**
  * Stop playing a loaded WAV
  *
  * @param wav A pointer to a valid ::pgeWav struct.
@@ -100,6 +142,16 @@ void pgeWavStop(pgeWav *wav);
  * Stop playing all WAVs
  */
 void pgeWavStopAll(void);
+
+/**
+ * @returns 1 if this WAV currently occupies a mixer slot.
+ */
+int pgeWavIsPlaying(pgeWav *wav);
+
+/**
+ * @returns how many mixer slots this WAV currently occupies.
+ */
+int pgeWavCountPlaying(pgeWav *wav);
 
 /**
  * Set the loop of the WAV playback

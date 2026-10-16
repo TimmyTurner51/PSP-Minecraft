@@ -389,6 +389,35 @@ public:
 	static block_t getID();
 };
 
+/// Wall torches (ladder-style IDs; settings bits are block light and cannot store face)
+class WallTorch1 : public BaseBlock
+{
+public:
+	WallTorch1();
+	static block_t getID(); // attach -X
+};
+
+class WallTorch2 : public BaseBlock
+{
+public:
+	WallTorch2();
+	static block_t getID(); // attach +X
+};
+
+class WallTorch3 : public BaseBlock
+{
+public:
+	WallTorch3();
+	static block_t getID(); // attach -Z
+};
+
+class WallTorch4 : public BaseBlock
+{
+public:
+	WallTorch4();
+	static block_t getID(); // attach +Z
+};
+
 class Door1 : public BaseBlock
 {
 public:
@@ -1392,6 +1421,25 @@ public:
     static block_t getID();
 };
 
+// Flow levels 5..7 (Java water spreads 7 blocks). Extended ids, see AddBlockType.
+class WaterBlock5 : public WaterBlock4
+{
+public:
+    static block_t getID();
+};
+
+class WaterBlock6 : public WaterBlock4
+{
+public:
+    static block_t getID();
+};
+
+class WaterBlock7 : public WaterBlock4
+{
+public:
+    static block_t getID();
+};
+
 class ItemFrame1 : public BaseBlock
 {
 public:
@@ -1903,6 +1951,206 @@ public:
 	static block_t getID();
 };
 
+// Button (Java BlockButton): a small mechanism mounted on the side/floor of a block. Which face it is
+// mounted on, and whether it is currently pressed, live in the 4-bit block-state nibble
+// (OpRedstonePowerMask) that the lighting code preserves; the mesh and the power code read them back.
+// A pressed button strongly powers the one block it is mounted on, then pops back out after 1 s
+// (stone) or 1.5 s (wood).
+class ButtonStone : public BaseBlock
+{
+public:
+
+	ButtonStone();
+	static block_t getID();
+};
+
+class ButtonWood : public BaseBlock
+{
+public:
+
+	ButtonWood();
+	static block_t getID();
+};
+
+// Lever (Java BlockLever). Shares the button's cell-state nibble -- bits 0-2 the mounting face, in the
+// same order -- but bit 3 is a *latch* instead of a press: use flips it and it stays flipped, with no
+// press timer and no entry in mPressedButtons. That shared encoding is the whole reason a lever gets
+// wire, torch, TNT and lamp behaviour for free: every reader of "is a switch on and where does it point"
+// asks the same nibble question a button answers.
+class Lever : public BaseBlock
+{
+public:
+
+	Lever();
+	static block_t getID();
+};
+
+// Redstone lamp (Java BlockRedstoneLight). The lit state is a second block id for the same reason the
+// furnace and the repeater use one: "is this cell a light source" stays an id lookup, and the mesher
+// picks the lit tile with no per-state texture switch. Unlike every other component here the lamp
+// reacts to power with no event of its own, so it is evaluated from the redstone event window -- see
+// CraftWorld::EvaluateRedstoneLamp.
+class RedstoneLampOff : public BaseBlock
+{
+public:
+
+	RedstoneLampOff();
+	static block_t getID();
+};
+
+class RedstoneLampOn : public BaseBlock
+{
+public:
+
+	RedstoneLampOn();
+	static block_t getID();
+};
+
+// Redstone repeater (Java BlockRedstoneRepeater). A flat 2 px slab that takes its input only from the
+// block it faces away from and drives only the block it faces, always at full strength -- which is what
+// lets a signal travel past the 15-cell limit of plain dust. Its facing and delay live in the 4-bit
+// block-state nibble (the lighting code skips repeater cells, exactly as it does buttons).
+// The powered state is a second block id rather than another state bit, which keeps "is this repeater
+// driving me" an id comparison and matches the furnace off/on pair this codebase already uses.
+class RepeaterOff : public BaseBlock
+{
+public:
+
+	RepeaterOff();
+	static block_t getID();
+};
+
+class RepeaterOn : public BaseBlock
+{
+public:
+
+	RepeaterOn();
+	static block_t getID();
+};
+
+/// Redstone torches (Java BlockRedstoneTorch, both the lit block 76 and the unlit block 75).
+///
+/// Like the plain torch family this codebase uses one block id per mounting face -- floor plus four walls
+/// -- because a torch's face has to survive in the world and the block settings nibble is block light.
+/// Unlike the plain torch there is also a lit/unlit pair, so lit and unlit ids are two contiguous ranges
+/// five apart: toggling is always `id +/- 5` and never touches the nibble.
+class RedstoneTorch : public BaseBlock          // lit, standing on the block below
+{
+public:
+	RedstoneTorch();
+	static block_t getID();
+};
+class RedstoneWallTorch1 : public BaseBlock     // lit, attached to the block at -X
+{
+public:
+	RedstoneWallTorch1();
+	static block_t getID();
+};
+class RedstoneWallTorch2 : public BaseBlock     // lit, attached to the block at +X
+{
+public:
+	RedstoneWallTorch2();
+	static block_t getID();
+};
+class RedstoneWallTorch3 : public BaseBlock     // lit, attached to the block at -Z
+{
+public:
+	RedstoneWallTorch3();
+	static block_t getID();
+};
+class RedstoneWallTorch4 : public BaseBlock     // lit, attached to the block at +Z
+{
+public:
+	RedstoneWallTorch4();
+	static block_t getID();
+};
+class UnlitRedstoneTorch : public BaseBlock     // switched off by its attachment being powered
+{
+public:
+	UnlitRedstoneTorch();
+	static block_t getID();
+};
+class UnlitRedstoneWallTorch1 : public BaseBlock
+{
+public:
+	UnlitRedstoneWallTorch1();
+	static block_t getID();
+};
+class UnlitRedstoneWallTorch2 : public BaseBlock
+{
+public:
+	UnlitRedstoneWallTorch2();
+	static block_t getID();
+};
+class UnlitRedstoneWallTorch3 : public BaseBlock
+{
+public:
+	UnlitRedstoneWallTorch3();
+	static block_t getID();
+};
+class UnlitRedstoneWallTorch4 : public BaseBlock
+{
+public:
+	UnlitRedstoneWallTorch4();
+	static block_t getID();
+};
+
+/// Piston (Java BlockPistonBase, plus BlockPistonExtension for the head).
+///
+/// Four base ids and two head ids, for the same reason the repeater and the lamp each have a pair: the
+/// sticky/normal difference is a *tile* difference (piston_top vs piston_top_sticky) and the extended
+/// flag has to be visible to the world without reading the state nibble, so between them they take two
+/// id bits rather than a state bit. Sticky is the id, extended is the id, and the nibble is left holding
+/// nothing but the direction it pushes.
+///
+/// That is the one place this differs from the repeater. A repeater is 4 px of art and its nibble has
+/// room to spare, so its "on" state became an id for the *tile*. A piston's nibble has to carry six
+/// directions, and it is the direction -- not the state -- that the mesher, the push code and the
+/// placement code all need first.
+///
+/// State nibble (bits 0-2, the same 6-neighbour order the button and lever mountings use so the two
+/// direction tables cannot drift apart): 0 = pushes down (-Y), 1 = up (+Y), 2 = -X, 3 = +X, 4 = -Z,
+/// 5 = +Z. Bit 3 of an id that needs no more is free here because the extended flag is the id.
+class PistonOff : public BaseBlock               // retracted, normal
+{
+public:
+	PistonOff();
+	static block_t getID();
+};
+class PistonOn : public BaseBlock                // extended: a head block sits in the cell in front
+{
+public:
+	PistonOn();
+	static block_t getID();
+};
+class StickyPistonOff : public BaseBlock         // retracted, sticky: also pulls one block back
+{
+public:
+	StickyPistonOff();
+	static block_t getID();
+};
+class StickyPistonOn : public BaseBlock
+{
+public:
+	StickyPistonOn();
+	static block_t getID();
+};
+/// The moving half. Java keeps this as one id (34) with a sticky bit in its metadata; this codebase
+/// already spends metadata bits on nothing else for the extension, so the pair is spelled out as ids
+/// the way the rest of the file does it.
+class PistonHead : public BaseBlock
+{
+public:
+	PistonHead();
+	static block_t getID();
+};
+class StickyPistonHead : public BaseBlock
+{
+public:
+	StickyPistonHead();
+	static block_t getID();
+};
+
 class BlockofQuartz : public BaseBlock
 {
 public:
@@ -2208,12 +2456,55 @@ public:
 	static block_t getID();
 };
 
+// The nether portal. Not solid, not editable, not breakable: it exists only as the lit interior of an
+// obsidian frame, and it is what the player stands in to travel.
+//
+// The lit interior is a flat plane in the middle of each cell, not a cube, so the surface reads as one
+// continuous sheet rather than a grid of separately lit block faces. There are two ids because the
+// plane has to know which way the frame runs and the mesher is handed nothing but an id:
+//   PortalBlock   -- the frame runs along X, so the sheet spans X and Y and is centred in Z
+//   PortalBlockZ  -- the frame runs along Z, so the sheet spans Z and Y and is centred in X
+// Both draw with blockModel 30 (CraftWorld_MeshBlocks.cpp) and share the animated atlas tile (15,8),
+// which UpdateWorldAnimation repaints every tick.
+class PortalBlock : public BaseBlock
+{
+public:
+
+	PortalBlock();
+
+	static block_t getID();
+};
+
+class PortalBlockZ : public BaseBlock
+{
+public:
+
+	PortalBlockZ();
+
+	static block_t getID();
+};
+
+// There are two portal ids now, so every "is this the portal?" test has to ask about both. One place
+// to get that right instead of five.
+inline bool IsPortalBlock(block_t b)
+{
+	return b == PortalBlock::getID() || b == PortalBlockZ::getID();
+}
+
 class GravitySandBlock : public BaseBlock
 {
 public:
 
 	GravitySandBlock();
 
+	static block_t getID();
+};
+
+class LavaBlock1 : public BaseBlock
+{
+public:
+
+	LavaBlock1();
 	static block_t getID();
 };
 

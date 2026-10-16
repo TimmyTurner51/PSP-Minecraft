@@ -41,8 +41,8 @@ Creeper::Creeper(Vector3 position1, int number1) : LameMob(position1, number1)
     rLegAngle = PI;
     lLegAngle = PI;
 
-    SPD = 1.18f;
-    HP = 18.0f;
+    ApplyProfile(MobProfiles::Creeper);
+    debugName = "Creeper";
 
     friendly = false;
 
@@ -92,36 +92,13 @@ void Creeper::BoxCollision()
 
 void Creeper::TakeDamage(float damage, float power, float dt)
 {
-    HP -= damage;
-
-    kicked = true;
-    damaged = true;
-    damagedTimer = power*0.6f+0.15;
-    velocity.y = (power+0.15f) * JUMPVELOCITY;
-    walkingOnGround = false;
-
-    position += velocity * dt;
-    playHurtSound = true;
-
-    lastKickType = 1; //by player
+    ApplyKickDamage(damage, power, dt, 1, &animLegAngleT);
 }
 
 void Creeper::TakeDamageFromPointExplosion(float damage, float power, float dt, Vector3 point)
 {
     explosionPos = point;
-
-    HP -= damage;
-
-    kicked = true;
-    damaged = true;
-    damagedTimer = power*0.6f+0.15;
-    velocity.y = (power+0.25f) * JUMPVELOCITY;
-    walkingOnGround = false;
-
-    position += velocity * dt;
-    playHurtSound = true;
-
-    lastKickType = 2; //by explosion
+    ApplyKickDamage(damage, power, dt, 2, NULL);
 }
 
 void Creeper::Update(CraftWorld *myWorld, Vector3 playerPos, float dt)
@@ -131,6 +108,10 @@ void Creeper::Update(CraftWorld *myWorld, Vector3 playerPos, float dt)
 
     distanceToPlayer = DistanceToPlayer();
     fastDistanceToPlayer = FastDistanceToPlayer();
+
+    // column streamed out: freeze in place (kept in the list and saved) until it is back
+    if(!myWorld->ColumnLoadedAt((int)position.x, (int)position.z))
+        return;
 
     if(killed == true)
     {
@@ -173,6 +154,13 @@ void Creeper::Update(CraftWorld *myWorld, Vector3 playerPos, float dt)
                 {
                     jumpReady = true;
                     jumpTimer = 0.0f;
+                }
+
+                if(knockbackTimer > 0.0f)
+                {
+                    knockbackTimer -= dt;
+                    if(knockbackTimer < 0.0f)
+                        knockbackTimer = 0.0f;
                 }
 
                 if(damaged == true)
@@ -254,7 +242,10 @@ void Creeper::Update(CraftWorld *myWorld, Vector3 playerPos, float dt)
                 /// BECOME ANGRY --- *
                 if(killed == false)
                 {
-                    if(fastDistanceToPlayer < 11 && world->HP > 0 && boredom == false) // it sees you
+                    // Creative: wander only â€” no chase or fuse.
+                    const bool canAggro = (world->gameModeWorld != 1) && (world->HP > 0) && (boredom == false);
+
+                    if(canAggro && fastDistanceToPlayer < 11) // it sees you
                     {
                         haunting = false;
                         hauntingTimer = 0.0f;
@@ -286,8 +277,14 @@ void Creeper::Update(CraftWorld *myWorld, Vector3 playerPos, float dt)
                             }
                         }
                     }
-                    else // it doesn't see the player
+                    else // it doesn't see the player (or creative)
                     {
+                        if(world->gameModeWorld == 1)
+                        {
+                            startExplosion = false;
+                            timeBeforeExplosion = 1.4f;
+                            blowingScale = 0.0f;
+                        }
                         headAngleZ = 0.0f;
                         headAngleY = 0.0f;
                         moving = false;
@@ -328,18 +325,18 @@ void Creeper::Update(CraftWorld *myWorld, Vector3 playerPos, float dt)
                                 hauntingPos.x = position.x - 6 + (rand() % 120)/10.0f;
                                 hauntingPos.z = position.z - 6 + (rand() % 120)/10.0f;
 
-                                if(hauntingPos.x > world->WORLD_SIZE-3)
+                                if(hauntingPos.x > world->worldLimit-3)
                                 {
-                                    hauntingPos.x = world->WORLD_SIZE-3;
+                                    hauntingPos.x = world->worldLimit-3;
                                 }
                                 if(hauntingPos.x < 2)
                                 {
                                     hauntingPos.x = 2;
                                 }
 
-                                if(hauntingPos.z > world->WORLD_SIZE-3)
+                                if(hauntingPos.z > world->worldLimit-3)
                                 {
-                                    hauntingPos.z = world->WORLD_SIZE-3;
+                                    hauntingPos.z = world->worldLimit-3;
                                 }
                                 if(hauntingPos.z < 2)
                                 {
@@ -469,9 +466,9 @@ void Creeper::Update(CraftWorld *myWorld, Vector3 playerPos, float dt)
                         angle = ATAN2_fast(position.x-explosionPos.x,position.z-explosionPos.z)+PI;
                     }
 
-                    TryToMoveWithoutJump(Vector3(sinf(angle+PI),0.0f,cosf(angle+PI)),(SPD+0.18f)*9.2f*(damagedTimer*damagedTimer)*dt);
+                    TryToMoveWithoutJump(Vector3(sinf(angle+PI),0.0f,cosf(angle+PI)),(SPD+0.18f)*9.2f*(knockbackTimer*knockbackTimer)*dt);
 
-                    if((walkingOnGround == true || footInLava || footInWater) && damagedTimer <= 0.0f)
+                    if((walkingOnGround == true || footInLava || footInWater) && knockbackTimer <= 0.0f)
                     {
                         kicked = false;
                     }
@@ -483,13 +480,21 @@ void Creeper::Update(CraftWorld *myWorld, Vector3 playerPos, float dt)
                 /// ANIMATIONS  --- *
                 if(killed == false)
                 {
-                    if(moving == true && startExplosion == false)
+                    if(kicked == true && startExplosion == false)
                     {
-                        animLegAngleT += PI*dt*1.8;
+                        animLegAngleT += PI * dt * 6.0f;
+                        if(animLegAngleT >= PI * 2.0f)
+                            animLegAngleT -= PI * 2.0f;
+                        animLegAngle = sinf(animLegAngleT) * 1.0f;
+                    }
+                    else if(moving == true && startExplosion == false)
+                    {
+                        animLegAngleT += PI*dt*1.8f;
                         if(animLegAngleT >= PI*2)
                         {
                             animLegAngleT = 0.0f;
                         }
+                        animLegAngle = sinf(animLegAngleT) * 0.7f;
                     }
                     else
                     {
@@ -525,151 +530,14 @@ void Creeper::Update(CraftWorld *myWorld, Vector3 playerPos, float dt)
                                 animLegAngleT = 0;
                             }
                         }
+                        animLegAngle = sinf(animLegAngleT) * 0.7f;
                     }
-                    animLegAngle = sinf(animLegAngleT) * 0.7f;
                 }
                 /// * --- END
 
 
-                /// DAMAGE FACTORS --- *
-                if(touchingCactus)
-                {
-                    tickCactusDamage += dt;
-                }
-                else
-                {
-                    tickCactusDamage = 0.4f;
-                }
-                if(tickCactusDamage >= 0.5f)
-                {
-                    HP -= 1;
-                    damaged = true;
-                    damagedTimer = 0.55f;
-
-                    tickCactusDamage -= 0.5f;
-                }
-                /// * --- END
-
-
-                /// SIMEPLE MOB PHYSICS --- *
-
-                Vector3 footPosition = position + foot;
-                Vector3 legsPosition = position + legs;
-                Vector3 headPosition = position + head;
-
-                if(world->PlayerInWater(legsPosition))
-                    footInWater = true;
-                else
-                    footInWater = false;
-
-                if(world->PlayerInWater(headPosition))
-                {
-                    if (velocity.y > -3)
-                    {
-                        velocity.y += (GRAVITY/3.0f) * dt;
-                    }
-                    else
-                    {
-                        velocity.y = -3;
-                    }
-                    headInWater = true;
-                }
-                else
-                {
-                    headInWater = false;
-                    velocity.y += (GRAVITY*1.3 * dt) * 1.6f;
-                }
-
-                if(world->PlayerInLava(legsPosition))
-                {
-                    footInLava = true;
-                    HP -= 0.5f;
-                    damaged = true;
-                    damagedTimer = 0.55f;
-                }
-                else
-                {
-                    footInLava = false;
-                }
-
-                if(world->PlayerInLava(headPosition))
-                {
-                    velocity.y += (GRAVITY/3.0f) * dt;
-                    headInLava = true;
-                    HP -= 1;
-                    damaged = true;
-                    damagedTimer = 0.55f;
-                }
-                else
-                {
-                    headInLava = false;
-                    velocity.y += GRAVITY * dt;
-                }
-
-                touchingCactus = false;
-                if(world->PlayerCollisionWithCactus(headPosition) || world->PlayerCollisionWithCactus(legsPosition))
-                {
-                    touchingCactus = true;
-                }
-
-                if(world->SolidAtPointForEntity(footPosition,colliderD) || world->SolidAtPointForEntity(headPosition,colliderU))
-                {
-                    walkingOnGround = true;
-                    if (world->SolidAtPointForEntity(headPosition,colliderU))
-                    {
-                        int blockIn = (int)(headPosition.y);
-                        position.y = (float)(blockIn - colliderU.y - 0.05);
-                    }
-                    if (world->SolidAtPointForEntity(footPosition,colliderD))
-                    {
-                        int blockOn = (int)(footPosition.y);
-                        position.y = (float)(blockOn + 1 + colliderD.y - 0.05);
-
-                        if(world->GetBlock(footPosition.x,footPosition.y,footPosition.z) == CactusBlock::getID())
-                        {
-                            touchingCactus = true;
-                        }
-                    }
-
-                    if(velocity.y != 0.0f) /// FALL DAMAGE
-                    {
-                        if (!world->PlayerInWater(footPosition))
-                        {
-                            if(velocity.y < -12 && velocity.y > -19)
-                            {
-                                HP -= (int)((velocity.y*-1) - 11) / 1.4;
-
-                                damaged = true;
-                                damagedTimer = 0.75f;
-                                playHurtSound = true;
-                            }
-                            if(velocity.y < -19)
-                            {
-                                HP -= (int)((velocity.y*-1) - 11) * 1.3f;
-
-                                damaged = true;
-                                damagedTimer = 0.75f;
-                                playHurtSound = true;
-                            }
-                        }
-                    }
-                    velocity.y = 0.0f;
-
-                    if(jumping == true)
-                    {
-                        velocity.y = 1.55f * JUMPVELOCITY;
-                        jumping = false;
-                        walkingOnGround = false;
-                    }
-                }
-                else
-                {
-                    walkingOnGround = false;
-                }
-                position += velocity * dt;
-            }
-            /// * --- END
-
+                UpdateMobPhysics(dt);
+            } // dt < 0.1f timers/AI
 
         }
         else
@@ -834,6 +702,8 @@ void Creeper::Render(Frustum &camFrustum, float dt)
             sceGuColor(0xFFFFFFFF);
 
             sceGumPopMatrix();
+
+            RenderFire();
         }
     }
 }

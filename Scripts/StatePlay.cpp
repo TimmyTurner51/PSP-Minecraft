@@ -1,25 +1,182 @@
  #include "StatePlay.h"
+#include <Aurora/Graphics/Effects/Arrow2.h>
 #include "TextureHelper.h"
+#include "DebugConfig.h"
+#include "PerfCounters.h"
+#include <stdio.h>
+#include <stdarg.h>
+#include <pspkernel.h>
 
 #include "WorldGenerator.h"
 #include "LoadingScreen.h"
+#include "LameFunctions.h"
 
 #define PI 3.14159265f
 #define DEG_TO_RAD (PI / 180.0f)
 #define TEXTURE_CHUNKS 8
 #define SKY_MOVE 0.003f
 
-#define WORLD_SIZE 252
+#define WORLD_SIZE 256
 #define WORLD_HEIGHT 112
-#define CHUNK_SIZE 14
+#define CHUNK_SIZE 16
 
 #define default_size 0.5
 #define default_big_size 0.687
 
+// How long a single chat-button press waits for a second one. The chat button (D-pad Up by
+// default) doubles as the third-person toggle, and the second tap has to be recognised before
+// chat opens, because the on-screen keyboard takes every button once it is up. Comfortably long
+// enough for a deliberate double tap, and the only cost of a single press is this much delay
+// before the keyboard appears.
+#define CHAT_DOUBLE_TAP_WINDOW 0.3f
+
+// Third person. The boom length is walked in whole steps from the eye towards the back of the
+// player and stops at the last step that is still clear, which is what keeps the camera outside
+// walls without a proper swept raycast. NEVER_BELOW is the length used when even the first step is
+// blocked -- see the placement call for why it is not simply zero.
+#define THIRD_PERSON_DISTANCE 3.5f
+#define THIRD_PERSON_NEVER_BELOW 1.1f
+#define THIRD_PERSON_STEPS 12
+
+// How far the head may be turned away from the body before the body is dragged round after it, in
+// degrees. Java's EntityLivingBase.updateDistance() clamps the head-to-body angle to this, which is
+// what gives the pivot-on-the-spot feel: inside the limit only the head moves, at the limit the body
+// comes round too.
+#define BODY_MAX_HEAD_TURN 75.0f
+
+// Sprinting. Java: walking 0.1 (the speed stat, not the exhaustion figure below), sprinting 0.13, so
+// a sprint is 1.3x. The FOV widens 15% while sprinting (EntityRenderer), which on a 480x272 screen is
+// most of what makes a sprint feel like one. The window is Java's 7-tick double-tap window; the 0.04
+// is the same "skip the first frames so a click bounce is not a second tap" guard the creative
+// sprint-fly uses.
+#define SPRINT_SPEED_MULT 1.3f
+#define SPRINT_FOV_MULT 0.15f
+#define SPRINT_TAP_WINDOW 0.35f
+#define SPRINT_TAP_MIN_GAP 0.04f
+
+// Camera bob is *not* scaled or suppressed in third person. It was tempting -- the dip is authored at
+// the eye, and in third person the nearest thing on screen is the player one boom length away, so the
+// same world-space dip reads as the model hopping against the ground more than as scenery sway. But
+// Java applies view bobbing identically in every perspective (setupViewBobbing has no thirdPersonView
+// test, only the View Bobbing option), so scaling it here would be a deviation, not a correction. The
+// correction was in the bob itself: cameraYaw is speed-proportional and ground-gated, so a walk is the
+// only thing that bobs at full strength, and the amplitude is Java's.
+
+// Hunger exhaustion. These are Java's own numbers, from EntityPlayer.addMovementStat / jump /
+// attackTargetEntityWithCurrentItem, and they are per *metre* wherever a distance is involved -- which
+// is the whole point: a sprinted metre costs ten times a walked one, so the bar empties about ten
+// times faster for the same distance. Exhaustion accumulates and CraftWorld::AddExhaustion trades
+// every full 4.0 in for a hunger point, so 400 walked metres or 40 sprinted metres is one point.
+#define EXHAUST_WALK 0.01f      // per metre, also the swimming and sneaking rate in 1.7
+#define EXHAUST_SPRINT 0.1f     // per metre
+#define EXHAUST_SWIM 0.015f     // per metre, Java's higher water rate
+#define EXHAUST_JUMP 0.05f      // per jump
+#define EXHAUST_SPRINT_JUMP 0.2f// per jump while sprinting, so bunny-hopping is not free
+#define EXHAUST_ATTACK 0.1f     // per swing that lands
+#define EXHAUST_DAMAGE 0.1f     // per hit taken
+
+// Java's MathHelper.wrapAngleTo180_float and the 0..360 form, for the head/body follow below.
+static float WrapAngle180(float angle)
+{
+    while(angle >= 180.0f)
+        angle -= 360.0f;
+    while(angle < -180.0f)
+        angle += 360.0f;
+    return angle;
+}
+
+static float WrapAngle360(float angle)
+{
+    while(angle >= 360.0f)
+        angle -= 360.0f;
+    while(angle < 0.0f)
+        angle += 360.0f;
+    return angle;
+}
+
 #define ENGLISH 1
+
+static int PauseOptionsGridMove(int pos, int dcol, int drow)
+{
+    int col = (pos >= 8) ? 1 : 0;
+    int row = pos & 7;
+    col = (col + dcol) & 1;
+    row = (row + drow + 8) & 7;
+    return col * 8 + row;
+}
+
+static bool PauseOptionsIsSlider(int pos)
+{
+    return pos == 0 || pos == 1 || pos == 8 || pos == 9;
+}
+
+static bool AdjustPauseOptionsSlider(CraftWorld* world, Camera* cam, SkyLight* sky, SkyLight* moon, int pos, int dir)
+{
+    if(world == NULL)
+        return false;
+    if(dir > 0)
+        dir = 1;
+    else if(dir < 0)
+        dir = -1;
+    else
+        return false;
+
+    if(pos == 0)
+    {
+        int fov = world->mainOptions.fov + dir * 5;
+        if(fov < 40 || fov > 100)
+            return false;
+        world->mainOptions.fov = fov;
+        RenderManager::InstancePtr()->fovv = world->mainOptions.fov;
+        RenderManager::InstancePtr()->SetPerspective(0, 480.0f / 272.0f, 0.18f, 1000.f);
+        if(sky != NULL)
+            sky->UpdateLightSource(world->skyTime);
+        if(moon != NULL)
+            moon->UpdateLightSource(world->skyTime);
+        return true;
+    }
+    if(pos == 1)
+    {
+        int v = world->mainOptions.horizontalViewDistance + dir;
+        if(v < 1 || v > 3)
+            return false;
+        world->mainOptions.horizontalViewDistance = v;
+        world->playerZoneSize = Vector3(CHUNK_SIZE * v, CHUNK_SIZE * world->mainOptions.verticalViewDistance, CHUNK_SIZE * v);
+        if(cam != NULL)
+        {
+            world->UpdatePlayerZoneBB(cam->m_vPosition);
+            cam->needUpdate = true;
+        }
+        return true;
+    }
+    if(pos == 8)
+    {
+        int v = world->mainOptions.verticalViewDistance + dir;
+        if(v < 1 || v > 3)
+            return false;
+        world->mainOptions.verticalViewDistance = v;
+        world->playerZoneSize = Vector3(CHUNK_SIZE * world->mainOptions.horizontalViewDistance, CHUNK_SIZE * v, CHUNK_SIZE * world->mainOptions.horizontalViewDistance);
+        if(cam != NULL)
+        {
+            world->UpdatePlayerZoneBB(cam->m_vPosition);
+            cam->needUpdate = true;
+        }
+        return true;
+    }
+    if(pos == 9)
+    {
+        int d = world->mainOptions.difficult + dir;
+        if(d < 0 || d > 3)
+            return false;
+        world->mainOptions.difficult = d;
+        return true;
+    }
+    return false;
+}
 
 StatePlay::StatePlay()
 {
+    portalFadeTex = -1;
     time12 = 0.0f;
     mRender = NULL;
     mSystemMgr = NULL;
@@ -47,6 +204,7 @@ StatePlay::StatePlay()
     moveForward = false;
     walkingOnGround = false;
     jumping = false;
+    sneaking = false;
     moving = false;
     headInWater = false;
     footInWater = false;
@@ -60,6 +218,19 @@ StatePlay::StatePlay()
     chestEn = false;
     furnaceEn = false;
     armorEn = false;
+
+    thirdPersonView = 0;
+    chatTapTimer = 0.0f;
+    chatTapPending = false;
+    bodyYaw = 270.0f;      // the camera's own default heading; InitCamera re-reads it
+    headYawOffset = 0.0f;
+    bobCamera = 0.0f;
+    sprinting = false;
+    sprintTapTimer = 0.0f;
+    sprintTapArm = false;
+    sprintTapPending = false;
+    sprintFwdWasHeld = false;
+    sprintFovBoost = 0.0f;
 
     cycle = 0;
     dtt = 0.0f;
@@ -79,6 +250,13 @@ StatePlay::StatePlay()
     dT = 0;
     dStd = -1;
     tryToDt = false;
+    pendingCrackId = -1;
+    pendingCrackX = 0.0f;
+    pendingCrackY = 0.0f;
+    pendingCrackZ = 0.0f;
+    pendingBreakStage = 0;
+    pendingBreakWasLight = false;
+    pendingBreakChunk = -1;
 
     testPos1.x = -1;
     testPos1.y = -1;
@@ -105,6 +283,11 @@ StatePlay::StatePlay()
     menuState = 0;
     selectPos = 0;
 
+    // The debug stick's menu must never survive a world load. Leaving it up would freeze the new
+    // world on its first frame with a menu pointing at a mob from the old one.
+    debugMenu.Close();
+    debugTarget = NULL;
+
     cloudsOffset = 0.0f;
 
     devMode = false;
@@ -113,6 +296,10 @@ StatePlay::StatePlay()
 	canHeadBob = true;
 	invSteveAngle = 0.0f;
 	bobCycle = 0.0f;
+	bobWalk = 0.0f;
+	camFollowY = 0.0f;
+	camFollowYInit = false;
+	lookDt = 1.0f / 60.0f;
 	changeY = 0.0f;
 	changeScale = 0.0f;
 
@@ -125,6 +312,8 @@ StatePlay::StatePlay()
 	hpAnim = 0.0f;
 
 	canFly = false;
+	flyJumpTimer = 0.0f;
+	flyJumpWasHeld = false;
 
 	for(int i = 0; i <= 3; i += 1)
     {
@@ -166,6 +355,9 @@ StatePlay::StatePlay()
     animSpeed = 1.0f;
     animGo = false;
 
+    bowCharging = false;
+    bowCharge = 0.0f;
+
     cubeLight = 0.0f;
 
     sleepMessageTime = 0.0f;
@@ -183,7 +375,6 @@ StatePlay::StatePlay()
 
 StatePlay::~StatePlay()
 {
-
 }
 
 void StatePlay::InitCamera()
@@ -192,12 +383,26 @@ void StatePlay::InitCamera()
     fppCam->PositionCamera(playerPosition.x,playerPosition.y,playerPosition.z, playerPosition.x,playerPosition.y,playerPosition.z-5.0f, 0.0f,1.0f,0.0f);
     mRender->SetActiveCamera(fppCam);
 
+    // The third-person body starts aligned with wherever the camera is pointing, so loading a save
+    // does not snap the model round on the first frame.
+    bodyYaw = fppCam->horAngle;
+    headYawOffset = 0.0f;
+
     mWorld->UpdatePlayerZoneBB(fppCam->m_vPosition);
-    mWorld->RebuildVisibleChunks();
+    mWorld->FetchNearestChunks();
 }
 
 void StatePlay::Init()
 {
+    // Free the title-screen art here rather than in Enter(). The nether runs out of heap inside
+    // buildMap() and the first mesh pass -- which happen below, during InitParametric -- and Enter()
+    // is not called until the world is pushed, i.e. after all of it. Releasing there would arrive too
+    // late to be the reason the mesh build fits. The menu is not drawn between here and the handover
+    // (the loading screen is, and it uses Dirt/Load, which are not on the release list), and the
+    // menu's own sprites are index-based, so they survive untouched and StateMenu::Resume refills
+    // them.
+    TextureHelper::Instance()->ReleaseMenuTextures();
+
     //set render manager instance
     mRender = RenderManager::InstancePtr();
     mSystemMgr = SystemManager::Instance();
@@ -219,7 +424,7 @@ void StatePlay::Init()
 
     playerPosition = newPlayerPos = oldPlayerPos = Vector3(64.0f,mWorld->groundHeight(0,0)+0,0);
 
-    int	curchunkTarget = mWorld->getChunkId(playerPosition);
+    // (curchunkTarget removed: computed from getChunkId and never read)
 
     dt = mTimer.GetDeltaTime();
 
@@ -242,6 +447,15 @@ void StatePlay::Init()
 
 void StatePlay::InitParametric(bool makeTrees,bool makeWater,bool makeCaves,unsigned int seed_1, int worldType, char gameMode)
 {
+    // Before the world, not after it. This function builds the map and its meshes itself (see
+    // buildMap below), so a release in Init()/Enter() would run after the allocation that runs out
+    // of heap -- which is the whole complaint this is addressing. The menu is not drawn between here
+    // and the handover; the loading screen is, and it uses Dirt/Load, which are deliberately not on
+    // the release list.
+    MC_DEBUG_LOG("stateplay: releasing the menu art BEFORE the world build\n");
+    TextureHelper::Instance()->ReleaseMenuTextures();
+    MC_DEBUG_LOG("stateplay: menu art released, continuing into the world build\n");
+
     //set render manager instance
     mRender = RenderManager::InstancePtr();
     mSystemMgr = SystemManager::Instance();
@@ -253,27 +467,28 @@ void StatePlay::InitParametric(bool makeTrees,bool makeWater,bool makeCaves,unsi
     mWorld->initWorld(WORLD_SIZE, WORLD_HEIGHT, CHUNK_SIZE);
     mWorld->gameModeWorld = gameMode;
 
-    WorldGenerator *mGen = new WorldGenerator();
-    mGen->initRandompMap(WORLD_SIZE, WORLD_HEIGHT, CHUNK_SIZE, mWorld, makeTrees, makeWater, makeCaves, seed_1, worldType);
-    delete mGen;
+    mWorld->worldGen = new WorldGenerator();
+    mWorld->worldGen->initRandompMap(WORLD_SIZE, WORLD_HEIGHT, CHUNK_SIZE, mWorld, makeTrees, makeWater, makeCaves, seed_1, worldType);
     //mWorld->initRandompMap(128,16,terrainType,makeFlat,makeTrees,makeWater,makeCaves);
     mWorld->setTextureSize(256,16,64,16,256,16);
     mWorld->SetWolrdTime(10);
+    playerPosition = newPlayerPos = oldPlayerPos = mWorld->playerSpawnPointPosition;
     mWorld->UpdatePlayerZoneBB(playerPosition);
     mWorld->buildMap();
+    MC_DebugHeapCheckpoint("play map built");
 
-    playerPosition = newPlayerPos = oldPlayerPos = mWorld->playerSpawnPointPosition;
-
-    int	curchunkTarget = mWorld->getChunkId(playerPosition);
+    // (curchunkTarget removed: computed from getChunkId and never read)
 
     dt = mTimer.GetDeltaTime();
 
     LoadTextures();
+    TextureManager::Instance()->LogTextureUsage("at world entry");
 
     mWorld->GetTexturesIds();
     mWorld->buildblocksVerts();
     mWorld->buildcloudsVerts();
     mWorld->buildmobVerts();
+    MC_DebugHeapCheckpoint("play mesh built");
 
     menuOptions = false;
     optionsMenuPos = 0;
@@ -289,20 +504,71 @@ void StatePlay::InitParametric(bool makeTrees,bool makeWater,bool makeCaves,unsi
 
     mWorld->haveCompass = mWorld->HaveItemInBarSlots(Compass::getID());
 
-
+#if MC_PERF_PROBE
+    PerfProbeSelfTest();
+#endif
 }
+
+#if MC_TEST_ENV
+void StatePlay::ApplyTestEnvironment(int weather, int hour)
+{
+    if(mWorld == NULL || mWorld->worldWeather == NULL)
+        return;
+
+    // Longer than any run, so the weather cannot turn on its own.
+    mWorld->worldWeather->SetWeatherType(weather);
+    mWorld->worldWeather->SetWeatherDuration(1000000.0f);
+    if(hour >= 0)
+    {
+        mWorld->SetWolrdTime((float)(hour % 24));
+        mWorld->SetAllChunksToUpdate();
+    }
+    Aurora::Utils::Logger::Instance()->LogMessage("testenv: weather %d, hour %d\n", weather, hour);
+}
+
+void StatePlay::SpawnTestMobInFront()
+{
+    const char* name = MC_TEST_MOB_STR(MC_TEST_MOB);
+    if(name[0] == 0 || mWorld == NULL)
+        return;
+
+    // Default camera looks toward -Z. Plant it in that view, on the ground.
+    float x = playerPosition.x;
+    float z = playerPosition.z - 3.5f;
+    int gx = (int)floorf(x);
+    int gz = (int)floorf(z);
+    int gy = mWorld->groundHeightWater(gx, gz);
+    if(gy <= 0)
+        gy = (int)playerPosition.y;
+    float y = (float)gy + 1.8f;
+
+    LameMob* mob = mWorld->SpawnMobByName(name, x, y, z);
+    if(mob == NULL)
+    {
+        Aurora::Utils::Logger::Instance()->LogMessage("testenv: unknown MC_TEST_MOB '%s'\n", name);
+        return;
+    }
+    mob->poseLock = true;
+    mob->mainAngle = ATAN2_fast(playerPosition.x - x, playerPosition.z - z);
+    Aurora::Utils::Logger::Instance()->LogMessage("testenv: still %s at %.1f,%.1f,%.1f\n", name, x, y, z);
+}
+#endif
 
 void StatePlay::SetWorldAndSaveName(std::string worldName,std::string fileName)
 {
     if(mWorld != NULL)
     {
         sprintf(mWorld->worldName,"%s",worldName.c_str());
+        mWorld->SetWorldSavePath(fileName);
     }
     saveFileName = fileName;
 }
 
 void StatePlay::LoadMap(std::string fileName,bool compressed)
 {
+    // As in InitParametric: this is a second world-build path, and the release has to precede it.
+    TextureHelper::Instance()->ReleaseMenuTextures();
+
     //enter loading screen
     LoadingScreen* loading = new LoadingScreen();
 
@@ -345,7 +611,7 @@ void StatePlay::LoadMap(std::string fileName,bool compressed)
     mWorld->initWorldBlocksLight();
     mWorld->buildMap();
 
-    int	curchunkTarget = mWorld->getChunkId(playerPosition);
+    // (curchunkTarget removed: computed from getChunkId and never read)
     dt = mTimer.GetDeltaTime();
     // load textures
     LoadTextures();
@@ -380,10 +646,16 @@ void StatePlay::LoadMap(std::string fileName,bool compressed)
 
 void StatePlay::LoadTextures()
 {
+    // The menu equips a skin into the Steve slot. Doing it again here covers a boot that ran
+    // before the save folder was the working directory, and a texture pack that reloaded Steve.
+    TextureHelper::Instance()->ApplySavedSkin();
+
     //terrain texure
     texture = TextureHelper::Instance()->GetTexture(TextureHelper::Terrain1);
+	Xpbar = TextureHelper::Instance()->GetTexture(TextureHelper::Xpbar);
     texture_mips = TextureHelper::Instance()->GetTexture(TextureHelper::Terrain2);
     waterAnimation = TextureHelper::Instance()->GetTexture(TextureHelper::WaterAnimation);
+    Particle::PrecacheTextures(mWorld);
 
     invPlayerTex = TextureHelper::Instance()->GetTexture(TextureHelper::Steve);
     cloudsTex = TextureHelper::Instance()->GetTexture(TextureHelper::clouds1);
@@ -419,12 +691,8 @@ void StatePlay::LoadTextures()
     barSprite->SetPosition(240,230);
     barSprite->Scale(utilScale,utilScale);
 
-	xpSprite = new Sprite(TextureHelper::Instance()->GetTexture(TextureHelper::Xpbar), 0 * utilsSize / 182, 0 * utilsSize / 182, 182 * utilsSize / 182, 5 * utilsSize / 182);
-	xpSprite->SetPosition(240, 210);
-	xpSprite->Scale(utilScale, utilScale);
-
     selectSprite = new Sprite(TextureHelper::Instance()->GetTexture(TextureHelper::Utils),0*utilsSize/182,22*utilsSize/182,24*utilsSize/182,24*utilsSize/182);
-    selectSprite->SetPosition(125,230);
+    selectSprite->SetPosition(108.0f + 11.0f * (264.0f / 182.0f),230);
     selectSprite->Scale(utilScale,utilScale);
 
     crossSprite = new Sprite(TextureHelper::Instance()->GetTexture(TextureHelper::Utils),24*utilsSize/182,22*utilsSize/182,9*utilsSize/182,9*utilsSize/182);
@@ -524,24 +792,38 @@ void StatePlay::LoadTextures()
 
     // inventory section
 
-    int invGuiSize = TextureManager::Instance()->getWidth(TextureHelper::Instance()->GetTexture(TextureHelper::inv));
-    float invGuiScale = 350.0f/(float)invGuiSize;
+    int invTex = TextureHelper::Instance()->GetTexture(TextureHelper::inv);
+    guiInvW = TextureManager::Instance()->getWidth(invTex);
+    guiInvH = (float)TextureManager::Instance()->getHeight(invTex);
+    guiScale = 350.0f / guiInvW;
 
-    invSprite = new Sprite(TextureHelper::Instance()->GetTexture(TextureHelper::inv));//200
+    int crtTex = TextureHelper::Instance()->GetTexture(TextureHelper::crt);
+    guiCrtW = TextureManager::Instance()->getWidth(crtTex);
+    guiCrtH = (float)TextureManager::Instance()->getHeight(crtTex);
+
+    int chtTex = TextureHelper::Instance()->GetTexture(TextureHelper::cht);
+    guiChtW = TextureManager::Instance()->getWidth(chtTex);
+    guiChtH = (float)TextureManager::Instance()->getHeight(chtTex);
+
+    int furTex = TextureHelper::Instance()->GetTexture(TextureHelper::fur);
+    guiFurW = TextureManager::Instance()->getWidth(furTex);
+    guiFurH = (float)TextureManager::Instance()->getHeight(furTex);
+
+    invSprite = new Sprite(invTex);//200
     invSprite->SetPosition(240,136);
-    invSprite->Scale(invGuiScale,invGuiScale);
+    invSprite->Scale(guiScale,guiScale);
 
-    crtSprite = new Sprite(TextureHelper::Instance()->GetTexture(TextureHelper::crt));//200
+    crtSprite = new Sprite(crtTex);//200
     crtSprite->SetPosition(240,136);
-    crtSprite->Scale(invGuiScale,invGuiScale);
+    crtSprite->Scale(guiScale,guiScale);
 
-    chtSprite = new Sprite(TextureHelper::Instance()->GetTexture(TextureHelper::cht));//200
+    chtSprite = new Sprite(chtTex);//200
     chtSprite->SetPosition(240,136);
-    chtSprite->Scale(invGuiScale,invGuiScale);
+    chtSprite->Scale(guiScale,guiScale);
 
-    furSprite = new Sprite(TextureHelper::Instance()->GetTexture(TextureHelper::fur));//200
+    furSprite = new Sprite(furTex);//200
     furSprite->SetPosition(240,136);
-    furSprite->Scale(invGuiScale,invGuiScale);
+    furSprite->Scale(guiScale,guiScale);
 
     int invArrowSize = TextureManager::Instance()->getWidth(TextureHelper::Instance()->GetTexture(TextureHelper::furArrow));
     float invArrowScale = 44.0f/(float)invArrowSize;
@@ -564,11 +846,11 @@ void StatePlay::LoadTextures()
     }
 
     selectInvSprite = new Sprite(TextureHelper::Instance()->GetTexture(TextureHelper::cursor));//200
-    selectInvSprite->SetPosition(96,138);
+    UpdateInvCursorPos();
 
     invCellSprite = new Sprite(TextureHelper::Instance()->GetTexture(TextureHelper::invCell));//200
     invCellSprite->SetPosition(240,136);
-    invCellSprite->Scale(2,2);
+    invCellSprite->Scale(guiScale,guiScale);
 
     skyLight = new SkyLight();
     skyMoonLight = new SkyLight();
@@ -588,6 +870,10 @@ void StatePlay::SetDayTimeAfterLoad()
 void StatePlay::Enter()
 {
     RenderManager::InstancePtr()->SetPerspective(55.0f, 480.0f / 272.0f, 0.18f, 1000.0f);//1000
+
+    // No frame drawn from here until StateMenu::Resume samples the title-screen art, and the nether
+    // needs the heap it is sitting on. Reloaded on the way back (see TextureHelper).
+    TextureHelper::Instance()->ReleaseMenuTextures();
 }
 
 void StatePlay::CleanUp()
@@ -610,7 +896,6 @@ void StatePlay::CleanUp()
     delete nbuttonSprite;
     delete moverSprite;
     delete barSprite;
-	delete xpSprite;
     delete selectSprite;
     delete crossSprite;
     delete invSprite;
@@ -680,15 +965,11 @@ void StatePlay::Resume()
 
 int StatePlay::FindChestId(int x, int y, int z)
 {
-    int o;
-    int address;
-    o = -1;
-    address = x + y * WORLD_SIZE + z * WORLD_SIZE * WORLD_HEIGHT;
-
+    int o = -1;
     for(unsigned int i = 0; i < mWorld->mChests.size(); i++)
     {
         Chest* NewChest = mWorld->mChests[i];
-        if(NewChest->chestAddress == address)
+        if(NewChest->chestX == x && NewChest->chestY == y && NewChest->chestZ == z)
         {
             o = i;
             break;
@@ -721,12 +1002,12 @@ void StatePlay::CheckForFurnFuel(Furnace* Fur)
 
     furnItem = -1;
 
-    if(Fur->furnaceSlotId[0] < 250 && Fur->furnaceSlotId[0] != -1)
+    if(IsBlockId(Fur->furnaceSlotId[0]) && Fur->furnaceSlotId[0] != -1)
     {
         furnItem = mWorld->blockTypes[Fur->furnaceSlotId[0]].furnItem;
     }
 
-    if(Fur->furnaceSlotId[0] >= 250)
+    if(IsItemId(Fur->furnaceSlotId[0]))
     {
         furnItem = mWorld->itemTypes[Fur->furnaceSlotId[0]-250].furnItem;
     }
@@ -853,12 +1134,12 @@ void StatePlay::CheckForFurnWorking(Furnace* Fur)
 
     furnItem = -1;
 
-    if(Fur->furnaceSlotId[0] < 250 && Fur->furnaceSlotId[0] != -1)
+    if(IsBlockId(Fur->furnaceSlotId[0]) && Fur->furnaceSlotId[0] != -1)
     {
         furnItem = mWorld->blockTypes[Fur->furnaceSlotId[0]].furnItem;
     }
 
-    if(Fur->furnaceSlotId[0] >= 250)
+    if(IsItemId(Fur->furnaceSlotId[0]))
     {
         furnItem = mWorld->itemTypes[Fur->furnaceSlotId[0]-250].furnItem;
     }
@@ -902,12 +1183,12 @@ void StatePlay::ReadyFurnSmelting(Furnace* Fur)
 {
     int furnItem;
 
-    if(Fur->furnaceSlotId[0] < 250)
+    if(IsBlockId(Fur->furnaceSlotId[0]))
     {
         furnItem = mWorld->blockTypes[Fur->furnaceSlotId[0]].furnItem;
     }
 
-    if(Fur->furnaceSlotId[0] >= 250)
+    if(IsItemId(Fur->furnaceSlotId[0]))
     {
         furnItem = mWorld->itemTypes[Fur->furnaceSlotId[0]-250].furnItem;
     }
@@ -1224,6 +1505,22 @@ void StatePlay::CraftItem2x2()
 
                 enableMainCraftBody = false;
             }
+        }
+    }
+
+    // redstone torch: a piece of redstone dust above a stick, the same vertical pair the plain torch
+    // uses with coal. Ids are 353 (dust) over 276 (stick), and the 2x2 grid is column-major here, so
+    // the pair is (0,2) or (1,3).
+    if(itemsIDs.size() == 2)
+    {
+        if((craftSlotId[0] == Redstone::getID() && craftSlotId[2] == Stick::getID()) ||
+           (craftSlotId[1] == Redstone::getID() && craftSlotId[3] == Stick::getID()))
+        {
+            craftItemId = RedstoneTorchItem::getID();
+            craftItemSt = 1;
+            craftItemAm = 1;
+
+            enableMainCraftBody = false;
         }
     }
 
@@ -1842,6 +2139,20 @@ void StatePlay::CraftItem3x3()
 
             enableMainCraftBody = false;
         }
+
+        // lever: one cobblestone and one stick, the vanilla shape. It has to live here rather than in
+        // the 3x3 switch below, because that switch keys on the *sum* of the grid and cobblestone +
+        // stick is 312 -- already the case label of the two-spruce-plank stick recipe. Two different
+        // shapes summing to the same number is the one thing that switch cannot express.
+        if((itemsIDs[0] == CobbleStone::getID() && itemsIDs[1] == 276) ||
+           (itemsIDs[1] == CobbleStone::getID() && itemsIDs[0] == 276))
+        {
+            craftItemId3 = Lever::getID();
+            craftItemSt3 = 1;
+            craftItemAm3 = 1;
+
+            enableMainCraftBody = false;
+        }
     }
 
     if(itemsIDs.size() == 3)
@@ -1859,6 +2170,40 @@ void StatePlay::CraftItem3x3()
         }
     }
 
+    // piston: three planks across the top, cobblestone-iron-cobblestone in the middle and
+    // cobblestone-redstone-cobblestone along the bottom -- vanilla's shape, and here the shape is the
+    // whole point and not the total. The 3x3 switch below keys on the *sum* of the grid, and a sum
+    // cannot tell this arrangement from any other arrangement of the same nine items, so the grid is
+    // checked slot by slot.
+    //
+    // The three planks may be any wood, mixed or not: vanilla's recipe asks the ore dictionary for
+    // plankWood, and the bed and carpet recipes above read planks as one category for the same reason.
+    // There is deliberately no sticky piston recipe. Vanilla wants a slimeball for it and this build has
+    // no slime and no slimeball, so a sticky piston is a creative-tab item -- see the Redstone tab.
+    {
+        bool planks = true;
+        for(int i = 0; i <= 2; i++)
+        {
+            if(craftSlotId3[i] != OakPlanks::getID() && craftSlotId3[i] != SprucePlanks::getID() &&
+               craftSlotId3[i] != BirchPlanks::getID())
+            {
+                planks = false;
+            }
+        }
+
+        if(planks &&
+           craftSlotId3[3] == CobbleStone::getID() && craftSlotId3[4] == IronBar::getID() &&
+           craftSlotId3[5] == CobbleStone::getID() && craftSlotId3[6] == CobbleStone::getID() &&
+           craftSlotId3[7] == Redstone::getID() && craftSlotId3[8] == CobbleStone::getID())
+        {
+            craftItemId3 = PistonOff::getID();
+            craftItemSt3 = 1;
+            craftItemAm3 = 1;
+
+            enableMainCraftBody = false;
+        }
+    }
+
     itemsIDs.clear();
 
     if(enableMainCraftBody)
@@ -1871,6 +2216,44 @@ void StatePlay::CraftItem3x3()
                 craftItemId3 = 322;
                 craftItemSt3 = 1;
                 craftItemAm3 = 3;
+            }
+        break;
+
+        // arrow: flint over stick over feather, vanilla's vertical column, and vanilla yields four.
+        // The grid is checked slot by slot on purpose -- this switch keys on the *sum* of the grid,
+        // so 1038 only proves "something that adds up to flint + stick + feather", not the shape.
+        case 1038:
+            for(int col = 0; col < 3; col++)
+            {
+                if(craftSlotId3[col] == Flint::getID() &&
+                   craftSlotId3[col+3] == Stick::getID() &&
+                   craftSlotId3[col+6] == Feather::getID())
+                {
+                    craftItemId3 = Arrow::getID();
+                    craftItemSt3 = 1;
+                    craftItemAm3 = 4;
+                }
+            }
+        break;
+
+        // bow: three sticks and three string in vanilla's shape, string down the right column and
+        // sticks curving down the middle and left:
+        //     . s #
+        //     s . #
+        //     . s #
+        // 3*string + 3*stick is 2073, which nothing else in this switch claims.
+        case 2073:
+            if(craftSlotId3[1] == Stick::getID() && craftSlotId3[3] == Stick::getID() &&
+               craftSlotId3[7] == Stick::getID() &&
+               craftSlotId3[2] == String::getID() && craftSlotId3[5] == String::getID() &&
+               craftSlotId3[8] == String::getID())
+            {
+                craftItemId3 = Bow::getID();
+                // A bow is a tool, so it is not stackable and its amount is its durability, not a
+                // count of one. This used to read (1, 1), which meant a crafted bow arrived with a
+                // single use and an already-empty durability bar -- see CraftWorld::FreshItemAmount.
+                craftItemSt3 = 0;
+                craftItemAm3 = mWorld->FreshItemAmount(Bow::getID());
             }
         break;
 
@@ -2225,6 +2608,37 @@ void StatePlay::CraftItem3x3()
             if((craftSlotId3[0] == Pumpkin3::getID() && craftSlotId3[3] == TorchItem::getID()) || (craftSlotId3[1] == Pumpkin3::getID() && craftSlotId3[4] == TorchItem::getID()) || (craftSlotId3[2] == Pumpkin3::getID() && craftSlotId3[5] == TorchItem::getID()) || (craftSlotId3[3] == Pumpkin3::getID() && craftSlotId3[6] == TorchItem::getID()) || (craftSlotId3[4] == Pumpkin3::getID() && craftSlotId3[7] == TorchItem::getID()) || (craftSlotId3[5] == Pumpkin3::getID() && craftSlotId3[8] == TorchItem::getID()))
             {
                 craftItemId3 = JackOLantern3::getID();
+                craftItemSt3 = 1;
+                craftItemAm3 = 1;
+            }
+        break;
+
+        // redstone repeater: torch, dust, torch over a full row of stone -- the vanilla shape. The sum
+        // is 3*3 + 2*408 + 353, and the grid is row-major, so the two accepted layouts are the torch row
+        // on top (0,1,2 over 3,4,5) or on the bottom (3,4,5 over 6,7,8); the flip is allowed because the
+        // 3x3 grid is easy to fill upside down and this codebase has no shaped-recipe mirroring.
+        case 1178:
+            if((craftSlotId3[0] == RedstoneTorchItem::getID() && craftSlotId3[1] == Redstone::getID() && craftSlotId3[2] == RedstoneTorchItem::getID() &&
+                craftSlotId3[3] == 3 && craftSlotId3[4] == 3 && craftSlotId3[5] == 3) ||
+               (craftSlotId3[3] == RedstoneTorchItem::getID() && craftSlotId3[4] == Redstone::getID() && craftSlotId3[5] == RedstoneTorchItem::getID() &&
+                craftSlotId3[6] == 3 && craftSlotId3[7] == 3 && craftSlotId3[8] == 3))
+            {
+                craftItemId3 = RepeaterItem::getID(); // the item form: it places a dark RepeaterOff
+                craftItemSt3 = 1;
+                craftItemAm3 = 1;
+            }
+        break;
+
+        // redstone lamp: four dust in a plus around a glowstone block, which is the vanilla recipe
+        // verbatim. Unlike every other shape here it needs no second layout: a plus rotated is the same
+        // plus. The result is the *dark* id, which is also its own loot, so a lamp broken anywhere in
+        // the world comes back as a lamp and not as a lit one.
+        case 1635:
+            if(craftSlotId3[1] == Redstone::getID() && craftSlotId3[3] == Redstone::getID() &&
+               craftSlotId3[4] == GlowstoneBlock::getID() &&
+               craftSlotId3[5] == Redstone::getID() && craftSlotId3[7] == Redstone::getID())
+            {
+                craftItemId3 = RedstoneLampOff::getID();
                 craftItemSt3 = 1;
                 craftItemAm3 = 1;
             }
@@ -2591,7 +3005,10 @@ void StatePlay::CraftItem3x3()
             {
                 craftItemId3 = 264;
                 craftItemSt3 = 0;
-                craftItemAm3 = 1562;
+                // 33, the golden shovel's own durability -- this read 1562, the diamond shovel's,
+                // which gave a golden shovel 47 times the life it should have had. Caught by
+                // tools/check-tool-durability.py; see the note at the top of that script.
+                craftItemAm3 = 33;
             }
         break;
 
@@ -3184,7 +3601,10 @@ void StatePlay::CraftItem3x3()
         break;
 
         case 75: //pumpkin to pumpkin seeds
-            if(craftSlotId3[0] == 75 || craftSlotId3[1] == 75 || craftSlotId3[2] == 75 && craftSlotId3[3] == 75 || craftSlotId3[4] == 75 || craftSlotId3[5] == 75 || craftSlotId3[6] == 75 || craftSlotId3[7] == 75 || craftSlotId3[8] == 75)
+            // Every slot joined with ||, matching the 2x2 grid's version of this same recipe above. Slots 2
+            // and 3 were joined with &&, which made a lone pumpkin in slot 2 match nothing -- the recipe
+            // silently failed for that one position.
+            if(craftSlotId3[0] == 75 || craftSlotId3[1] == 75 || craftSlotId3[2] == 75 || craftSlotId3[3] == 75 || craftSlotId3[4] == 75 || craftSlotId3[5] == 75 || craftSlotId3[6] == 75 || craftSlotId3[7] == 75 || craftSlotId3[8] == 75)
             {
                 craftItemId3 = PumpkinSeeds::getID();
                 craftItemSt3 = 1;
@@ -3206,6 +3626,10 @@ void StatePlay::HandleEvents(StateManager* sManager)
 {
     //update delta time
     dt = mTimer.GetDeltaTime();
+    if(dt > 0.1f)
+        dt = 0.1f;
+
+    canFly = false;
 
     cameraSpeed = 2.0f * dt;
     cameraMoveSpeed = 4.00f * dt;
@@ -3232,16 +3656,86 @@ void StatePlay::HandleEvents(StateManager* sManager)
     //update input
     mSystemMgr->InputUpdate();
 
+    // While the debug menu is up it owns the input. The world is held frozen and the only keys that
+    // mean anything are the menu's own, so returning here keeps a press of the use button from
+    // reaching the block and item paths, and keeps the stick from re-opening the menu on top of
+    // itself. HandleEvents is safe to leave early: the chat and the sounds are ticked in Update.
+    if(debugMenu.IsOpen() == true)
+    {
+        fppCam->CancelLookEase();
+        return;
+    }
+
+    // A menu, the inventory, or a dead player skips the look block below. Drop the coast so
+    // closing the menu does not finish the turn that was in progress when it opened.
+    if(mWorld->HP <= 0 || sleepTime > 0.0f || menuState != 0 || invEn || craft3xEn || chestEn || furnaceEn)
+        fppCam->CancelLookEase();
+
     if(mWorld->HP > 0 && sleepTime <= 0.0f)
     {
-        mWorld->playerGrowth = 1.65f;
-        if(menuState == 0)//game state
+        sneaking = false;
+        if(menuState == 0 && invEn == false && craft3xEn == false && chestEn == false && furnaceEn == false)
+        {
+            bool wantSneak = keyHold(InputHelper::Instance()->getButtonToAction(InputHelper::ACTION_SNEAK));
+            if(wantSneak)
+                sneaking = true;
+            else if(mWorld->playerGrowth < 1.60f)
+            {
+                Vector3 standHead = playerPosition + Vector3(0.0f, 0.35f, 0.0f);
+                sneaking = mWorld->SolidAtPointForPlayer(standHead);
+            }
+        }
+        else if(mWorld->playerGrowth < 1.60f)
+        {
+            Vector3 standHead = playerPosition + Vector3(0.0f, 0.35f, 0.0f);
+            sneaking = mWorld->SolidAtPointForPlayer(standHead);
+        }
+        mWorld->playerGrowth = sneaking ? 1.50f : 1.65f;
+        if(WorldRunning())//game state
         {
             if(invEn == false && craft3xEn == false && chestEn == false && furnaceEn == false)
             {
                 if(tickShowSlotName > -0.1f)
                 {
                     tickShowSlotName -= dt;
+                }
+
+                // L+R in either order opens inventory and cancels a break.
+                if(sleepTime == 0.0f &&
+                   (keyHold(InputHelper::Instance()->getButtonToAction(13)) || keyPressed(InputHelper::Instance()->getButtonToAction(13))) &&
+                   (keyHold(InputHelper::Instance()->getButtonToAction(14)) || keyPressed(InputHelper::Instance()->getButtonToAction(14))) &&
+                   (keyPressed(InputHelper::Instance()->getButtonToAction(13)) || keyPressed(InputHelper::Instance()->getButtonToAction(14))))
+                {
+                    invEn = true;
+                    dT = 0;
+                    dET = 0;
+                    chestId = -1;
+                    dStd = -1;
+                    startDt = false;
+                    return;
+                }
+
+                if(sleepTime == 0.0f && keyPressed(InputHelper::Instance()->getButtonToAction(InputHelper::ACTION_CHAT)))
+                {
+                    int chatBtn = InputHelper::Instance()->getButtonToAction(InputHelper::ACTION_CHAT);
+                    int placeBtn = InputHelper::Instance()->getButtonToAction(14);
+                    if(!(chatBtn == 0 && (keyHold(placeBtn) || keyPressed(placeBtn))))
+                    {
+                        if(chatTapTimer > 0.0f)
+                        {
+                            // Second tap inside the window: that was a double tap, so the held-back
+                            // chat open is dropped and the view cycles instead.
+                            chatTapTimer = 0.0f;
+                            chatTapPending = false;
+                            thirdPersonView = (thirdPersonView + 1) % 3;
+                        }
+                        else
+                        {
+                            // First tap. Do not open chat yet -- it would take the second tap.
+                            chatTapTimer = CHAT_DOUBLE_TAP_WINDOW;
+                            chatTapPending = true;
+                        }
+                    }
                 }
 
                 //switch right
@@ -3254,7 +3748,7 @@ void StatePlay::HandleEvents(StateManager* sManager)
                     }
                     barPosition != 8 ? barPosition ++ : barPosition = 0;
 
-                    selectSprite->SetPosition(125 + (barPosition * 28.8f),230);
+                    selectSprite->SetPosition(108.0f + (11.0f + barPosition * 20.0f) * (264.0f / 182.0f),230);
 
                     tickShowSlotName = 1.25f;
 
@@ -3274,7 +3768,7 @@ void StatePlay::HandleEvents(StateManager* sManager)
                     }
                     barPosition != 0 ? barPosition -- : barPosition = 8;
 
-                    selectSprite->SetPosition(125 + (barPosition * 28.8f),230);
+                    selectSprite->SetPosition(108.0f + (11.0f + barPosition * 20.0f) * (264.0f / 182.0f),230);
 
                     tickShowSlotName = 1.25f;
 
@@ -3336,97 +3830,106 @@ void StatePlay::HandleEvents(StateManager* sManager)
                     }
                 }
 
-                //camera rotate up
-                if(keyHold(InputHelper::Instance()->getButtonToAction(4)))
+                //camera look — yaw/pitch from angles so turning can't drag pitch
                 {
-                    if (startDt == true)
+                    int bUp = InputHelper::Instance()->getButtonToAction(4);
+                    int bDown = InputHelper::Instance()->getButtonToAction(5);
+                    int bLeft = InputHelper::Instance()->getButtonToAction(6);
+                    int bRight = InputHelper::Instance()->getButtonToAction(7);
+                    bool analogLook = (bUp >= 11 && bUp <= 14) || (bDown >= 11 && bDown <= 14) || (bLeft >= 11 && bLeft <= 14) || (bRight >= 11 && bRight <= 14);
+                    float lookYaw = 0.0f;
+                    float lookPitch = 0.0f;
+                    if(analogLook)
                     {
-                       // startDt = false;
-                        dStd = -1;
+                        float ax = mSystemMgr->GetAnalogX();
+                        float ay = mSystemMgr->GetAnalogY();
+                        float mag = sqrtf(ax * ax + ay * ay);
+                        float dead = 0.18f;
+                        if(mag > dead)
+                        {
+                            float t = (mag - dead) / (1.0f - dead);
+                            if(t > 1.0f)
+                                t = 1.0f;
+                            ax = ax / mag * t;
+                            ay = ay / mag * t;
+                            lookYaw = ax * 2.0f;
+                            lookPitch = ay * 2.0f;
+                        }
                     }
-                    fppCam->PitchView(1.0f*dt);
-                    fppCam->PitchView(1.0f*dt);
-                    shift_y > -0.06f ? shift_y -= 0.24*dt : shift_y = -0.06f;
-                }
-                else
-                {
-                    if (shift_y < 0.0f)
+                    else
                     {
-                        shift_y += 0.24*dt;
+                        if(keyHold(bUp))
+                            lookPitch += 2.0f;
+                        if(keyHold(bDown))
+                            lookPitch -= 2.0f;
+                        if(keyHold(bRight))
+                            lookYaw += 2.0f;
+                        if(keyHold(bLeft))
+                            lookYaw -= 2.0f;
                     }
-                    if(abs(shift_y) <= 0.001f)
+                    // Same dt as movement, with no tighter clamp. The rate eases toward the stick
+                    // inside ApplyLook; the angle still advances by rate * real elapsed time, which is
+                    // what keeps a long frame from turning a fixed number of degrees.
+                    lookDt = dt;
+                    fppCam->ApplyLook(lookYaw, lookPitch, dt);
+                    if(fppCam->lookRatePitch != 0.0f || fppCam->lookRateYaw != 0.0f)
                     {
-                        shift_y = 0.0f;
-                    }
-                }
+                        if(startDt == true)
+                            dStd = -1;
 
-                //camera rotate down
-                if(keyHold(InputHelper::Instance()->getButtonToAction(5)))
-                {
-                    if (startDt == true)
-                    {
-                       // startDt = false;
-                        dStd = -1;
+                        // Diagnostic: the turn rate as the console actually produces it, reported once a
+                        // second. A held button settles near 114 deg/s. The first fraction of a second
+                        // is the ease-in, so a tap averages lower.
+                        static int sTurnFrames = 0;
+                        static float sTurnYawDeg = 0.0f;
+                        static float sTurnWorstDt = 0.0f;
+                        static float sTurnAccum = 0.0f;
+                        if(fppCam->lookRateYaw != 0.0f)
+                            sTurnYawDeg += fabsf(fppCam->lookRateYaw * lookDt) * 180.0f / 3.14159265f;
+                        sTurnFrames++;
+                        if(dt > sTurnWorstDt)
+                            sTurnWorstDt = dt;
+                        sTurnAccum += dt;
+                        if(sTurnAccum >= 1.0f)
+                        {
+                            // MC_DEBUG_LOG, not Logger directly: this is a once-a-second card write, and
+                            // Logger flushes the memory stick on every line. In a release build that
+                            // hitch lands on every second the camera is turning.
+                            if(sTurnYawDeg > 0.0f)
+                                MC_DEBUG_LOG(
+                                    "turn: frames=%d yawDegPerSec=%d worstFrameMs=%d\n",
+                                    sTurnFrames, (int)(sTurnYawDeg / sTurnAccum), (int)(sTurnWorstDt * 1000.0f));
+                            sTurnFrames = 0;
+                            sTurnYawDeg = 0.0f;
+                            sTurnWorstDt = 0.0f;
+                            sTurnAccum = 0.0f;
+                        }
                     }
-                    fppCam->PitchView(-1.0f*dt);
-                    fppCam->PitchView(-1.0f*dt);
-                    shift_y < 0.06f ? shift_y += 0.24*dt : shift_y = 0.06f;
-                }
-                else
-                {
-                    if (shift_y > 0.0f)
+                    if(lookPitch > 0.0f)
+                        shift_y > -0.06f ? shift_y -= 0.24f*dt : shift_y = -0.06f;
+                    else if(lookPitch < 0.0f)
+                        shift_y < 0.06f ? shift_y += 0.24f*dt : shift_y = 0.06f;
+                    else
                     {
-                        shift_y -= 0.24*dt;
+                        if(shift_y < 0.0f)
+                            shift_y += 0.24f*dt;
+                        else if(shift_y > 0.0f)
+                            shift_y -= 0.24f*dt;
+                        if(fabsf(shift_y) <= 0.001f)
+                            shift_y = 0.0f;
                     }
-                    if(abs(shift_y) <= 0.001f)
+                    if(lookYaw < 0.0f)
+                        shift_x > -0.06f ? shift_x -= 0.24f*dt : shift_x = -0.06f;
+                    else if(lookYaw > 0.0f)
+                        shift_x < 0.06f ? shift_x += 0.24f*dt : shift_x = 0.06f;
+                    else
                     {
-                        shift_y = 0.0f;
-                    }
-                }
-
-                //camera rotate right
-                if(keyHold(InputHelper::Instance()->getButtonToAction(7)))
-                {
-                    if (startDt == true)
-                    {
-                       // startDt = false;
-                        dStd = -1;
-                    }
-                    fppCam->RotateView(-2.0f*dt,0,1,0);
-                    shift_x > -0.06f ? shift_x -= 0.24*dt : shift_x = -0.06f;
-                }
-                else
-                {
-                    if (shift_x < 0.0f)
-                    {
-                        shift_x += 0.24*dt;
-                    }
-                    if(abs(shift_x) <= 0.001f)
-                    {
-                        shift_x = 0.0f;
-                    }
-                }
-
-                //camera rotate left
-                if(keyHold(InputHelper::Instance()->getButtonToAction(6)))
-                {
-                    if (startDt == true)
-                    {
-                        //startDt = false;
-                        dStd = -1;
-                    }
-                    fppCam->RotateView(2.0f*dt,0,1,0);
-                    shift_x < 0.06f ? shift_x += 0.24*dt : shift_x = 0.06f;
-                }
-                else
-                {
-                    if (shift_x > 0.0f)
-                    {
-                        shift_x -= 0.24*dt;
-                    }
-                    if(abs(shift_x) <= 0.001f)
-                    {
-                        shift_x = 0.0f;
+                        if(shift_x < 0.0f)
+                            shift_x += 0.24f*dt;
+                        else if(shift_x > 0.0f)
+                            shift_x -= 0.24f*dt;
+                        if(fabsf(shift_x) <= 0.001f)
+                            shift_x = 0.0f;
                     }
                 }
 
@@ -3434,6 +3937,69 @@ void StatePlay::HandleEvents(StateManager* sManager)
                 moving = false;
                 moveForward = false;
                 bool diagonleMoving = false;
+                if(sneaking)
+                    cameraMoveSpeed *= 0.3f;
+
+                // Sprint, on a double tap of Forward -- Java's EntityPlayerSP rule, and the same tap
+                // pattern the creative sprint-fly uses (see StatePlayCreative). The taps have to be
+                // told apart inside a 7-tick window with no button to spare, and they can only be
+                // told apart after the fact, so the first tap arms the window and the second inside
+                // it starts the sprint. Releasing Forward ends it, which is also Java's rule, and
+                // that is why the release cancels unconditionally rather than remembering a state.
+                //
+                // Java's other cancellation conditions are honoured where this port can see them:
+                // sneaking, and a food level of 6 or less. It also cancels on hitting a wall
+                // (isCollidedHorizontally); this port has no such flag, and the practical effect
+                // there is that you keep the sprint animation while pressed against a block, which
+                // costs nothing because you are not moving and so are not paying exhaustion for it.
+                if(sleepTime == 0.0f)
+                {
+                    bool sprintFwdHeld = keyHold(InputHelper::Instance()->getButtonToAction(0));
+                    if(sprintTapTimer > 0.0f)
+                        sprintTapTimer -= dt;
+
+                    if(sprintFwdHeld && !sprintFwdWasHeld)
+                    {
+                        if(sprintTapArm && sprintTapTimer > SPRINT_TAP_MIN_GAP)
+                        {
+                            sprinting = true;
+                            sprintTapArm = false;
+                            sprintTapTimer = 0.0f;
+                        }
+                        else
+                        {
+                            sprintTapPending = true;
+                            sprintTapArm = false;
+                            sprintTapTimer = SPRINT_TAP_WINDOW;
+                        }
+                    }
+                    if(!sprintFwdHeld && sprintFwdWasHeld)
+                    {
+                        if(sprintTapPending && sprintTapTimer > SPRINT_TAP_MIN_GAP)
+                            sprintTapArm = true;
+                        sprintTapPending = false;
+                        sprinting = false;
+                    }
+                    sprintFwdWasHeld = sprintFwdHeld;
+                    if(!sprintFwdHeld && sprintTapTimer <= 0.0f)
+                        sprintTapArm = false;
+
+                    // Java will not start or keep a sprint on an empty bar. Checked after the taps so
+                    // a sprint that runs the bar dry stops at that moment rather than at the next tap.
+                    if(sneaking || mWorld->HG <= 6.0f)
+                        sprinting = false;
+
+                    if(sprinting)
+                        cameraMoveSpeed *= SPRINT_SPEED_MULT;
+                }
+                else
+                {
+                    sprinting = false;
+                    sprintTapTimer = 0.0f;
+                    sprintTapArm = false;
+                    sprintTapPending = false;
+                    sprintFwdWasHeld = false;
+                }
 
                 if(sleepTime == 0.0f)
                 {
@@ -3491,7 +4057,7 @@ void StatePlay::HandleEvents(StateManager* sManager)
                             fppCam->StrafePhysic(cameraMoveSpeed*slowdown);
 
                             if(canFly)
-                                fppCam->MovePhysic(cameraMoveSpeed*slowdown);
+                                fppCam->MovePhysicNoY(cameraMoveSpeed*slowdown);
                             else
                                 fppCam->MovePhysicNoY(cameraMoveSpeed*slowdown);
                         }
@@ -3503,7 +4069,7 @@ void StatePlay::HandleEvents(StateManager* sManager)
                             fppCam->StrafePhysic(-cameraMoveSpeed*slowdown);
 
                             if(canFly)
-                                fppCam->MovePhysic(cameraMoveSpeed*slowdown);
+                                fppCam->MovePhysicNoY(cameraMoveSpeed*slowdown);
                             else
                                 fppCam->MovePhysicNoY(cameraMoveSpeed*slowdown);
                         }
@@ -3511,15 +4077,15 @@ void StatePlay::HandleEvents(StateManager* sManager)
                         if(!diagonleMoving)
                         {
                             if(canFly)
-                                fppCam->MovePhysic(cameraMoveSpeed*slowdown2);
+                                fppCam->MovePhysicNoY(cameraMoveSpeed*slowdown2);
                             else
                                 fppCam->MovePhysicNoY(cameraMoveSpeed*slowdown2);
                         }
 
-                        if(mWorld->HG > 0)
-                        {
-                            mWorld->HG -= dt/75.0f;
-                        }
+                        // The walking cost is no longer subtracted here. Hunger now runs on Java's
+                        // exhaustion accumulator, fed once per frame from the distance actually
+                        // moved in Update (see EXHAUST_WALK / EXHAUST_SPRINT), which is the only
+                        // place that knows whether the player was sprinting, wading or on the ground.
                     }
 
                     //move back
@@ -3551,7 +4117,7 @@ void StatePlay::HandleEvents(StateManager* sManager)
                             fppCam->StrafePhysic(cameraMoveSpeed*slowdown);
 
                             if(canFly)
-                                fppCam->MovePhysic(-cameraMoveSpeed*slowdown);
+                                fppCam->MovePhysicNoY(-cameraMoveSpeed*slowdown);
                             else
                                 fppCam->MovePhysicNoY(-cameraMoveSpeed*slowdown);
                         }
@@ -3563,7 +4129,7 @@ void StatePlay::HandleEvents(StateManager* sManager)
                             fppCam->StrafePhysic(-cameraMoveSpeed*slowdown);
 
                             if(canFly)
-                                fppCam->MovePhysic(-cameraMoveSpeed*slowdown);
+                                fppCam->MovePhysicNoY(-cameraMoveSpeed*slowdown);
                             else
                                 fppCam->MovePhysicNoY(-cameraMoveSpeed*slowdown);
                         }
@@ -3571,14 +4137,9 @@ void StatePlay::HandleEvents(StateManager* sManager)
                         if(!diagonleMoving)
                         {
                             if(canFly)
-                                fppCam->MovePhysic(-cameraMoveSpeed*slowdown2);
+                                fppCam->MovePhysicNoY(-cameraMoveSpeed*slowdown2);
                             else
                                 fppCam->MovePhysicNoY(-cameraMoveSpeed*slowdown2);
-                        }
-
-                        if(mWorld->HG > 0)
-                        {
-                            mWorld->HG -= dt/75.0f;
                         }
                     }
 
@@ -3602,11 +4163,6 @@ void StatePlay::HandleEvents(StateManager* sManager)
                             fppCam->StrafePhysic(cameraMoveSpeed*slowdown);
                             moving = true;
                         }
-
-                        if(mWorld->HG > 0)
-                        {
-                            mWorld->HG -= dt/75.0f;
-                        }
                     }
 
                     //move left
@@ -3629,14 +4185,10 @@ void StatePlay::HandleEvents(StateManager* sManager)
                             fppCam->StrafePhysic(-cameraMoveSpeed*slowdown);
                             moving = true;
                         }
-
-                        if(mWorld->HG > 0)
-                        {
-                            mWorld->HG -= dt/75.0f;
-                        }
                     }
 
-                    // jumping/swiming
+                    // jumping/swiming (survival — no fly toggle)
+                    canFly = false;
                     if(keyHold(InputHelper::Instance()->getButtonToAction(12)))
                     {
                         dStd = -1;
@@ -3676,9 +4228,19 @@ void StatePlay::HandleEvents(StateManager* sManager)
             //add cube
             if(keyPressed(InputHelper::Instance()->getButtonToAction(14)))
             {
-				if(keyHold(InputHelper::Instance()->getButtonToAction(14)))
-				{
-					if(sleepTime == 0.0f)
+                // The debug stick, before anything else in this block. It is a held item with no
+                // other use, so letting a block's own action see it first would mean a block could
+                // swallow the click; handled here, holding the stick can never place, break or open
+                // anything by accident.
+                if(mWorld->invId[27+barPosition] == DebugStick::getID())
+                {
+                    CheckDebugStickUse();
+                    return;
+                }
+
+                if(keyHold(InputHelper::Instance()->getButtonToAction(14)))
+                {
+                    if(sleepTime == 0.0f)
 					{
 						if(keyPressed(InputHelper::Instance()->getButtonToAction(13))) //open inventory
 						{
@@ -3699,6 +4261,32 @@ void StatePlay::HandleEvents(StateManager* sManager)
                     startDt = false; //stop destroying
                 }
 
+
+                if (mWorld->invId[27+barPosition] == Bow::getID()) ///BOW: start the draw
+                {
+                    // Nothing happens on the press itself. Vanilla starts drawing here and fires when
+                    // the button comes back up, which is what Update watches for; see bowCharging.
+                    // Survival spends an arrow out of the pack, so with none this is a dry draw and
+                    // the press does nothing. Creative *in this state* needs no arrow either: a world
+                    // switched to creative in-game keeps running StatePlay, and `gameModeWorld` is
+                    // what says so -- the separate StatePlayCreative never had a gate to begin with.
+                    //
+                    // Only a *new* draw is started. `SystemManager::KeyPressed` is not a true press
+                    // edge: it answers yes whenever the whole button mask changed and the key asked
+                    // about happens to be down, so it reports the place button again on any frame in
+                    // which some other button moved -- and the default rotation keys are face buttons,
+                    // so turning while holding the trigger fired this block repeatedly. Restarting a
+                    // draw that is already running reset bowCharge to 0, which is what made the bow's
+                    // draw snap back to its first frame while the camera was turning and fill up again
+                    // the moment it stopped. A draw already in progress is left alone.
+                    if(bowCharging == false &&
+                       (mWorld->gameModeWorld == 1 || mWorld->HasItemInInventory(Arrow::getID()) == true))
+                    {
+                        bowCharging = true;
+                        bowCharge = 0.0f;
+                    }
+                    return;
+                }
 
                 if (mWorld->invId[27+barPosition] == 299) ///SNOWBALL THROWING
                 {
@@ -3721,6 +4309,69 @@ void StatePlay::HandleEvents(StateManager* sManager)
                     return;
                 }
 
+                if(mWorld->invId[27+barPosition] == FlintAndSteel::getID()) // light a mob (8 s, like a fire block)
+                {
+                    Vector3 igniteDir = fppCam->m_vView - fppCam->m_vPosition;
+                    igniteDir.normalize();
+                    float mobT = 6.0f, mobPower = 0.0f;
+                    LameMob* igniteMob = FindMobAlongRay(mWorld, fppCam->m_vPosition, igniteDir, 5.0f, &mobT, &mobPower);
+                    if(igniteMob != NULL)
+                    {
+                        bool blocked = false;
+                        for(float i = 0; i < mobT; i += 0.15f)
+                        {
+                            Vector3 p = fppCam->m_vPosition + (igniteDir * i);
+                            BoundingBox colliderP = mWorld->GetBlockCollideBox(p.x,p.y,p.z, mWorld->GetBlock(p.x,p.y,p.z));
+                            BoundingBox testBoxP = BoundingBox(floorf(p.x)+0.5f+colliderP.min.x, floorf(p.y)+0.5f+colliderP.min.y, floorf(p.z)+0.5f+colliderP.min.z, floorf(p.x)+0.5f+colliderP.max.x, floorf(p.y)+0.5f+colliderP.max.y, floorf(p.z)+0.5f+colliderP.max.z);
+                            if(mWorld->BlockEditable(p.x,p.y,p.z) && testBoxP.contains(p))
+                            {
+                                blocked = true;
+                                break;
+                            }
+                        }
+                        if(blocked == false)
+                        {
+                            igniteMob->SetOnFire(8.0f);
+                            mSoundMgr->PlayFlintSound();
+                            changeY = -0.20f;
+                            anim[0] = 1;
+
+                            mWorld->invAm[27+barPosition] -= 1;
+                            if(mWorld->invAm[27+barPosition] <= 0)
+                            {
+                                mWorld->invAm[27+barPosition] = -1;
+                                mWorld->invSt[27+barPosition] = 0;
+                                mWorld->invId[27+barPosition] = -1;
+                            }
+                            return;
+                        }
+                    }
+                }
+
+                if(mWorld->invId[27+barPosition] == Wheat::getID() || mWorld->invId[27+barPosition] == Carrot::getID() || mWorld->invId[27+barPosition] == WheatSeeds::getID()) // feed: love mode / grow a baby
+                {
+                    Vector3 feedDir = fppCam->m_vView - fppCam->m_vPosition;
+                    feedDir.normalize();
+                    LameMob* feedMob = FindMobForUse(mWorld, fppCam->m_vPosition, feedDir, 5.0f);
+                    // LameMob::Feed is the authority on what feeds what -- it rejects any item that is
+                    // not the mob's own breedItemId -- so this list just has to cover every mob food in
+                    // the game. WheatSeeds was missing, which is why chickens happily followed seeds but
+                    // could never be fed: the ray never ran for them.
+                    if(feedMob != NULL && feedMob->Feed(mWorld->invId[27+barPosition]))
+                    {
+                        changeY = -0.20f;
+                        anim[0] = 1;
+                        mWorld->invAm[27+barPosition] -= 1;
+                        if(mWorld->invAm[27+barPosition] <= 0)
+                        {
+                            mWorld->invAm[27+barPosition] = -1;
+                            mWorld->invSt[27+barPosition] = 0;
+                            mWorld->invId[27+barPosition] = -1;
+                        }
+                        return;
+                    }
+                }
+
                 //add cube
                 Vector3 rayDir = fppCam->m_vView - fppCam->m_vPosition;
                 rayDir.normalize();
@@ -3728,7 +4379,7 @@ void StatePlay::HandleEvents(StateManager* sManager)
                 //get position and view vector
                 Vector3 testPos;
 
-                BoundingBox collider = mWorld->blockTypes[mWorld->GetBlock(testPos.x,testPos.y,testPos.z)].collideBox;
+                BoundingBox collider = mWorld->GetBlockCollideBox(testPos.x,testPos.y,testPos.z, mWorld->GetBlock(testPos.x,testPos.y,testPos.z));
                 BoundingBox testBox = BoundingBox(testPos.x+collider.min.x, testPos.y+collider.min.y, testPos.z+collider.min.z, testPos.x+collider.max.x, testPos.y+collider.max.y, testPos.z+collider.max.z);
 
 
@@ -3736,7 +4387,7 @@ void StatePlay::HandleEvents(StateManager* sManager)
                 {
                     if(mWorld->mSheeps.empty() == false)
                     {
-                        for(float i = 0; i < 5.25f; i+=0.1f)
+                        for(float i = 0; i < 5.25f; i+=0.075f)
                         {
                             testPos = fppCam->m_vPosition + (rayDir * i);
                             for(int f = 0; f < mWorld->mSheeps.size(); f++)
@@ -3832,7 +4483,7 @@ void StatePlay::HandleEvents(StateManager* sManager)
 
                                         if(mWorld->invId[27+barPosition] == Scissors::getID())
                                         {
-                                            if(TestSheep->sheared == false)
+                                            if(TestSheep->sheared == false && TestSheep->IsBaby() == false)
                                             {
                                                 int woolNum = 1+rand()%3;
                                                 for(int i = 0; i < woolNum; i++)
@@ -3864,11 +4515,21 @@ void StatePlay::HandleEvents(StateManager* sManager)
                     return;
                 }
 
-                for(float i = 0; i < 5.25f; i+=0.1f)
+                // The look, and the two things that make the aim exact. The loop steps from cell wall to
+                // cell wall instead of marching a fixed step, so every cell the ray crosses is visited:
+                // a fixed step can pass a whole cell it crosses in less than its stride, and the cell it
+                // costs is exactly the thin one -- redstone wire's 1 px selection plate (see
+                // GetBlockSelectionBox and CraftWorld::NextCellDistance). The box test is then a clip,
+                // `hasIntersected(box, distance)` -- the same call the placement face normal below uses --
+                // rather than "did this point land inside the box", which on a plate the look only grazes
+                // is the other half of the same coin toss.
+                Ray pickRay(fppCam->m_vPosition, rayDir);
+
+                for(float i = 0.0f; i < 5.25f; i = CraftWorld::NextCellDistance(fppCam->m_vPosition, rayDir, i))
                 {
                     testPos = fppCam->m_vPosition + (rayDir * i);
 
-                    collider = mWorld->blockTypes[mWorld->GetBlock(testPos.x,testPos.y,testPos.z)].collideBox;
+                    collider = mWorld->GetBlockSelectionBox(testPos.x,testPos.y,testPos.z, mWorld->GetBlock(testPos.x,testPos.y,testPos.z));
                     testBox = BoundingBox(floorf(testPos.x)+0.5f+collider.min.x, floorf(testPos.y)+0.5f+collider.min.y, floorf(testPos.z)+0.5f+collider.min.z, floorf(testPos.x)+0.5f+collider.max.x, floorf(testPos.y)+0.5f+collider.max.y, floorf(testPos.z)+0.5f+collider.max.z);
 
                     int selectedBlock = mWorld->GetBlock(testPos.x, testPos.y, testPos.z);
@@ -3884,11 +4545,11 @@ void StatePlay::HandleEvents(StateManager* sManager)
                             BoundingBox playerBox;
                             if(walkingOnGround == false)
                             {
-                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - 1.63f,playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
+                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - (mWorld->playerGrowth - 0.02f),playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
                             }
                             else
                             {
-                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - 1.59f,playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
+                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - (mWorld->playerGrowth - 0.06f),playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
                             }
                             if(!blockBox.intersect(playerBox))
                             {
@@ -3920,11 +4581,11 @@ void StatePlay::HandleEvents(StateManager* sManager)
                             BoundingBox playerBox;
                             if(walkingOnGround == false)
                             {
-                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - 1.63f,playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
+                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - (mWorld->playerGrowth - 0.02f),playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
                             }
                             else
                             {
-                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - 1.59f,playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
+                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - (mWorld->playerGrowth - 0.06f),playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
                             }
                             if(!blockBox.intersect(playerBox))
                             {
@@ -4003,7 +4664,10 @@ void StatePlay::HandleEvents(StateManager* sManager)
                     }
 
                     //check if we are touch something
-                    if(mWorld->BlockEditable(testPos.x,testPos.y,testPos.z) && testBox.contains(testPos))
+                    float pickDist = -1.0f;
+                    pickRay.hasIntersected(testBox, pickDist);
+
+                    if(mWorld->BlockEditable(testPos.x,testPos.y,testPos.z) && pickDist != -1.0f)
                     {
                         // we use hoes
                         if(mWorld->invId[27+barPosition] >= 270 && mWorld->invId[27+barPosition] <= 274)
@@ -4091,9 +4755,8 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                         green = 1.0 - ((TestNoteBlock->GetNote()-12)/12.0f);
                                         red = ((TestNoteBlock->GetNote()-12)/12.0f);
                                     }
-                                    Particle* Note = new Particle(mWorld,"note",Vector3((int)testPos.x+0.5f,(int)testPos.y+1.1f,(int)testPos.z+0.5f));
+                                    Particle* Note = Particle::Spawn(mWorld,"note",Vector3((int)testPos.x+0.5f,(int)testPos.y+1.1f,(int)testPos.z+0.5f));
                                     Note->SetColor(Vector3(red,green,blue));
-                                    mParticles.push_back(Note);
                                 }
 
                                 animGo = true;
@@ -4151,7 +4814,7 @@ void StatePlay::HandleEvents(StateManager* sManager)
 
                                 if(TestItemFrame->GetItem() != -1)  // remove item in item frame
                                 {
-                                    if(TestItemFrame->GetItem() < 250)
+                                    if(IsBlockId(TestItemFrame->GetItem()))
                                     {
                                         mWorld->DropThis(TestItemFrame->GetItem(), 1, true, Vector3((int)testPos.x+0.5f,(int)testPos.y+0.5f,(int)testPos.z+0.5f));
                                     }
@@ -4163,7 +4826,7 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                         }
                                         else
                                         {
-                                            if(TestItemFrame->GetItem() >= 250)
+                                            if(IsItemId(TestItemFrame->GetItem()))
                                             {
                                                 mWorld->DropThis(TestItemFrame->GetItem(), 1, mWorld->StackableItem(TestItemFrame->GetItem()), Vector3((int)testPos.x+0.5f,(int)testPos.y+0.5f,(int)testPos.z+0.5f));
                                             }
@@ -4375,11 +5038,11 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                 BoundingBox playerBox;
                                 if(walkingOnGround == false)
                                 {
-                                    playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - 1.63f,playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
+                                    playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - (mWorld->playerGrowth - 0.02f),playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
                                 }
                                 else
                                 {
-                                    playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - 1.59f,playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
+                                    playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - (mWorld->playerGrowth - 0.06f),playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
                                 }
 
                                 if(!blockBox.intersect(playerBox))
@@ -4429,11 +5092,11 @@ void StatePlay::HandleEvents(StateManager* sManager)
                             BoundingBox playerBox;
                             if(walkingOnGround == false)
                             {
-                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - 1.63f,playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
+                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - (mWorld->playerGrowth - 0.02f),playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
                             }
                             else
                             {
-                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - 1.59f,playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
+                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - (mWorld->playerGrowth - 0.06f),playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
                             }
                             if(!doorBox.intersect(playerBox))
                             {
@@ -4457,11 +5120,11 @@ void StatePlay::HandleEvents(StateManager* sManager)
                             BoundingBox playerBox;
                             if(walkingOnGround == false)
                             {
-                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - 1.63f,playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
+                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - (mWorld->playerGrowth - 0.02f),playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
                             }
                             else
                             {
-                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - 1.59f,playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
+                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - (mWorld->playerGrowth - 0.06f),playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
                             }
 
                             if(!doorBox.intersect(playerBox))
@@ -4486,11 +5149,11 @@ void StatePlay::HandleEvents(StateManager* sManager)
                             BoundingBox playerBox;
                             if(walkingOnGround == false)
                             {
-                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - 1.63f,playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
+                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - (mWorld->playerGrowth - 0.02f),playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
                             }
                             else
                             {
-                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - 1.59f,playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
+                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - (mWorld->playerGrowth - 0.06f),playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
                             }
                             if(!doorBox.intersect(playerBox))
                             {
@@ -4515,11 +5178,11 @@ void StatePlay::HandleEvents(StateManager* sManager)
                             BoundingBox playerBox;
                             if(walkingOnGround == false)
                             {
-                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - 1.63f,playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
+                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - (mWorld->playerGrowth - 0.02f),playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
                             }
                             else
                             {
-                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - 1.59f,playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
+                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - (mWorld->playerGrowth - 0.06f),playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
                             }
                             if(!doorBox.intersect(playerBox))
                             {
@@ -4544,11 +5207,11 @@ void StatePlay::HandleEvents(StateManager* sManager)
                             BoundingBox playerBox;
                             if(walkingOnGround == false)
                             {
-                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - 1.63f,playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
+                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - (mWorld->playerGrowth - 0.02f),playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
                             }
                             else
                             {
-                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - 1.59f,playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
+                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - (mWorld->playerGrowth - 0.06f),playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
                             }
                             if(!doorBox.intersect(playerBox))
                             {
@@ -4576,11 +5239,11 @@ void StatePlay::HandleEvents(StateManager* sManager)
                             BoundingBox playerBox;
                             if(walkingOnGround == false)
                             {
-                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - 1.63f,playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
+                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - (mWorld->playerGrowth - 0.02f),playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
                             }
                             else
                             {
-                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - 1.59f,playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
+                                playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - (mWorld->playerGrowth - 0.06f),playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
                             }
                             if(!doorBox.intersect(playerBox))
                             {
@@ -4598,12 +5261,32 @@ void StatePlay::HandleEvents(StateManager* sManager)
                             }
                         }
 
+                        if (mWorld->IsButtonBlock((block_t)selectedBlock)) // pressing a button
+                        {
+                            mWorld->PressButton((int)testPos.x,(int)testPos.y,(int)testPos.z);
+                            fppCam->needUpdate = true;
+                            return;
+                        }
+
+                        if (mWorld->IsLever((block_t)selectedBlock)) // flipping a lever
+                        {
+                            // No press timer and no mPressedButtons entry: a lever latches, so the whole
+                            // interaction is the state flip and the click it plays.
+                            mWorld->UseLever((int)testPos.x,(int)testPos.y,(int)testPos.z);
+                            fppCam->needUpdate = true;
+                            return;
+                        }
+
+                        if (mWorld->IsRepeaterBlock((block_t)selectedBlock)) // retiming a repeater
+                        {
+                            mWorld->UseRepeater((int)testPos.x,(int)testPos.y,(int)testPos.z);
+                            fppCam->needUpdate = true;
+                            return;
+                        }
+
                         if (selectedBlock == TNTBlock::getID() && mWorld->invId[27+barPosition] == FlintAndSteel::getID())//TNT explosion
                         {
-                            mWorld->SpawnTNTentity(((int)testPos.x)+0.5f,((int)testPos.y)+0.5f,((int)testPos.z)+0.5f);
-                            mWorld->GetBlock(testPos.x,testPos.y,testPos.z) = 0;
-                            mSoundMgr->PlayFuseSound();
-                            mWorld->RebuildOpaqueMeshChunk(mWorld->getChunkId(testPos));
+                            mWorld->PrimeTNTBlock((int)testPos.x,(int)testPos.y,(int)testPos.z);
                             fppCam->needUpdate = true;
 
                             mWorld->invAm[27+barPosition] -= 1;
@@ -4695,6 +5378,7 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                 fppCam->RotateView(0,0,0,0);
                                 fppCam->upDownAngle = 0;
                                 fppCam->horAngle = 180;
+                                fppCam->RebuildView();
                                 return;
                             }
                             if(selectedBlock == BedBlock2::getID() || selectedBlock == BedBlock6::getID())
@@ -4719,6 +5403,7 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                 fppCam->RotateView(0,0,180,0);
                                 fppCam->upDownAngle = 0;
                                 fppCam->horAngle = 0;
+                                fppCam->RebuildView();
                                 return;
                             }
                             if(selectedBlock == BedBlock3::getID() || selectedBlock == BedBlock7::getID())
@@ -4743,6 +5428,7 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                 fppCam->RotateView(0,0,90,0);
                                 fppCam->upDownAngle = 0;
                                 fppCam->horAngle = 270;
+                fppCam->RebuildView();
                                 return;
                             }
                             if(selectedBlock == BedBlock4::getID() || selectedBlock == BedBlock8::getID())
@@ -4767,6 +5453,7 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                 fppCam->RotateView(0,0,270,0);
                                 fppCam->upDownAngle = 0;
                                 fppCam->horAngle = 90;
+                                fppCam->RebuildView();
                                 return;
                             }
                         }
@@ -4844,6 +5531,18 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                 mWorld->HG += 8;
                             }
 
+                            if (mWorld->invId[27+barPosition] == RawChicken::getID()) ///RAW CHICKEN
+                            {
+                                foodEaten = true;
+                                mWorld->HG += 1;
+                            }
+
+                            if (mWorld->invId[27+barPosition] == CookedChicken::getID()) ///COOKED CHICKEN
+                            {
+                                foodEaten = true;
+                                mWorld->HG += 8;
+                            }
+
 							if (mWorld->invId[27+barPosition] == RawMutton::getID()) ///RAW Mutton
                             {
                                 foodEaten = true;
@@ -4888,13 +5587,12 @@ void StatePlay::HandleEvents(StateManager* sManager)
 
                                 Vector3 particlePos = fppCam->m_vPosition + (rayParticleDir * 0.38f);
 
-                                if(mParticles.size() <= 52)
+                                if(Particle::ActiveCount() <= 52)
                                 {
                                     for(int k = 0; k <= 5; k++) // 5 particles
                                     {
-                                        Particle* FoodPart = new Particle(mWorld,"item crack",Vector3(particlePos.x,particlePos.y-0.18f,particlePos.z));
+                                        Particle* FoodPart = Particle::Spawn(mWorld,"item crack",Vector3(particlePos.x,particlePos.y-0.18f,particlePos.z));
                                         FoodPart->var1 = mWorld->invId[27+barPosition]-250;
-                                        mParticles.push_back(FoodPart);
                                     }
                                 }
 
@@ -4933,38 +5631,53 @@ void StatePlay::HandleEvents(StateManager* sManager)
                         if(distance != -1.0f)
                         {
                             Vector3 hitPos = fppCam->m_vPosition + (rayDir * distance);
+                            // Which face of the block the look entered. The cell a placement targets is
+                            // the block the pick landed on, stepped one cell out along that face -- and
+                            // that means exactly *one* axis, so the dominant axis of the hit normal is
+                            // what decides it. The per-axis test this replaces asked each axis on its own
+                            // against a 0.66 threshold, and a hit near a block edge splits the normal
+                            // across two axes -- (0.68, 0.68, 0.27) at a corner -- so it pushed two of
+                            // them at once and produced a *diagonal* target cell. A torch reads its
+                            // mounting straight off this offset, so that diagonal cell is precisely what
+                            // put the torch on the block diagonally beside the one being aimed at.
                             Vector3 normal = (hitPos - cubePos);
-                            normal.normalize();
 
                             Vector3 testPos2;
 
-                            if(normal.x < -0.66f)
-                                testPos2.x = -1.0f;
-                            else if(normal.x > 0.66f)
-                                testPos2.x = 1.0f;
+                            if(fabsf(normal.x) >= fabsf(normal.y) && fabsf(normal.x) >= fabsf(normal.z))
+                                testPos2.x = (normal.x > 0.0f) ? 1.0f : -1.0f;
                             else
                                 testPos2.x = 0.0f;
 
-                            if(normal.y < -0.66f)
-                                testPos2.y = -1.0f;
-                            else if(normal.y > 0.66f)
-                                testPos2.y = 1.0f;
+                            if(fabsf(normal.y) > fabsf(normal.x) && fabsf(normal.y) >= fabsf(normal.z))
+                                testPos2.y = (normal.y > 0.0f) ? 1.0f : -1.0f;
                             else
                                 testPos2.y = 0.0f;
 
-                            if(normal.z < -0.66f)
-                                testPos2.z = -1.0f;
-                            else if(normal.z > 0.66f)
-                                testPos2.z = 1.0f;
+                            if(fabsf(normal.z) > fabsf(normal.x) && fabsf(normal.z) > fabsf(normal.y))
+                                testPos2.z = (normal.z > 0.0f) ? 1.0f : -1.0f;
                             else
                                 testPos2.z = 0.0f;
 
                             testPos2 += testPos;
 
+                            // Aiming at a wire means "put this on the wire". The wire's own cell can
+                            // never be the target -- the wire is in it -- and the face-derived cell is
+                            // not what a player means either: a floor plate has no meaningful side face,
+                            // so a level look at a wire put the block *beside* it. Wire only ever lies
+                            // flat (there is no wall-mounted dust), so a block aimed at one belongs in
+                            // the cell directly above it, whatever face the ray reports.
+                            if(mWorld->GetBlock(testPos.x,testPos.y,testPos.z) == Redstoneoff::getID())
+                            {
+                                testPos2.x = (float)((int)testPos.x);
+                                testPos2.y = (float)((int)testPos.y + 1);
+                                testPos2.z = (float)((int)testPos.z);
+                            }
+
                             //check if this block is empty
-                            if(mWorld->GetBlock(testPos2.x,testPos2.y,testPos2.z) == Lava::getID() ||
-                               mWorld->GetBlock(testPos2.x,testPos2.y,testPos2.z) == 4 ||
-                               mWorld->GetBlock(testPos2.x,testPos2.y,testPos2.z) == 0 ||
+                            if(mWorld->GetBlock(testPos2.x,testPos2.y,testPos2.z) == 0 ||
+                               mWorld->BlockIsWater(mWorld->GetBlock(testPos2.x,testPos2.y,testPos2.z)) ||
+                               mWorld->BlockIsLava(mWorld->GetBlock(testPos2.x,testPos2.y,testPos2.z)) ||
                                mWorld->GetBlock(testPos2.x,testPos2.y,testPos2.z) == 93)
                             {
                                 //now check if player is not there ;) we don't want to place cubes where we stand
@@ -4976,11 +5689,11 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                 BoundingBox playerBox;
                                 if(walkingOnGround == false)
                                 {
-                                    playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - 1.63f,playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
+                                    playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - (mWorld->playerGrowth - 0.02f),playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
                                 }
                                 else
                                 {
-                                    playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - 1.59f,playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
+                                    playerBox = BoundingBox(Vector3(playerPosition.x - (mWorld->playerCollisionSize-0.03f),playerPosition.y - (mWorld->playerGrowth - 0.06f),playerPosition.z - (mWorld->playerCollisionSize-0.03)),Vector3(playerPosition.x + (mWorld->playerCollisionSize-0.03),playerPosition.y + 0.2f,playerPosition.z + (mWorld->playerCollisionSize-0.03)));
                                 }
 
                                 if(!blockBox.intersect(playerBox) ||
@@ -4990,7 +5703,9 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                    mWorld->invId[27+barPosition] == MelonSeeds::getID()   ||
                                    mWorld->invId[27+barPosition] == PumpkinSeeds::getID() ||
                                    mWorld->invId[27+barPosition] == Carrot::getID()       ||
-                                   mWorld->invId[27+barPosition] == Potato::getID())
+                                   mWorld->invId[27+barPosition] == Potato::getID()        ||
+                                   mWorld->invId[27+barPosition] == Redstone::getID()      ||
+                                   mWorld->IsSpawnEgg(mWorld->invId[27+barPosition]))
                                 {
                                     //check if you want put light source or normal block
                                     if(mWorld->CanPutBlockHere(testPos2.x,testPos2.y,testPos2.z,mWorld->invId[27+barPosition]))
@@ -5011,7 +5726,7 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                             mWorld->GetBlock(testPos2.x,testPos2.y,testPos2.z) = 0;
                                         }
 
-                                        if (mWorld->invId[27+barPosition]<250) // if block in our hands
+                                        if (IsBlockId(mWorld->invId[27+barPosition])) // if block in our hands
                                         {
                                             if (mWorld->invId[27+barPosition] >= BlackWoolCarpet::getID() && mWorld->invId[27+barPosition] <= WhiteWoolCarpet::getID()) // if carpet in our hands
                                             {
@@ -5316,6 +6031,119 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                                     break;
 
 
+                                                    case kExtendedBlockBase + 3: // Stone button
+                                                    case kExtendedBlockBase + 4: // Wooden button
+                                                    case kExtendedBlockBase + 17: // Lever
+                                                    {
+                                                        // Buttons mount onto the clicked face; the
+                                                        // pressed flag is added later, as block state.
+                                                        // A lever mounts the same way and stores its
+                                                        // facing in the same nibble, so placement is
+                                                        // identical -- the only difference is what the
+                                                        // fourth bit means once it is there.
+                                                        float odx = testPos2.x - testPos.x;
+                                                        float ody = testPos2.y - testPos.y;
+                                                        float odz = testPos2.z - testPos.z;
+                                                        int buttonFacing = -1;
+                                                        if(ody > 0.5f) buttonFacing = 0;
+                                                        else if(ody < -0.5f) buttonFacing = 1;
+                                                        else if(odx > 0.5f) buttonFacing = 2;
+                                                        else if(odx < -0.5f) buttonFacing = 3;
+                                                        else if(odz > 0.5f) buttonFacing = 4;
+                                                        else if(odz < -0.5f) buttonFacing = 5;
+
+                                                        if(buttonFacing >= 0 && mWorld->BlockSolid(testPos.x,testPos.y,testPos.z))
+                                                        {
+                                                            mWorld->GetBlock(testPos2.x,testPos2.y,testPos2.z) = mWorld->invId[27+barPosition];
+                                                            mWorld->SetButtonState((int)testPos2.x,(int)testPos2.y,(int)testPos2.z, buttonFacing);
+                                                        }
+                                                        else
+                                                        {
+                                                            placed = false;
+                                                        }
+                                                        break;
+                                                    }
+
+                                                    case kExtendedBlockBase + 5: // Redstone repeater
+                                                    {
+                                                        // Java BlockRedstoneRepeater: it only ever sits on the
+                                                        // floor, and its output points away from the player who
+                                                        // placed it, so it drives the block straight ahead.
+                                                        float ody = testPos2.y - testPos.y;
+                                                        if(ody > 0.5f && mWorld->BlockSolid(testPos.x,testPos.y,testPos.z))
+                                                        {
+                                                            Vector3 look = fppCam->m_vView - fppCam->m_vPosition;
+                                                            float lookX = look.x < 0.0f ? -look.x : look.x;
+                                                            float lookZ = look.z < 0.0f ? -look.z : look.z;
+                                                            int repeaterFacing;
+                                                            if(lookX >= lookZ)
+                                                                repeaterFacing = (look.x > 0.0f) ? 1 : 3;
+                                                            else
+                                                                repeaterFacing = (look.z > 0.0f) ? 2 : 0;
+
+                                                            mWorld->GetBlock(testPos2.x,testPos2.y,testPos2.z) = mWorld->invId[27+barPosition];
+                                                            mWorld->SetRepeaterState((int)testPos2.x,(int)testPos2.y,(int)testPos2.z,
+                                                                mWorld->RepeaterStateFrom(repeaterFacing, 1));
+                                                            mWorld->UpdateRedstonePower((int)testPos2.x,(int)testPos2.y,(int)testPos2.z);
+                                                        }
+                                                        else
+                                                        {
+                                                            placed = false;
+                                                        }
+                                                        break;
+                                                    }
+
+                                                    case kExtendedBlockBase + 20: // Piston
+                                                    case kExtendedBlockBase + 22: // Sticky piston
+                                                    {
+                                                        // Java BlockPistonBase.determineOrientation: the head
+                                                        // comes out *towards* whoever placed the piston, and the
+                                                        // placer's pitch is only consulted when they are standing
+                                                        // almost directly over or under the cell being filled.
+                                                        // Reading the reticle instead would make a piston placed
+                                                        // on the floor at your feet push *down* into the ground,
+                                                        // where vanilla pushes it up -- the cell is under the eye
+                                                        // and the block below is not the direction being asked
+                                                        // for.
+                                                        //
+                                                        // "Towards the placer" is the part that is easy to get
+                                                        // backwards, and reading the look vector directly is how:
+                                                        // that vector points *away* from the player, so the
+                                                        // direction to store is the one the piston pushes back
+                                                        // along, not the one the vector names. Stored the other
+                                                        // way round, a piston placed on a wall has its arm in the
+                                                        // wall and its plate facing away, and it disagrees with
+                                                        // the vertical cases below -- which were always right,
+                                                        // and are the ones that show the piston on the floor
+                                                        // pushing up at you.
+                                                        Vector3 look = fppCam->m_vView - fppCam->m_vPosition;
+                                                        float lookX = look.x < 0.0f ? -look.x : look.x;
+                                                        float lookZ = look.z < 0.0f ? -look.z : look.z;
+                                                        int pistonFacing;
+                                                        if(lookX >= lookZ)
+                                                            pistonFacing = (look.x > 0.0f) ? 2 : 3;   // -X / +X
+                                                        else
+                                                            pistonFacing = (look.z > 0.0f) ? 4 : 5;   // -Z / +Z
+
+                                                        if(fabsf(playerPosition.x - testPos2.x) < 2.0f &&
+                                                           fabsf(playerPosition.z - testPos2.z) < 2.0f)
+                                                        {
+                                                            if(playerPosition.y - testPos2.y > 2.0f)
+                                                                pistonFacing = 1;   // the placer is well above it
+                                                            else if(testPos2.y - playerPosition.y > 0.0f)
+                                                                pistonFacing = 0;   // and here, well below it
+                                                        }
+
+                                                        mWorld->GetBlock(testPos2.x,testPos2.y,testPos2.z) = mWorld->invId[27+barPosition];
+                                                        // The idle piston *is* the item, so there is no other
+                                                        // id to write -- but the state nibble is written by
+                                                        // hand, as for a button: the cell has just been air
+                                                        // (or water), and whatever was in the nibble before
+                                                        // that is not this piston's direction.
+                                                        mWorld->SetPistonState((int)testPos2.x,(int)testPos2.y,(int)testPos2.z, pistonFacing);
+                                                        break;
+                                                    }
+
                                                     default:
                                                     mWorld->GetBlock(testPos2.x,testPos2.y,testPos2.z) = mWorld->invId[27+barPosition];
                                                     break;
@@ -5333,6 +6161,21 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                                     {
                                                         mWorld->invAm[27+barPosition]-= 1;
                                                     }
+                                                    if(mWorld->GetBlock(testPos2.x,testPos2.y,testPos2.z) == TNTBlock::getID())
+                                                    {
+                                                        mWorld->TryIgniteTNT((int)testPos2.x,(int)testPos2.y,(int)testPos2.z);
+                                                    }
+                                                    else
+                                                    {
+                                                        // Java's World.setBlock notifies every neighbour on *any*
+                                                        // placement, and the redstone half of that is a reseed: dust
+                                                        // recomputes from its sources, a lamp in range re-decides, and a
+                                                        // switch in range is re-asked. Covered by the old
+                                                        // `== RedstoneBlock` test only, which is why a lamp placed
+                                                        // against live wiring stayed dark until some unrelated redstone
+                                                        // event happened inside its 5x5x5 window.
+                                                        mWorld->UpdateRedstonePower((int)testPos2.x,(int)testPos2.y,(int)testPos2.z);
+                                                    }
                                                 }
                                                 else
                                                 {
@@ -5342,11 +6185,45 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                         }
                                         else //if it is item in our hand
                                         {
+                                            if(mWorld->IsSpawnEgg(mWorld->invId[27+barPosition]))
+                                            {
+                                                if(mWorld->SpawnFromEgg(mWorld->invId[27+barPosition], testPos2.x+0.5f, testPos2.y, testPos2.z+0.5f))
+                                                {
+                                                    mWorld->invAm[27+barPosition] -= 1;
+                                                    if(mWorld->invAm[27+barPosition] == 0)
+                                                    {
+                                                        mWorld->invAm[27+barPosition] = -1;
+                                                        mWorld->invSt[27+barPosition] = 0;
+                                                        mWorld->invId[27+barPosition] = -1;
+                                                    }
+                                                    animGo = true;
+                                                    animDest = 0.0f;
+                                                }
+                                                return;
+                                            }
                                             if(mWorld->invId[27+barPosition] == TorchItem::getID()) // if it is torch
                                             {
-                                                if(mWorld->BlockSolid(testPos2.x+1,testPos2.y,testPos2.z) == true || mWorld->BlockSolid(testPos2.x-1,testPos2.y,testPos2.z) == true || mWorld->BlockSolid(testPos2.x,testPos2.y,testPos2.z-1) == true || mWorld->BlockSolid(testPos2.x,testPos2.y,testPos2.z+1) == true || mWorld->BlockSolid(testPos2.x,testPos2.y-1,testPos2.z) == true)
+                                                // Face from clicked support: 0=floor, 1=-X, 2=+X, 3=-Z, 4=+Z
+                                                float odx = testPos2.x - testPos.x;
+                                                float ody = testPos2.y - testPos.y;
+                                                float odz = testPos2.z - testPos.z;
+                                                int torchFace = -1;
+                                                if(ody > 0.5f)
+                                                    torchFace = 0;
+                                                else if(ody < -0.5f)
+                                                    torchFace = -1; // no ceiling torches
+                                                else if(odx > 0.5f)
+                                                    torchFace = 1;
+                                                else if(odx < -0.5f)
+                                                    torchFace = 2;
+                                                else if(odz > 0.5f)
+                                                    torchFace = 3;
+                                                else if(odz < -0.5f)
+                                                    torchFace = 4;
+
+                                                if(torchFace >= 0 && mWorld->BlockSolid(testPos.x,testPos.y,testPos.z))
                                                 {
-                                                    mWorld->GetBlock(testPos2.x,testPos2.y,testPos2.z) = 48;
+                                                    mWorld->GetBlock(testPos2.x,testPos2.y,testPos2.z) = CraftWorld::TorchBlockFromFace(torchFace);
                                                     fppCam->needUpdate = true;
 
                                                     mWorld->invAm[27+barPosition] -= 1;
@@ -5357,7 +6234,129 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                                        mWorld->invId[27+barPosition] = -1;
                                                     }
                                                     wasLight = true;
-                                                    mWorld->SetLigtSourcePosition(testPos2.x,testPos2.y,testPos2.z,mWorld->invId[27+barPosition]);
+                                                    mWorld->SetLigtSourcePosition(testPos2.x,testPos2.y,testPos2.z,Torch::getID());
+                                                }
+                                                else
+                                                {
+                                                    return;
+                                                }
+                                            }
+
+                                            if(mWorld->invId[27+barPosition] == RedstoneTorchItem::getID()) // redstone torch
+                                            {
+                                                // Same mount rule as the plain torch, but the block id has
+                                                // to carry the lit/unlit family as well, so the id is built
+                                                // from the face and the torch then decides its own state.
+                                                float odx = testPos2.x - testPos.x;
+                                                float ody = testPos2.y - testPos.y;
+                                                float odz = testPos2.z - testPos.z;
+                                                int torchFace = -1;
+                                                if(ody > 0.5f)
+                                                    torchFace = 0;
+                                                else if(ody < -0.5f)
+                                                    torchFace = -1; // no ceiling torches
+                                                else if(odx > 0.5f)
+                                                    torchFace = 1;
+                                                else if(odx < -0.5f)
+                                                    torchFace = 2;
+                                                else if(odz > 0.5f)
+                                                    torchFace = 3;
+                                                else if(odz < -0.5f)
+                                                    torchFace = 4;
+
+                                                if(torchFace >= 0 && mWorld->BlockSolid(testPos.x,testPos.y,testPos.z))
+                                                {
+                                                    // Java places the lit torch and lets updateTick darken it if
+                                                    // the mount is already powered. Evaluating immediately gives
+                                                    // the same result without the visible 0.1 s of wrong light.
+                                                    mWorld->GetBlock(testPos2.x,testPos2.y,testPos2.z) =
+                                                        CraftWorld::RedstoneTorchFromFace(torchFace, true);
+                                                    fppCam->needUpdate = true;
+
+                                                    mWorld->invAm[27+barPosition] -= 1;
+                                                    if(mWorld->invAm[27+barPosition] == 0)
+                                                    {
+                                                       mWorld->invAm[27+barPosition] = -1;
+                                                       mWorld->invSt[27+barPosition] = 0;
+                                                       mWorld->invId[27+barPosition] = -1;
+                                                    }
+                                                    mWorld->UpdateRedstonePower((int)testPos2.x,(int)testPos2.y,(int)testPos2.z);
+                                                    mWorld->EvaluateRedstoneTorch((int)testPos2.x,(int)testPos2.y,(int)testPos2.z);
+                                                    wasLight = true;
+                                                }
+                                                else
+                                                {
+                                                    return;
+                                                }
+                                            }
+
+                                            if(mWorld->invId[27+barPosition] == RepeaterItem::getID()) // redstone repeater
+                                            {
+                                                // Java BlockRedstoneRepeater: it only ever sits on the floor, and
+                                                // its output points away from the player who placed it, so it
+                                                // drives the block straight ahead. The block-id path below keeps
+                                                // the same rule for inventories saved before the repeater had an
+                                                // item form; this is the path a repeater picked up now takes.
+                                                float ody = testPos2.y - testPos.y;
+                                                if(ody > 0.5f && mWorld->BlockSolid(testPos.x,testPos.y,testPos.z))
+                                                {
+                                                    Vector3 look = fppCam->m_vView - fppCam->m_vPosition;
+                                                    float lookX = look.x < 0.0f ? -look.x : look.x;
+                                                    float lookZ = look.z < 0.0f ? -look.z : look.z;
+                                                    int repeaterFacing;
+                                                    if(lookX >= lookZ)
+                                                        repeaterFacing = (look.x > 0.0f) ? 1 : 3;
+                                                    else
+                                                        repeaterFacing = (look.z > 0.0f) ? 2 : 0;
+
+                                                    mWorld->GetBlock(testPos2.x,testPos2.y,testPos2.z) = RepeaterOff::getID();
+                                                    mWorld->SetRepeaterState((int)testPos2.x,(int)testPos2.y,(int)testPos2.z,
+                                                        mWorld->RepeaterStateFrom(repeaterFacing, 1));
+                                                    mWorld->UpdateRedstonePower((int)testPos2.x,(int)testPos2.y,(int)testPos2.z);
+                                                    fppCam->needUpdate = true;
+
+                                                    mWorld->invAm[27+barPosition] -= 1;
+                                                    if(mWorld->invAm[27+barPosition] == 0)
+                                                    {
+                                                       mWorld->invAm[27+barPosition] = -1;
+                                                       mWorld->invSt[27+barPosition] = 0;
+                                                       mWorld->invId[27+barPosition] = -1;
+                                                    }
+                                                    wasLight = true;
+                                                }
+                                                else
+                                                {
+                                                    return;
+                                                }
+                                            }
+
+                                            if(mWorld->invId[27+barPosition] == Redstone::getID()) // if it is Redstone item
+                                            {
+                                                bool canPlaceDust = (mWorld->GetBlock(testPos2.x,testPos2.y,testPos2.z) == 0);
+                                                if(canPlaceDust && mWorld->BlockSolid(testPos2.x,testPos2.y-1,testPos2.z) == false)
+                                                {
+                                                    canPlaceDust = false;
+                                                }
+                                                if(canPlaceDust)
+                                                {
+                                                    mWorld->GetBlock(testPos2.x,testPos2.y,testPos2.z) = Redstoneoff::getID();
+                                                    fppCam->needUpdate = true;
+                                                    int chunkTarget = mWorld->getChunkId(testPos2);
+                                                    mWorld->RebuildTransparentMeshChunk(chunkTarget);
+                                                    mWorld->rebuildNearestChunks(chunkTarget,testPos2);
+                                                    mWorld->UpdateRedstonePower((int)testPos2.x,(int)testPos2.y,(int)testPos2.z);
+
+                                                    mWorld->invAm[27+barPosition] -= 1;
+                                                    if(mWorld->invAm[27+barPosition] == 0)
+                                                    {
+                                                       mWorld->invAm[27+barPosition] = -1;
+                                                       mWorld->invSt[27+barPosition] = 0;
+                                                       mWorld->invId[27+barPosition] = -1;
+                                                    }
+                                                    wasUpdated = true;
+                                                    animGo = true;
+                                                    animDest = 0.0f;
+                                                    return;
                                                 }
                                                 else
                                                 {
@@ -5480,15 +6479,38 @@ void StatePlay::HandleEvents(StateManager* sManager)
 											if (mWorld->invId[27 + barPosition] == FlintAndSteel::getID()) // if it is FlintAndSteel
 											{
 												mSoundMgr->PlayFlintSound();
-												mWorld->GetBlock(testPos2.x, testPos2.y, testPos2.z) = Fire::getID();
+
+												// A flint and steel on a valid obsidian ring lights the portal rather
+												// than starting a fire. TryLightPortal measures the ring, so any legal
+												// frame size works; only when there is no frame does the old fire
+												// behaviour below run. The clicked cell is tried first, then the aimed
+												// block itself, because the player may aim at either the opening or the
+												// obsidian.
+												bool litPortal = mWorld->TryLightPortal(testPos2.x, testPos2.y, testPos2.z);
+												if(litPortal == false)
+													litPortal = mWorld->TryLightPortal(testPos.x, testPos.y, testPos.z);
+												Aurora::Utils::Logger::Instance()->LogMessage("portal: flint clicked=(%d,%d,%d) place=(%d,%d,%d) lit=%d\n",
+													(int)testPos.x,(int)testPos.y,(int)testPos.z,
+													(int)testPos2.x,(int)testPos2.y,(int)testPos2.z,(int)litPortal);
 
 												fppCam->needUpdate = true;
 												int chunkTarget = mWorld->getChunkId(testPos2);
-												mWorld->RebuildTransparentMeshChunk(chunkTarget);
-												mWorld->rebuildNearestChunks(chunkTarget, testPos2);
-												mWorld->RemoveLigtSourceAtPosition(testPos.x, testPos.y, testPos.z, 247);
-												mWorld->UpdateLightAreaIn(testPos);
-												mWorld->RebuildFullMeshChunk(chunkTarget);
+												if(litPortal == true)
+												{
+													mWorld->RebuildTransparentMeshChunk(chunkTarget);
+													mWorld->rebuildNearestChunks(chunkTarget, testPos2);
+													mWorld->UpdateLightAreaIn(testPos2);
+													mWorld->RebuildFullMeshChunk(chunkTarget);
+												}
+												else
+												{
+													mWorld->GetBlock(testPos2.x, testPos2.y, testPos2.z) = Fire::getID();
+													mWorld->RebuildTransparentMeshChunk(chunkTarget);
+													mWorld->rebuildNearestChunks(chunkTarget, testPos2);
+													mWorld->SetLigtSourcePosition(testPos2.x, testPos2.y, testPos2.z, Fire::getID());
+													mWorld->UpdateLightAreaIn(testPos2);
+													mWorld->RebuildFullMeshChunk(chunkTarget);
+												}
 
 												mWorld->invAm[27 + barPosition] -= 1;
 												if (mWorld->invAm[27 + barPosition] == 0)
@@ -5886,9 +6908,8 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                                 int chunkTarget = mWorld->getChunkId(testPos2);
                                                 mWorld->GetBlock(testPos2.x,testPos2.y,testPos2.z) = 4;
                                                 mWorld->invId[27+barPosition] = 290;
-
-                                                //mWorld->rebuildChunk(chunkTarget);
-                                                //mWorld->rebuildTransparentChunk(chunkTarget);
+                                                mWorld->RebuildTransparentMeshChunk(chunkTarget);
+                                                mWorld->rebuildNearestChunks(chunkTarget,testPos2);
                                                 fppCam->needUpdate = true;
                                             }
                                             if(mWorld->invId[27+barPosition] == 292) // if it is lava busket
@@ -5905,7 +6926,7 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                                 }
 
                                                 wasLight = true;
-                                                mWorld->SetLigtSourcePosition(testPos2.x,testPos2.y,testPos2.z,mWorld->invId[27+barPosition]);
+                                                mWorld->SetLigtSourcePosition(testPos2.x,testPos2.y,testPos2.z,Lava::getID());
                                                 fppCam->needUpdate = true;
                                             }
                                         }
@@ -5921,7 +6942,7 @@ void StatePlay::HandleEvents(StateManager* sManager)
 
                                         int chunkTarget = mWorld->getChunkId(testPos2);
 
-                                        if(oldBlock < 250 && oldBlock != -1)
+                                        if(IsBlockId(oldBlock) && oldBlock != -1)
                                         {
                                             mSoundMgr->PlayWalkSound(mWorld->blockTypes[oldBlock].soundType);
                                         }
@@ -6059,13 +7080,12 @@ void StatePlay::HandleEvents(StateManager* sManager)
 
                         Vector3 particlePos = fppCam->m_vPosition + (rayParticleDir * 0.38f);
 
-                        if(mParticles.size() <= 52)
+                        if(Particle::ActiveCount() <= 52)
                         {
                             for(int k = 0; k <= 5; k++) // 5 particles
                             {
-                                Particle* FoodPart = new Particle(mWorld,"item crack",Vector3(particlePos.x,particlePos.y-0.18f,particlePos.z));
+                                Particle* FoodPart = Particle::Spawn(mWorld,"item crack",Vector3(particlePos.x,particlePos.y-0.18f,particlePos.z));
                                 FoodPart->var1 = mWorld->invId[27+barPosition]-250;
-                                mParticles.push_back(FoodPart);
                             }
                         }
 
@@ -6102,246 +7122,37 @@ void StatePlay::HandleEvents(StateManager* sManager)
                 //remove cube
                 Vector3 rayDir = fppCam->m_vView - fppCam->m_vPosition;
                 rayDir.normalize();
+                Vector3 rayOrigin = fppCam->m_vPosition;
+                float punchReach = 3.5f;
+                float nearestMobT = punchReach + 1.0f;
+                float punchPower = 0.7f;
+                LameMob* punchMob = FindMobAlongRay(mWorld, rayOrigin, rayDir, punchReach, &nearestMobT, &punchPower);
 
                 //we are takin our positiona and view vector
                 Vector3 testPos2;
                 testPos2 = Vector3(-1,-1,-1);
 
-                BoundingBox collider = mWorld->blockTypes[mWorld->GetBlock(testPos2.x,testPos2.y,testPos2.z)].collideBox;
+                BoundingBox collider = mWorld->GetBlockCollideBox(testPos2.x,testPos2.y,testPos2.z, mWorld->GetBlock(testPos2.x,testPos2.y,testPos2.z));
                 BoundingBox testBox = BoundingBox(testPos2.x+collider.min.x, testPos2.y+collider.min.y, testPos2.z+collider.min.z, testPos2.x+collider.max.x, testPos2.y+collider.max.y, testPos2.z+collider.max.z);
 
                 //we are moving slowly to the target +=0.5
-                for(float i = 0; i < 5.25f; i+=0.1f)
+                // One iteration per cell the look crosses (see CraftWorld::NextCellDistance), clipped
+                // against that cell's selection box: the punch has to hit the same shape the crosshair
+                // outlines, or a 1 px plate can be aimed at and not broken.
+                Ray punchRay(fppCam->m_vPosition, rayDir);
+
+                for(float i = 0.0f; i < 5.25f; i = CraftWorld::NextCellDistance(fppCam->m_vPosition, rayDir, i))
                 {
                     testPos2 = fppCam->m_vPosition + (rayDir * i);
 
-                    collider = mWorld->blockTypes[mWorld->GetBlock(testPos2.x,testPos2.y,testPos2.z)].collideBox;
+                    collider = mWorld->GetBlockSelectionBox(testPos2.x,testPos2.y,testPos2.z, mWorld->GetBlock(testPos2.x,testPos2.y,testPos2.z));
                     testBox = BoundingBox(floorf(testPos2.x)+0.5f+collider.min.x, floorf(testPos2.y)+0.5f+collider.min.y, floorf(testPos2.z)+0.5f+collider.min.z, floorf(testPos2.x)+0.5f+collider.max.x, floorf(testPos2.y)+0.5f+collider.max.y, floorf(testPos2.z)+0.5f+collider.max.z);
 
-                    bool kick = false;
-                    if(mWorld->mZombies.empty() == false)
-                    {
-                        for(int f = 0; f < mWorld->mZombies.size(); f++)
-                        {
-                            Zombie *TestZombie = mWorld->mZombies[f];
-                            if(TestZombie->DistanceToPlayer() < 3.16f && TestZombie->kicked == false && TestZombie->damaged == false)
-                            {
-                                if(TestZombie->bBox.contains(testPos2))
-                                {
-                                    float damage = 1.0f;
-                                    bool weapon = false;
-
-                                    damage = mWorld->FetchDamagePoints(mWorld->invId[27+barPosition], weapon);
-
-                                    if(weapon == true)
-                                    {
-                                        mWorld->invAm[27+barPosition] -= 1+rand()%2;
-
-                                        if(mWorld->invAm[27+barPosition] <= 0)
-                                        {
-                                            mWorld->invId[27+barPosition] = -1;
-                                            mWorld->invAm[27+barPosition] = -1;
-                                            mWorld->invSt[27+barPosition] = false;
-
-                                            mSoundMgr->PlayBreakSound();
-                                        }
-                                    }
-
-                                    TestZombie->TakeDamage(damage,0.75f,dt);
-                                    kick = true;
-
-                                    animGo = true;
-                                    animDest = 0.0f;
-
-                                    changeY = -0.1f;
-                                    anim[0] = 1;
-                                    break;
-                                }
-                            }
-                        }
-                        if(kick == true)
-                        {
-                            return;
-                        }
-                    }
-
-
-                    if(mWorld->mCows.empty() == false)
-                    {
-                        for(int f = 0; f < mWorld->mCows.size(); f++)
-                        {
-                            Cow *TestCow = mWorld->mCows[f];
-                            if(TestCow->DistanceToPlayer() < 2.75 && TestCow->kicked == false && TestCow->damaged == false)
-                            {
-                                if(TestCow->bBox.contains(testPos2))
-                                {
-                                    float damage = 1.0f;
-                                    bool weapon = false;
-
-                                    damage = mWorld->FetchDamagePoints(mWorld->invId[27+barPosition], weapon);
-
-                                    if(weapon == true)
-                                    {
-                                        mWorld->invAm[27+barPosition] -= 1+rand()%2;
-
-                                        if(mWorld->invAm[27+barPosition] <= 0)
-                                        {
-                                            mWorld->invId[27+barPosition] = -1;
-                                            mWorld->invAm[27+barPosition] = -1;
-                                            mWorld->invSt[27+barPosition] = false;
-
-                                            mSoundMgr->PlayBreakSound();
-                                        }
-                                    }
-
-                                    TestCow->TakeDamage(damage,0.7f,dt);
-                                    kick = true;
-
-                                    animGo = true;
-                                    animDest = 0.0f;
-                                    break;
-                                }
-                            }
-                        }
-                        if(kick == true)
-                        {
-                            return;
-                        }
-                    }
-
-
-                    if(mWorld->mSheeps.empty() == false)
-                    {
-                        for(int f = 0; f < mWorld->mSheeps.size(); f++)
-                        {
-                            Sheep *TestSheep = mWorld->mSheeps[f];
-                            if(TestSheep->DistanceToPlayer() < 2.75 && TestSheep->kicked == false && TestSheep->damaged == false)
-                            {
-                                if(TestSheep->bBox.contains(testPos2))
-                                {
-                                    float damage = 1.0f;
-                                    bool weapon = false;
-
-                                    damage = mWorld->FetchDamagePoints(mWorld->invId[27+barPosition], weapon);
-
-                                    if(weapon == true)
-                                    {
-                                        mWorld->invAm[27+barPosition] -= 1+rand()%2;
-
-                                        if(mWorld->invAm[27+barPosition] <= 0)
-                                        {
-                                            mWorld->invId[27+barPosition] = -1;
-                                            mWorld->invAm[27+barPosition] = -1;
-                                            mWorld->invSt[27+barPosition] = false;
-
-                                            mSoundMgr->PlayBreakSound();
-                                        }
-                                    }
-
-                                    TestSheep->TakeDamage(damage,0.7f,dt);
-                                    kick = true;
-
-                                    animGo = true;
-                                    animDest = 0.0f;
-                                    break;
-                                }
-                            }
-                        }
-                        if(kick == true)
-                        {
-                            return;
-                        }
-                    }
-
-
-                    if(mWorld->mCreepers.empty() == false)
-                    {
-                        for(int f = 0; f < mWorld->mCreepers.size(); f++)
-                        {
-                            Creeper *TestCreeper = mWorld->mCreepers[f];
-                            if(mWorld->FastDistance2d(abs(TestCreeper->position.x-playerPosition.x)*10,abs(TestCreeper->position.z-playerPosition.z)*10)/10.0f + abs(TestCreeper->position.y-(playerPosition.y-0.7))/2.0f < 2.18 && TestCreeper->kicked == false && TestCreeper->damaged == false)
-                            {
-                                if(TestCreeper->bBox.contains(testPos2))
-                                {
-                                    float damage = 1.0f;
-                                    bool weapon = false;
-
-                                    damage = mWorld->FetchDamagePoints(mWorld->invId[27+barPosition], weapon);
-
-                                    if(weapon == true)
-                                    {
-                                        mWorld->invAm[27+barPosition] -= 1+rand()%2;
-
-                                        if(mWorld->invAm[27+barPosition] <= 0)
-                                        {
-                                            mWorld->invId[27+barPosition] = -1;
-                                            mWorld->invAm[27+barPosition] = -1;
-                                            mWorld->invSt[27+barPosition] = false;
-
-                                            mSoundMgr->PlayBreakSound();
-                                        }
-                                    }
-
-                                    TestCreeper->TakeDamage(damage,0.7f,dt);
-                                    kick = true;
-
-                                    animGo = true;
-                                    animDest = 0.0f;
-                                    break;
-                                }
-                            }
-                        }
-                        if(kick == true)
-                        {
-                            return;
-                        }
-                    }
-
-					/*if(mWorld->mPigs.empty() == false)
-                    {
-                        for(int f = 0; f < mWorld->mPigs.size(); f++)
-                        {
-                            Pig *TestPig = mWorld->mPigs[f];
-                            if(TestPig->DistanceToPlayer() < 2.75 && TestPig->kicked == false && TestPig->damaged == false)
-                            {
-                                if(TestPig->bBox.contains(testPos2))
-                                {
-                                    float damage = 1.0f;
-                                    bool weapon = false;
-
-                                    damage = mWorld->FetchDamagePoints(mWorld->invId[27+barPosition], weapon);
-
-                                    if(weapon == true)
-                                    {
-                                        mWorld->invAm[27+barPosition] -= 1+rand()%2;
-
-                                        if(mWorld->invAm[27+barPosition] <= 0)
-                                        {
-                                            mWorld->invId[27+barPosition] = -1;
-                                            mWorld->invAm[27+barPosition] = -1;
-                                            mWorld->invSt[27+barPosition] = false;
-
-                                            mSoundMgr->PlayBreakSound();
-                                        }
-                                    }
-
-                                    TestPig->TakeDamage(damage,0.7f,dt);
-                                    kick = true;
-
-                                    animGo = true;
-                                    animDest = 0.0f;
-                                    break;
-                                }
-                            }
-                        }
-                        if(kick == true)
-                        {
-                            return;
-                        }
-                    }*/
-
                     //check if we touch something
-                    if(mWorld->BlockEditable(testPos2.x,testPos2.y,testPos2.z) && testBox.contains(testPos2))
+                    float punchDist = -1.0f;
+                    punchRay.hasIntersected(testBox, punchDist);
+
+                    if(mWorld->BlockEditable(testPos2.x,testPos2.y,testPos2.z) && punchDist != -1.0f && i <= nearestMobT)
                     {
                         if(mWorld->GetBlock(testPos2.x,testPos2.y,testPos2.z) == NoteBlock::getID())
                         {
@@ -6367,9 +7178,8 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                         green = 1.0 - ((TestNoteBlock->GetNote()-12)/12.0f);
                                         red = ((TestNoteBlock->GetNote()-12)/12.0f);
                                     }
-                                    Particle* Note = new Particle(mWorld,"note",Vector3((int)testPos2.x+0.5f,(int)testPos2.y+1.1f,(int)testPos2.z+0.5f));
+                                    Particle* Note = Particle::Spawn(mWorld,"note",Vector3((int)testPos2.x+0.5f,(int)testPos2.y+1.1f,(int)testPos2.z+0.5f));
                                     Note->SetColor(Vector3(red,green,blue));
-                                    mParticles.push_back(Note);
                                 }
                             }
                         }
@@ -6622,6 +7432,17 @@ void StatePlay::HandleEvents(StateManager* sManager)
                         break;
                     }
                 }
+                if(punchMob != NULL && startDt == false)
+                {
+                    ApplyMeleeHit(mWorld, mSoundMgr, barPosition, punchMob, punchPower, dt, true);
+                    // Java charges exhaustion for a swing that lands (attackTargetEntityWithCurrentItem).
+                    mWorld->AddExhaustion(EXHAUST_ATTACK);
+                    animGo = true;
+                    animDest = 0.0f;
+                    changeY = -0.1f;
+                    anim[0] = 1;
+                    return;
+                }
             }
 
             //remove cube
@@ -6668,7 +7489,7 @@ void StatePlay::HandleEvents(StateManager* sManager)
                             {
                                 // drop all items in chest
                                 Chest* TestChest = mWorld->mChests[chestId];
-                                for(int i = 0; i <= 27; i++)
+                                for(int i = 0; i < 27; i++) //Chest has 27 slots (0..26)
                                 {
                                     if(TestChest->chestSlotId[i] > 0)
                                     {
@@ -6770,6 +7591,13 @@ void StatePlay::HandleEvents(StateManager* sManager)
                             }
                         }
 
+                        // Breaking half a piston takes the other half with it: an extended base would
+                        // otherwise leave its head standing in the next cell with nothing to retract
+                        // it, and a broken head would leave a base stuck open. This runs *before* the
+                        // cell is emptied below, because the direction it needs lives in the state
+                        // nibble that ClearStateCellNibble is about to zero.
+                        mWorld->BreakPistonPartner((int)testPos1.x,(int)testPos1.y,(int)testPos1.z);
+
                         if(oldBlock >= 57 && oldBlock <= 58)
                         {
                             mWorld->GetBlock(testPos1.x,testPos1.y,testPos1.z) = 0;
@@ -6831,6 +7659,38 @@ void StatePlay::HandleEvents(StateManager* sManager)
                         else
                         {
                             mWorld->GetBlock(testPos1.x,testPos1.y,testPos1.z) = 0;
+                            // The cell is air now, so its settings nibble is no longer state as far as the
+                            // light readers are concerned -- see ClearStateCellNibble. Zero it before
+                            // anything reads the cell, or a high delay setting is read back as a light
+                            // level and shadows the spot it was broken on.
+                            if(CraftWorld::IsStateCellBlock(oldBlock))
+                            {
+                                mWorld->ClearStateCellNibble((int)testPos1.x,(int)testPos1.y,(int)testPos1.z);
+                            }
+
+                            // A nether portal hangs off its obsidian ring, so pulling a frame block out
+                            // takes the portal with it. Java gets this from a scheduled tick that
+                            // re-measures the frame; with no block tick here, the break does it.
+                            if(oldBlock == Obsidian::getID())
+                            {
+                                mWorld->BreakPortalNear((int)testPos1.x,(int)testPos1.y,(int)testPos1.z);
+                            }
+                            // Removing any redstone source or one-way part changes what everything around
+                            // it reads, so reseed: dust, a block of redstone, a redstone torch, a
+                            // repeater and now a switch or a lamp all have to be announced. The torch case
+                            // also covers the torch being picked up while it was the mount's only reason to
+                            // be powered. A switch (button or lever) earns its place because while it is on
+                            // it weak-powers all six neighbours, so removing it leaves exactly the wire it was
+                            // driving reading stale; a lamp earns its place as a *conductor* -- a block of
+                            // redstone behind a lamp strongly powers the lamp, and dust pointing into the lamp
+                            // reads that back, so pulling the lamp out has to reseed even though a lamp never
+                            // emits power in either state.
+                            if(oldBlock == Redstoneoff::getID() || oldBlock == RedstoneBlock::getID()
+                               || CraftWorld::IsRedstoneTorchBlock(oldBlock) || CraftWorld::IsRepeaterBlock(oldBlock)
+                               || CraftWorld::IsSwitchBlock(oldBlock) || CraftWorld::IsRedstoneLampBlock(oldBlock))
+                            {
+                                mWorld->UpdateRedstonePower((int)testPos1.x,(int)testPos1.y,(int)testPos1.z);
+                            }
 
                             int upper_block = mWorld->GetBlock(testPos1.x,testPos1.y+1,testPos1.z);
 
@@ -6839,7 +7699,7 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                 if(mWorld->BlockSolid(testPos1.x,testPos1.y+1,testPos1.z) == false &&
                                    !(upper_block >= Door1::getID() && upper_block <= Door8::getID()) &&
                                    !(upper_block >= ItemFrame1::getID() && upper_block <= ItemFrame4::getID()) &&
-                                   upper_block != Torch::getID() &&
+                                   !CraftWorld::IsTorchBlock(upper_block) &&
                                    upper_block != WaterBlock::getID() &&
                                    upper_block != Lava::getID() &&
                                    upper_block != CaneBlock::getID() &&
@@ -6854,7 +7714,7 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                     if(mWorld->ChunksEqual(testPos1,testPos2) == false)
                                     {
                                         int chunkTarget = mWorld->getChunkId(testPos2);
-                                        mWorld->RebuildTransparentMeshChunk(chunkTarget);
+                                        mWorld->AddChunkToUpdate(chunkTarget);
                                     }
                                 }
 
@@ -6866,7 +7726,7 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                         if(mWorld->ChunksEqual(testPos1, testPos2) == false)
                                         {
                                             int chunkTarget = mWorld->getChunkId(testPos2);
-                                            mWorld->RebuildTransparentMeshChunk(chunkTarget);
+                                            mWorld->AddChunkToUpdate(chunkTarget);
                                         }
                                         break;
                                     }
@@ -6884,7 +7744,7 @@ void StatePlay::HandleEvents(StateManager* sManager)
                             }
                         }
 
-                        if(mWorld->invId[27+barPosition] >= 250 && mWorld->invId[27+barPosition] <= 275) // tool breaking
+                        if(IsItemId(mWorld->invId[27+barPosition]) && mWorld->invId[27+barPosition] <= 275) // tool breaking
                         {
                             mWorld->invAm[27+barPosition] -= 1;
                             if(mWorld->invAm[27+barPosition] <= 0)
@@ -6894,13 +7754,15 @@ void StatePlay::HandleEvents(StateManager* sManager)
 
                                 Vector3 particlePos = fppCam->m_vPosition + (rayParticleDir * 0.38f);
 
-                                if(mParticles.size() <= 52)
+                                if(Particle::ActiveCount() <= 52)
                                 {
                                     for(int k = 0; k <= 5; k++) // 5 particles
                                     {
-                                        Particle* ToolPart = new Particle(mWorld,"item crack",Vector3(particlePos.x,particlePos.y-0.18f,particlePos.z));
-                                        ToolPart->var1 = mWorld->invId[27+barPosition]-250;
-                                        mParticles.push_back(ToolPart);
+                                        Particle* ToolPart = Particle::Spawn(mWorld,"item crack",Vector3(particlePos.x,particlePos.y-0.18f,particlePos.z));
+                                        if(ToolPart)
+                                        {
+                                            ToolPart->var1 = mWorld->invId[27+barPosition]-250;
+                                        }
                                     }
                                 }
 
@@ -7083,7 +7945,7 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                     if(mWorld->ChunksEqual(testPos1, testPos2) == false)
                                     {
                                         int chunkTarget = mWorld->getChunkId(testPos2);
-                                        mWorld->RebuildTransparentMeshChunk(chunkTarget);
+                                        mWorld->AddChunkToUpdate(chunkTarget);
                                     }
                                     break;
                                 }
@@ -7134,50 +7996,15 @@ void StatePlay::HandleEvents(StateManager* sManager)
                             }
                         }
 
-                        if(mParticles.size() <= 52 && oldBlock >= 0)
+                        if(oldBlock >= 0)
                         {
-                            for(int k = 0; k <= 8; k++) // 9 particles
-                            {
-                                Particle* Smoke2 = new Particle(mWorld,"block crack",Vector3((int)testPos1.x + 0.5f + (-0.3+(rand() % 7)*0.1f),(int)testPos1.y + 0.5f + (-0.2+(rand() % 5)*0.1f),(int)testPos1.z + 0.5f + (-0.3+(rand() % 7)*0.1f)));
-                                Smoke2->var1 = oldBlock;
-                                mParticles.push_back(Smoke2);
-                            }
-                        }
-
-                        //check if this block is a support for light block or ladder
-                        mWorld->CheckForTorchSupport(testPos1.x,testPos1.y,testPos1.z,mWorld->GetBlock(testPos1.x,testPos1.y,testPos1.z));
-                        mWorld->CheckForLadderSupport(testPos1.x,testPos1.y,testPos1.z);
-                        mWorld->DestroyAroundTrapdoors(testPos1.x,testPos1.y,testPos1.z);
-                        mWorld->DestroyAroundItemFrames(testPos1.x,testPos1.y,testPos1.z);
-
-                        int chunkTarget = mWorld->getChunkId(testPos1);
-
-                        if(chunkTarget != -1)
-                        {
-                            if(wasLight == true)
-                            {
-                                mWorld->RemoveLigtSourceAtPosition(testPos1.x,testPos1.y,testPos1.z,Torch::getID());
-                                mWorld->UpdateLightAreaIn(testPos1);
-
-                                mWorld->RebuildFullMeshChunk(chunkTarget);
-                                mWorld->rebuildNearestChunksForLight(chunkTarget,testPos1);
-                            }
-                            else
-                            {
-                                mWorld->initPutBlocksLight(testPos1.x, testPos1.y+2, testPos1.z);
-                                if(mWorld->GetLightLevel(testPos1.x-1,testPos1.y,testPos1.z) != 0 ||
-                                   mWorld->GetLightLevel(testPos1.x+1,testPos1.y,testPos1.z) != 0 ||
-                                   mWorld->GetLightLevel(testPos1.x,testPos1.y-1,testPos1.z) != 0 ||
-                                   mWorld->GetLightLevel(testPos1.x,testPos1.y+1,testPos1.z) != 0 ||
-                                   mWorld->GetLightLevel(testPos1.x,testPos1.y,testPos1.z-1) != 0 ||
-                                   mWorld->GetLightLevel(testPos1.x,testPos1.y,testPos1.z+1) != 0)
-                                {
-                                    mWorld->UpdateLightAreaIn(testPos1);
-                                }
-
-                                mWorld->RebuildFullMeshChunk(chunkTarget);
-                                mWorld->rebuildNearestChunks(chunkTarget,testPos1);
-                            }
+                            pendingCrackId = oldBlock;
+                            pendingCrackX = testPos1.x;
+                            pendingCrackY = testPos1.y;
+                            pendingCrackZ = testPos1.z;
+                            pendingBreakWasLight = wasLight;
+                            pendingBreakChunk = mWorld->getChunkId(testPos1);
+                            pendingBreakStage = 1;
                         }
 
                         if(mWorld->HG > 0.01)
@@ -7275,7 +8102,7 @@ void StatePlay::HandleEvents(StateManager* sManager)
                         invXPosition = 0;
                         invYPosition = 0;
                     }
-                    selectInvSprite->SetPosition(96+(invXPosition * 36),138+(invYPosition * 36));
+                    UpdateInvCursorPos();
 
                     invEn = false;
                     craft3xEn = false;
@@ -7442,12 +8269,12 @@ void StatePlay::HandleEvents(StateManager* sManager)
                         if(armorEn == true)
                         {
                             invXPosition != 1 ? invXPosition ++ : invXPosition = 1;
-                            selectInvSprite->SetPosition(96+(invXPosition * 108),26+(invYPosition * 72));
+                            UpdateInvCursorPos();
                         }
                         else
                         {
                             invXPosition != 8 ? invXPosition ++ : invXPosition = 8;
-                            selectInvSprite->SetPosition(96+(invXPosition * 36),138+(invYPosition * 36));
+                            UpdateInvCursorPos();
                         }
                     }
                     else
@@ -7455,17 +8282,17 @@ void StatePlay::HandleEvents(StateManager* sManager)
                         if(invEn == 1)
                         {
                             invXPosition != 1 ? invXPosition ++ : invXPosition = 1;
-                            selectInvSprite->SetPosition(276 + (invXPosition * 36),46+(invYPosition * 36));
+                            UpdateInvCursorPos();
                         }
                         if(craft3xEn == 1)
                         {
                             invXPosition != 2 ? invXPosition ++ : invXPosition = 2;
-                            selectInvSprite->SetPosition(204 + (invXPosition * 36),26+(invYPosition * 36));
+                            UpdateInvCursorPos();
                         }
                         if(chestEn == 1) // if it is in chest
                         {
                             invXPosition != 8 ? invXPosition ++ : invXPosition = 8;
-                            selectInvSprite->SetPosition(96 + (invXPosition * 36),26+(invYPosition * 36));
+                            UpdateInvCursorPos();
                         }
                     }
                 }
@@ -7477,27 +8304,22 @@ void StatePlay::HandleEvents(StateManager* sManager)
                     {
                         invXPosition != 0 ? invXPosition -- : invXPosition = 0;
 
-                        selectInvSprite->SetPosition(96+(invXPosition * 36),138+(invYPosition * 36));
-
-                        if(armorEn == true)
-                        {
-                            selectInvSprite->SetPosition(96+(invXPosition * 108),26+(invYPosition * 72));
-                        }
+                        UpdateInvCursorPos();
                     }
                     else
                     {
                         invXPosition != 0 ? invXPosition -- : invXPosition = 0;
                         if(invEn == 1)
                         {
-                            selectInvSprite->SetPosition(276 + (invXPosition * 36),46+(invYPosition * 36));
+                            UpdateInvCursorPos();
                         }
                         if(craft3xEn == 1)
                         {
-                            selectInvSprite->SetPosition(204 + (invXPosition * 36),26+(invYPosition * 36));
+                            UpdateInvCursorPos();
                         }
                         if(chestEn == 1)
                         {
-                            selectInvSprite->SetPosition(96 + (invXPosition * 36),26+(invYPosition * 36));
+                            UpdateInvCursorPos();
                         }
                     }
                 }
@@ -7509,25 +8331,27 @@ void StatePlay::HandleEvents(StateManager* sManager)
                     {
                         if(armorEn == true)
                         {
-                            invYPosition ++;
-                            selectInvSprite->SetPosition(96+(invXPosition * 108),26+(invYPosition * 72));
-
-                            if(invYPosition == 2)
+                            if(invYPosition < 1)
                             {
+                                invYPosition ++;
+                            }
+                            else
+                            {
+                                // Leave the armour grid downward and land on the inventory row
+                                // directly below the column we were in (0 stays 0, 1 becomes 3).
                                 if(invXPosition == 1)
                                 {
                                     invXPosition = 3;
                                 }
                                 invYPosition = 0;
                                 armorEn = false;
-
-                                selectInvSprite->SetPosition(96+(invXPosition * 36),138+(invYPosition * 36));
                             }
+                            UpdateInvCursorPos();
                         }
                         else
                         {
                             invYPosition != 3 ? invYPosition ++ : invYPosition = 3;
-                            selectInvSprite->SetPosition(96+(invXPosition * 36),138+(invYPosition * 36));
+                            UpdateInvCursorPos();
                         }
                     }
                     else
@@ -7539,11 +8363,11 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                 upEn = 0; // we go to standart inv menu
                                 invYPosition = 0;
                                 invXPosition = 5 + invXPosition;
-                                selectInvSprite->SetPosition(96+(invXPosition * 36),138+(invYPosition * 36));
+                                UpdateInvCursorPos();
                                 return;
                             }
                             invYPosition != 1 ? invYPosition ++ : invYPosition = 1;
-                            selectInvSprite->SetPosition(276 + (invXPosition * 36),46+(invYPosition * 36));
+                            UpdateInvCursorPos();
                         }
 
                         if (craft3xEn == 1)
@@ -7553,11 +8377,11 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                 upEn = 0;
                                 invYPosition = 0;
                                 invXPosition = 3 + invXPosition;
-                                selectInvSprite->SetPosition(96+(invXPosition * 36),138+(invYPosition * 36));
+                                UpdateInvCursorPos();
                                 return;
                             }
                             invYPosition != 2 ? invYPosition ++ : invYPosition = 2;
-                            selectInvSprite->SetPosition(204 + (invXPosition * 36),26+(invYPosition * 36));
+                            UpdateInvCursorPos();
                         }
 
                         if (chestEn == 1)
@@ -7566,11 +8390,11 @@ void StatePlay::HandleEvents(StateManager* sManager)
                             {
                                 upEn = 0;
                                 invYPosition = 0;
-                                selectInvSprite->SetPosition(96+(invXPosition * 36),138+(invYPosition * 36));
+                                UpdateInvCursorPos();
                                 return;
                             }
                             invYPosition != 1 ? invYPosition ++ : invYPosition = 2;
-                            selectInvSprite->SetPosition(96 + (invXPosition * 36),26+(invYPosition * 36));
+                            UpdateInvCursorPos();
                         }
 
                         if (furnaceEn == 1)
@@ -7580,11 +8404,11 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                 upEn = 0;
                                 invYPosition = 0;
                                 invXPosition = 3;
-                                selectInvSprite->SetPosition(96+(invXPosition * 36),138+(invYPosition * 36));
+                                UpdateInvCursorPos();
                                 return;
                             }
                             invYPosition != 1 ? invYPosition ++ : invYPosition = 1;
-                            selectInvSprite->SetPosition(204 ,26+(invYPosition * 72));
+                            UpdateInvCursorPos();
                         }
                     }
                 }
@@ -7594,6 +8418,15 @@ void StatePlay::HandleEvents(StateManager* sManager)
                 {
                     if (upEn == 0)
                     {
+                        if(armorEn)
+                        {
+                            if(invYPosition > 0)
+                            {
+                                invYPosition --;
+                            }
+                            UpdateInvCursorPos();
+                            return;
+                        }
                         if (invYPosition == 0)
                         {
                             if(invEn == 1)
@@ -7602,18 +8435,17 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                 {
                                     invXPosition -= 5;
                                     invYPosition = 1;
-                                    selectInvSprite->SetPosition(276 + (invXPosition * 36),46+(invYPosition * 36));
                                     upEn = true;
+                                    UpdateInvCursorPos();
                                 }
                                 if((invXPosition == 0 || invXPosition == 3) && armorEn == false && upEn == false)
                                 {
-                                    if(invXPosition == 3)
-                                    {
-                                        invXPosition = 1;
-                                    }
+                                    // Enter the armour grid on its bottom row, in the column the
+                                    // inventory cursor was over (0 -> 0, 3 -> 1).
+                                    invXPosition = (invXPosition == 3) ? 1 : 0;
                                     invYPosition = 1;
-                                    selectInvSprite->SetPosition(96 + (invXPosition * 108),26+(invYPosition * 72));
                                     armorEn = true;
+                                    UpdateInvCursorPos();
                                 }
                             }
                             if(craft3xEn == 1)
@@ -7622,33 +8454,33 @@ void StatePlay::HandleEvents(StateManager* sManager)
                                 {
                                     invXPosition -= 3;
                                     invYPosition = 2;
-                                    selectInvSprite->SetPosition(204 + (invXPosition * 36),26+(invYPosition * 36));
                                     upEn = 1;
+                                    UpdateInvCursorPos();
                                 }
                             }
                             if(chestEn == 1)
                             {
                                 invYPosition = 2;
-                                selectInvSprite->SetPosition(96 + (invXPosition * 36),26+(invYPosition * 36));
                                 upEn = 1;
+                                UpdateInvCursorPos();
                             }
                             if(furnaceEn == 1)
                             {
                                 if(invXPosition == 3)
                                 {
                                     invYPosition = 1;
-                                    selectInvSprite->SetPosition(204,26+(invYPosition * 72));
                                     upEn = 1;
+                                    UpdateInvCursorPos();
                                 }
                             }
                             return;
                         }
                         invYPosition != 0 ? invYPosition -- : invYPosition = 0;
-                        selectInvSprite->SetPosition(96+(invXPosition * 36),138+(invYPosition * 36));
+                        UpdateInvCursorPos();
 
                         if(armorEn == true)
                         {
-                            selectInvSprite->SetPosition(96 + (invXPosition * 108),26+(invYPosition * 72));
+                            UpdateInvCursorPos();
                         }
                     }
                     else
@@ -7657,19 +8489,19 @@ void StatePlay::HandleEvents(StateManager* sManager)
 
                         if(invEn == 1)
                         {
-                            selectInvSprite->SetPosition(276 + (invXPosition * 36),46+(invYPosition * 36));
+                            UpdateInvCursorPos();
                         }
                         if(craft3xEn == 1)
                         {
-                            selectInvSprite->SetPosition(204 + (invXPosition * 36),26+(invYPosition * 36));
+                            UpdateInvCursorPos();
                         }
                         if(chestEn == 1)
                         {
-                            selectInvSprite->SetPosition(96 + (invXPosition * 36),26+(invYPosition * 36));
+                            UpdateInvCursorPos();
                         }
                         if(furnaceEn == 1)
                         {
-                            selectInvSprite->SetPosition(204,26+(invYPosition * 72));
+                            UpdateInvCursorPos();
                         }
                     }
                 }
@@ -7695,72 +8527,83 @@ void StatePlay::HandleEvents(StateManager* sManager)
                             }
                             else
                             {
-                                if (mWorld->invId[invYPosition*9 + invXPosition] == -1)
+                                int idx = invYPosition*9 + invXPosition;
+                                if (mWorld->invId[idx] == -1)
                                 {
-                                    mWorld->invId[invYPosition*9 + invXPosition]=mWorld->mId;
-                                    mWorld->invAm[invYPosition*9 + invXPosition]=mWorld->mAm;
-                                    mWorld->invSt[invYPosition*9 + invXPosition]=mWorld->mSt;
+                                    mWorld->invId[idx]=mWorld->mId;
+                                    mWorld->invAm[idx]=mWorld->mAm;
+                                    mWorld->invSt[idx]=mWorld->mSt;
                                     mWorld->mId = -1;
                                     mWorld->mAm = -1;
                                     mWorld->mSt = 0;
                                 }
-
-                                if (mWorld->invId[invYPosition*9 + invXPosition] == mWorld->mId)
+                                else if (mWorld->invId[idx] == mWorld->mId && mWorld->invSt[idx] == 1)
                                 {
-                                    if(mWorld->invSt[invYPosition*9 + invXPosition] == 1)
+                                    if (mWorld->invAm[idx]+mWorld->mAm < 64)
                                     {
-                                        if (mWorld->invAm[invYPosition*9 + invXPosition]+mWorld->mAm < 64)
+                                        mWorld->invAm[idx]+=mWorld->mAm;
+                                        mWorld->mId = -1;
+                                        mWorld->mAm = -1;
+                                        mWorld->mSt = 0;
+                                    }
+                                    else
+                                    {
+                                        mWorld->mAm = (mWorld->invAm[idx] + mWorld->mAm) - 64;
+                                        mWorld->invAm[idx]=64;
+
+                                        if(mWorld->mAm == 0)
                                         {
-                                            mWorld->invAm[invYPosition*9 + invXPosition]+=mWorld->mAm;
-                                            mWorld->mId = -1;
                                             mWorld->mAm = -1;
+                                            mWorld->mId = -1;
                                             mWorld->mSt = 0;
                                         }
-                                        else
-                                        {
-                                            mWorld->mAm = (mWorld->invAm[invYPosition*9 + invXPosition] + mWorld->mAm) - 64;
-                                            mWorld->invAm[invYPosition*9 + invXPosition]=64;
-
-                                            if(mWorld->mAm == 0)
-                                            {
-                                                mWorld->mAm = -1;
-                                                mWorld->mId = -1;
-                                                mWorld->mSt = 0;
-                                            }
-                                        }
                                     }
+                                }
+                                else
+                                {
+                                    short tId = mWorld->invId[idx];
+                                    short tAm = mWorld->invAm[idx];
+                                    bool  tSt = mWorld->invSt[idx];
+                                    mWorld->invId[idx] = mWorld->mId;
+                                    mWorld->invAm[idx] = mWorld->mAm;
+                                    mWorld->invSt[idx] = mWorld->mSt;
+                                    mWorld->mId = tId;
+                                    mWorld->mAm = tAm;
+                                    mWorld->mSt = tSt;
                                 }
                             }
                         }
                         else
                         {
+                            int armorIdx = invYPosition * 2 + invXPosition;
+
                             if (mWorld->mId == -1)
                             {
-                                if (mWorld->armorId[invYPosition*2 + invXPosition] != 324+invYPosition*2+invXPosition) // 324+invYPosition*2+invXPosition is an id of sample armor item
+                                if (mWorld->armorId[armorIdx] != 324+armorIdx) // 324+armorIdx is an id of sample armor item
                                 {
-                                    mWorld->mId = mWorld->armorId[invYPosition*2 + invXPosition];
-                                    mWorld->mAm = mWorld->armorAm[invYPosition*2 + invXPosition];
-                                    mWorld->mSt = mWorld->armorSt[invYPosition*2 + invXPosition];
-                                    mWorld->armorId[invYPosition*2 + invXPosition] = 324+invYPosition*2+invXPosition;
-                                    mWorld->armorAm[invYPosition*2 + invXPosition] = -1;
-                                    mWorld->armorSt[invYPosition*2 + invXPosition] = false;
+                                    mWorld->mId = mWorld->armorId[armorIdx];
+                                    mWorld->mAm = mWorld->armorAm[armorIdx];
+                                    mWorld->mSt = mWorld->armorSt[armorIdx];
+                                    mWorld->armorId[armorIdx] = 324+armorIdx;
+                                    mWorld->armorAm[armorIdx] = -1;
+                                    mWorld->armorSt[armorIdx] = false;
                                 }
                             }
                             else
                             {
-                                if (mWorld->armorId[invYPosition*2 + invXPosition] == 324+invYPosition*2+invXPosition)
+                                if (mWorld->armorId[armorIdx] == 324+armorIdx)
                                 {
-                                    if(mWorld->mId == 324+invYPosition*2+invXPosition+4 || /* all leather armor */
-                                       mWorld->mId == 324+invYPosition*2+invXPosition+8 || /* all chain armor */
-                                       mWorld->mId == 324+invYPosition*2+invXPosition+12|| /* all iron armor */
-                                       mWorld->mId == 324+invYPosition*2+invXPosition+16|| /* all diamond armor */
-                                       mWorld->mId == 324+invYPosition*2+invXPosition+20|| /* all golde armor */
-                                       (invXPosition == 0 && invYPosition == 0 && mWorld->mId == Pumpkin3::getID()) /** it is pumpkin and cursor on helmet slot **/
+                                    if(mWorld->mId == 324+armorIdx+4 || /* all leather armor */
+                                       mWorld->mId == 324+armorIdx+8 || /* all chain armor */
+                                       mWorld->mId == 324+armorIdx+12|| /* all iron armor */
+                                       mWorld->mId == 324+armorIdx+16|| /* all diamond armor */
+                                       mWorld->mId == 324+armorIdx+20|| /* all golde armor */
+                                       (armorIdx == 0 && mWorld->mId == Pumpkin3::getID()) /** it is pumpkin and cursor on helmet slot **/
                                       ) // crazy code monkey skill
                                     {
-                                        mWorld->armorId[invYPosition*2 + invXPosition]=mWorld->mId;
-                                        mWorld->armorAm[invYPosition*2 + invXPosition]=mWorld->mAm;
-                                        mWorld->armorSt[invYPosition*2 + invXPosition]=mWorld->mSt;
+                                        mWorld->armorId[armorIdx]=mWorld->mId;
+                                        mWorld->armorAm[armorIdx]=mWorld->mAm;
+                                        mWorld->armorSt[armorIdx]=mWorld->mSt;
                                         mWorld->mId = -1;
                                         mWorld->mAm = -1;
                                         mWorld->mSt = false;
@@ -8364,6 +9207,60 @@ void StatePlay::HandleEvents(StateManager* sManager)
         }
         else if(menuState == 1) //menu state
         {
+            static float analogMenuWait = 0.0f;
+            analogMenuWait -= dt;
+            if(analogMenuWait < 0.0f)
+                analogMenuWait = 0.0f;
+            if(analogMenuWait <= 0.0f)
+            {
+                float ay = mSystemMgr->GetAnalogY();
+                float ax = mSystemMgr->GetAnalogX();
+                if(ay < -0.6f)
+                {
+                    analogMenuWait = 0.18f;
+                    if(menuOptions)
+                    {
+                        optionsMenuPos = PauseOptionsGridMove(optionsMenuPos, 0, -1);
+                        mSoundMgr->PlayMenuSound();
+                    }
+                    else
+                    {
+                        selectPos--;
+                        if(selectPos < 0)
+                            selectPos = 5;
+                        mSoundMgr->PlayMenuSound();
+                    }
+                }
+                else if(ay > 0.6f)
+                {
+                    analogMenuWait = 0.18f;
+                    if(menuOptions)
+                    {
+                        optionsMenuPos = PauseOptionsGridMove(optionsMenuPos, 0, 1);
+                        mSoundMgr->PlayMenuSound();
+                    }
+                    else
+                    {
+                        selectPos++;
+                        if(selectPos > 5)
+                            selectPos = 0;
+                        mSoundMgr->PlayMenuSound();
+                    }
+                }
+                else if(menuOptions && PauseOptionsIsSlider(optionsMenuPos) && ax < -0.6f)
+                {
+                    analogMenuWait = 0.18f;
+                    if(AdjustPauseOptionsSlider(mWorld, fppCam, skyLight, skyMoonLight, optionsMenuPos, -1))
+                        mSoundMgr->PlayMenuSound();
+                }
+                else if(menuOptions && PauseOptionsIsSlider(optionsMenuPos) && ax > 0.6f)
+                {
+                    analogMenuWait = 0.18f;
+                    if(AdjustPauseOptionsSlider(mWorld, fppCam, skyLight, skyMoonLight, optionsMenuPos, 1))
+                        mSoundMgr->PlayMenuSound();
+                }
+            }
+
             //turn off menu with the same key
             if(keyPressed(InputHelper::Instance()->getButtonToAction(15)))
             {
@@ -8376,138 +9273,46 @@ void StatePlay::HandleEvents(StateManager* sManager)
             //menu keys
         if(menuOptions)
         {
-            //up, down
+            //up, down, left, right move between the two columns
             if(mSystemMgr->KeyPressed(PSP_CTRL_UP))
             {
-                if(optionsMenuPos == 8 || optionsMenuPos == 0)
-                {
-                    return;
-                }
-                optionsMenuPos--;
+                optionsMenuPos = PauseOptionsGridMove(optionsMenuPos, 0, -1);
                 mSoundMgr->PlayMenuSound();
             }
 
             if(mSystemMgr->KeyPressed(PSP_CTRL_DOWN))
             {
-                if(optionsMenuPos == 7 || optionsMenuPos == 15)
-                {
-                    return;
-                }
-                optionsMenuPos++;
+                optionsMenuPos = PauseOptionsGridMove(optionsMenuPos, 0, 1);
                 mSoundMgr->PlayMenuSound();
             }
 
-            if(mSystemMgr->KeyPressed(PSP_CTRL_RTRIGGER))
+            if(mSystemMgr->KeyPressed(PSP_CTRL_LEFT))
             {
-                if(optionsMenuPos + 8 > 15)
-                {
-                    return;
-                }
-                optionsMenuPos += 8;
-                mSoundMgr->PlayMenuSound();
-            }
-
-            if(mSystemMgr->KeyPressed(PSP_CTRL_LTRIGGER))
-            {
-                if(optionsMenuPos - 8 < 0)
-                {
-                    return;
-                }
-                optionsMenuPos -= 8;
+                optionsMenuPos = PauseOptionsGridMove(optionsMenuPos, -1, 0);
                 mSoundMgr->PlayMenuSound();
             }
 
             if(mSystemMgr->KeyPressed(PSP_CTRL_RIGHT))
             {
-                if(optionsMenuPos == 0)
-                {
-                    if (mWorld->mainOptions.fov <= 95)
-                    {
-                        mWorld->mainOptions.fov += 5;
-                        mSoundMgr->PlayMenuSound();
-                        mRender->fovv = mWorld->mainOptions.fov;
-                        RenderManager::InstancePtr()->SetPerspective(0, 480.0f / 272.0f, 0.18f, 1000.f);
-                        skyLight->UpdateLightSource(mWorld->skyTime);
-                        skyMoonLight->UpdateLightSource(mWorld->skyTime);
-                    }
-                }
-                if(optionsMenuPos == 1)
-                {
-                    if (mWorld->mainOptions.horizontalViewDistance != 3)
-                    {
-                        mWorld->mainOptions.horizontalViewDistance += 1;
-                        mSoundMgr->PlayMenuSound();
-                        mWorld->playerZoneSize = Vector3(CHUNK_SIZE*mWorld->mainOptions.horizontalViewDistance,CHUNK_SIZE*mWorld->mainOptions.verticalViewDistance,CHUNK_SIZE*mWorld->mainOptions.horizontalViewDistance);
-                        mWorld->UpdatePlayerZoneBB(fppCam->m_vPosition);
-                        fppCam->needUpdate = true;
-                    }
-                }
-                if(optionsMenuPos == 8)
-                {
-                    if (mWorld->mainOptions.verticalViewDistance != 3)
-                    {
-                        mWorld->mainOptions.verticalViewDistance += 1;
-                        mSoundMgr->PlayMenuSound();
-                        mWorld->playerZoneSize = Vector3(CHUNK_SIZE*mWorld->mainOptions.horizontalViewDistance,CHUNK_SIZE*mWorld->mainOptions.verticalViewDistance,CHUNK_SIZE*mWorld->mainOptions.horizontalViewDistance);
-                        mWorld->UpdatePlayerZoneBB(fppCam->m_vPosition);
-                        fppCam->needUpdate = true;
-                    }
-                }
-                if(optionsMenuPos == 9)
-                {
-                    mWorld->mainOptions.difficult += 1;
-                    mSoundMgr->PlayMenuSound();
+                optionsMenuPos = PauseOptionsGridMove(optionsMenuPos, 1, 0);
+                mSoundMgr->PlayMenuSound();
+            }
 
-                    if(mWorld->mainOptions.difficult > 3)
-                    {
-                        mWorld->mainOptions.difficult = 3;
-                    }
+            if(mSystemMgr->KeyPressed(PSP_CTRL_LTRIGGER))
+            {
+                if(PauseOptionsIsSlider(optionsMenuPos))
+                {
+                    if(AdjustPauseOptionsSlider(mWorld, fppCam, skyLight, skyMoonLight, optionsMenuPos, -1))
+                        mSoundMgr->PlayMenuSound();
                 }
             }
 
-            if(mSystemMgr->KeyPressed(PSP_CTRL_LEFT))
+            if(mSystemMgr->KeyPressed(PSP_CTRL_RTRIGGER))
             {
-                if(optionsMenuPos == 0)
+                if(PauseOptionsIsSlider(optionsMenuPos))
                 {
-                    if (mWorld->mainOptions.fov >= 45)
-                    {
-                        mWorld->mainOptions.fov -= 5;
+                    if(AdjustPauseOptionsSlider(mWorld, fppCam, skyLight, skyMoonLight, optionsMenuPos, 1))
                         mSoundMgr->PlayMenuSound();
-                        mRender->fovv = mWorld->mainOptions.fov;
-                        RenderManager::InstancePtr()->SetPerspective(0, 480.0f / 272.0f, 0.18f, 1000.f);
-                        skyLight->UpdateLightSource(mWorld->skyTime);
-                        skyMoonLight->UpdateLightSource(mWorld->skyTime);
-                    }
-                }
-                if(optionsMenuPos == 1)
-                {
-                    if (mWorld->mainOptions.horizontalViewDistance != 1)
-                    {
-                        mWorld->mainOptions.horizontalViewDistance -= 1;
-                        mSoundMgr->PlayMenuSound();
-                        mWorld->playerZoneSize = Vector3(CHUNK_SIZE*mWorld->mainOptions.horizontalViewDistance,CHUNK_SIZE*mWorld->mainOptions.verticalViewDistance,CHUNK_SIZE*mWorld->mainOptions.horizontalViewDistance);
-                        fppCam->needUpdate = true;
-                    }
-                }
-                if(optionsMenuPos == 8)
-                {
-                    if (mWorld->mainOptions.verticalViewDistance != 1)
-                    {
-                        mWorld->mainOptions.verticalViewDistance -= 1;
-                        mSoundMgr->PlayMenuSound();
-                        mWorld->playerZoneSize = Vector3(CHUNK_SIZE*mWorld->mainOptions.horizontalViewDistance,CHUNK_SIZE*mWorld->mainOptions.verticalViewDistance,CHUNK_SIZE*mWorld->mainOptions.horizontalViewDistance);
-                        fppCam->needUpdate = true;
-                    }
-                }
-                if(optionsMenuPos == 9)
-                {
-                    mWorld->mainOptions.difficult -= 1;
-                    mSoundMgr->PlayMenuSound();
-
-                    if(mWorld->mainOptions.difficult < 0)
-                    {
-                        mWorld->mainOptions.difficult = 0;
-                    }
                 }
             }
 
@@ -8792,9 +9597,13 @@ void StatePlay::HandleEvents(StateManager* sManager)
                 fppCam->RotateView(0,0,90,0);
                 fppCam->upDownAngle = 0;
                 fppCam->horAngle = 270;
+                fppCam->RebuildView();
                 mWorld->HP = 20;
                 mWorld->HG = 20;
                 mWorld->OS = 10;
+
+                bodyYaw = 270.0f;      // the respawn teleport moved the camera; snap the model with it
+                headYawOffset = 0.0f;
 
                 invEn = false;
                 craft3xEn = false;
@@ -8823,8 +9632,259 @@ void StatePlay::HandleEvents(StateManager* sManager)
 }
 
 
+#if MC_AUTO_WALK
+// Development-only auto-walk. Defined further down, beside StatePlay::keyHold -- the one place the
+// game turns the analog into a direction -- but ticked from Update, which is above it in this file.
+static void AutoWalkTick(float dt);
+// Stuck check, likewise: it needs the player's feet, which Update has and keyHold does not.
+static void AutoWalkProgress(float dt, float x, float y, float z, float vx, float vz, float hp);
+#endif
+
+#if MC_AUTO_FLY
+// Development-only flight path -- see MC_AUTO_FLY in DebugConfig.h.
+namespace autofly
+{
+    const float kSettleSecs = 8.0f;    // let the spawn area finish meshing first
+    const float kFlySecs    = 10.0f;   // 112 blocks, seven chunks, per leg at sprint-fly speed
+    // Then stop and hover. A hole that is still there after this is the kind the player reports: the
+    // one that does not fill when they stand still. The hole audit (CraftWorld::AuditHoles) fires
+    // 2.5 s into the hover and names it.
+    const float kHoverSecs  = 8.0f;
+    const float kLegSecs    = kFlySecs + kHoverSecs;
+    const float kHeight     = 72.0f;   // a few blocks over typical ground (~60), so the hole is on screen
+    const float kFlyPitch   = -0.55f;  // look at the ground ahead, not the sky
+    const float kHoverPitch = -0.90f;  // look down at the hole when they stop
+    float t = 0.0f;
+    float logTimer = 0.0f;
+}
+
+static void AutoFlyPlace(float dt, Vector3& pos, Camera* cam)
+{
+    autofly::t += dt;
+    if(autofly::t < autofly::kSettleSecs)
+        return;
+    const float legT = autofly::t - autofly::kSettleSecs;
+    const int leg = (int)(legT / autofly::kLegSecs);
+    const bool hovering = (legT - leg * autofly::kLegSecs) >= autofly::kFlySecs;
+    // horAngle 0 looks along +x, 270 along -z (Camera::RebuildView).
+    const bool east = (leg & 1) == 0;
+    const float step = hovering ? 0.0f : MC_AUTO_FLY_SPEED * dt;
+    if(east)
+        pos.x += step;
+    else
+        pos.z -= step;
+    pos.y = autofly::kHeight;
+    cam->horAngle = east ? 0.0f : 270.0f;
+    cam->upDownAngle = hovering ? autofly::kHoverPitch : autofly::kFlyPitch;
+
+    autofly::logTimer += dt;
+    if(autofly::logTimer >= 1.0f)
+    {
+        autofly::logTimer -= 1.0f;
+        Aurora::Utils::Logger::Instance()->LogMessage("fly t=%.1f pos=%.1f,%.1f,%.1f leg=%d %s\n",
+            autofly::t, pos.x, pos.y, pos.z, leg, hovering ? "hover" : "fly");
+    }
+}
+#endif
+
 void StatePlay::Update(StateManager* sManager)
 {
+    canFly = false;
+    mSoundMgr->AudioSync();
+    mChat.Update(dt);
+
+#if MC_NETHER_PROBE
+    // TEMPORARY diagnostic: log what the pad actually delivers, so a control problem can be told
+    // apart from a binding one. Logs only while something is being pressed.
+    {
+        static float inProbeT = 0.0f;
+        inProbeT += dt;
+        if(inProbeT > 0.4f)
+        {
+            inProbeT = 0.0f;
+            float ax = mSystemMgr->GetAnalogX();
+            float ay = mSystemMgr->GetAnalogY();
+            bool up = mSystemMgr->KeyHold(PSP_CTRL_UP);
+            bool dn = mSystemMgr->KeyHold(PSP_CTRL_DOWN);
+            bool lf = mSystemMgr->KeyHold(PSP_CTRL_LEFT);
+            bool rt = mSystemMgr->KeyHold(PSP_CTRL_RIGHT);
+            if(ax > 0.05f || ax < -0.05f || ay > 0.05f || ay < -0.05f || up || dn || lf || rt)
+                Aurora::Utils::Logger::Instance()->LogMessage("[inputprobe] ax=%.3f ay=%.3f dpad=%d%d%d%d\n", ax, ay, up, dn, lf, rt);
+        }
+    }
+#endif
+
+    // The debug stick's menu. It takes the whole update while it is up: the world must not advance
+    // a single tick behind an open debug menu, or the mob being tested walks away while you are
+    // deciding what to do to it. This is a hold of its own rather than a menuState value, because
+    // the pause menu and the inventory panels are one big else-if chain and sliding in between them
+    // would mean touching every one of their conditions.
+    if(debugMenu.IsOpen() == true)
+        debugMenu.Update(dt, mSystemMgr, mSoundMgr);
+
+    ApplyDebugMenuResult();
+
+    if(debugMenu.IsOpen() == true)
+        return;
+
+#if MC_PERF_PROBE
+    // Probe build only: keep the benchmark clock PerfProbeSelfTest left in the world flipping, so the
+    // per-second perf lines below describe a world with a running clock rather than an idle one.
+    PerfProbeDriveClock(dt);
+#endif
+
+#if MC_AUTO_WALK
+    // Development-only auto-walk clock and stuck check. Once a frame, here rather than in keyHold --
+    // see AutoWalkTick. This is also the only place holding both the clock and the player's feet, which
+    // is what the stuck check needs.
+    AutoWalkTick(dt);
+    AutoWalkProgress(dt, playerPosition.x, playerPosition.y, playerPosition.z,
+                     fppCam ? fppCam->m_vVelocity.x : 0.0f, fppCam ? fppCam->m_vVelocity.z : 0.0f,
+                     mWorld ? mWorld->HP : 0.0f);
+    // The input tables, because nothing else in a probe build ever sets them.
+    //
+    // InputHelper::Init() -- the only thing that fills connections[] with the real bindings -- has
+    // exactly one caller, StateMenu. MC_PERF_PROBE and MC_NETHER_PROBE both boot straight into a world
+    // and never pass through the menu, so connections[] keeps its default-constructed button = 0 for
+    // every action, getButtonToAction() returns 0, and the movement code asks keyHold(0) -- the d-pad --
+    // instead of the analog entries 11-14 this probe injects into. The probe was therefore never being
+    // asked for a direction at all, and the player never moved no matter what it returned.
+    //
+    // Measured on the overworld probe before this: `asked=0/0/0/0` and `vel=0.000,0.000` for 95
+    // seconds, with the position frozen to the digit at spawn. A stationary player produces no meshing
+    // after the world-entry fill, which is why every earlier "walking" run looked like a short
+    // streaming window followed by idle -- that window was the fill, not the walk.
+    //
+    // Init() only writes the default tables, so calling it here is the same state StateMenu would have
+    // left behind before Load() applied the player's own bindings. Load() is deliberately not called:
+    // the probe wants the defaults, and it avoids depending on a Config/input.cf that may not exist.
+    static bool sInputTablesReady = false;
+    if(!sInputTablesReady)
+    {
+        sInputTablesReady = true;
+        InputHelper::Instance()->Init();
+    }
+    // The game's own step-up assist, so walking into a one-block ledge is not read as a blocked path.
+    // A player option, set rather than saved, because this is a probe build.
+    if(mWorld)
+        mWorld->mainOptions.autoJump = true;
+    // Keep the probe alive. The movement block in HandleEvents is guarded by `mWorld->HP > 0`, so a
+    // death ends the walk silently: the clock keeps ticking and the log keeps printing, but nothing is
+    // asked for any more and the player stands still for the rest of the session. Measured on the run
+    // before this one: the walk travelled 224.7 blocks in 72 s and then froze for the remaining 48 with
+    // asked=0/0/0/0 -- a death, not a blocked path. The death is logged once, because it is a fact
+    // about the run, and then undone so the remaining seconds still measure walking.
+    if(mWorld && mWorld->HP <= 0.0f)
+    {
+        static bool sLoggedWalkDeath = false;
+        if(!sLoggedWalkDeath)
+        {
+            sLoggedWalkDeath = true;
+            Aurora::Utils::Logger::Instance()->LogMessage(
+                "walk: player died -- reviving so the walk can cover the full session\n");
+        }
+        mWorld->HP = 20.0f;
+    }
+#endif
+
+    // Chat-button double-tap bookkeeping. A press that never became a double tap opens chat here,
+    // one window after it was pressed; the menu checks are repeated because the player has had that
+    // window to open something, and a chat open behind an inventory would strand the keyboard.
+    if(chatTapTimer > 0.0f)
+    {
+        chatTapTimer -= dt;
+        if(chatTapTimer <= 0.0f)
+        {
+            chatTapTimer = 0.0f;
+            if(chatTapPending)
+            {
+                chatTapPending = false;
+                if(menuState == 0 && invEn == false && craft3xEn == false && chestEn == false && furnaceEn == false && sleepTime == 0.0f)
+                {
+                    mChat.TryOpen(mSystemMgr, mWorld);
+                }
+            }
+        }
+    }
+
+    // Bow draw and release. HandleEvents started the draw on the press; here it is accumulated while
+    // the button is still held and the shot goes off the frame it is not. The panels and the sleep
+    // fade both take the button for other things, so a draw is abandoned rather than fired if one of
+    // them came up mid-draw.
+    if(bowCharging == true)
+    {
+        bool canFire = (mWorld != NULL && fppCam != NULL && menuState == 0 && sleepTime == 0.0f &&
+                        invEn == false && craft3xEn == false && chestEn == false && furnaceEn == false);
+        if(canFire == false)
+        {
+            bowCharging = false;
+            bowCharge = 0.0f;
+        }
+        else if(keyHold(InputHelper::Instance()->getButtonToAction(14)) == true)
+        {
+            bowCharge += dt;
+            if(bowCharge > 1.0f)
+                bowCharge = 1.0f;
+        }
+        else
+        {
+            bowCharging = false;
+            FireBowArrow();
+            bowCharge = 0.0f;
+        }
+    }
+
+    // Head and body. The head is wherever the camera points -- Java's rotationYawHead is rotationYaw
+    // for the local player -- and the body is dragged after it: 0.3 of the remaining angle per 20 Hz
+    // game tick, which is what EntityLivingBase.updateDistance() applies. Written as a decay rather
+    // than a fixed step so it does not depend on the frame rate, and then the head is clamped to
+    // BODY_MAX_HEAD_TURN away from the body, so a big flick takes the body round with it instead of
+    // leaving the head cranked right round on a stationary torso.
+    if(mWorld != NULL && fppCam != NULL)
+    {
+        float headYaw = fppCam->horAngle;
+        float diff = WrapAngle180(headYaw - bodyYaw);
+        bodyYaw += diff * (1.0f - powf(0.7f, dt * 20.0f));
+
+        headYawOffset = WrapAngle180(headYaw - bodyYaw);
+        if(headYawOffset > BODY_MAX_HEAD_TURN)
+            headYawOffset = BODY_MAX_HEAD_TURN;
+        if(headYawOffset < -BODY_MAX_HEAD_TURN)
+            headYawOffset = -BODY_MAX_HEAD_TURN;
+
+        bodyYaw = WrapAngle360(headYaw - headYawOffset);
+    }
+
+    if(menuState != 0)
+        return;
+
+    if(pendingBreakStage == 1 && pendingCrackId < 0 && mWorld != NULL)
+    {
+        int x = (int)pendingCrackX;
+        int y = (int)pendingCrackY;
+        int z = (int)pendingCrackZ;
+        mWorld->WakeBuriedAround(x, y, z);
+        if(pendingBreakChunk != -1)
+        {
+            if(pendingBreakWasLight)
+                mWorld->RemoveLigtSourceAtPosition(x, y, z, Torch::getID());
+            mWorld->RebuildFullMeshChunk(pendingBreakChunk);
+            mWorld->rebuildNearestChunks(pendingBreakChunk, Vector3((float)x, (float)y, (float)z));
+        }
+        pendingBreakStage = 2;
+    }
+    else if(pendingBreakStage == 2 && mWorld != NULL)
+    {
+        pendingBreakStage = 0;
+        int x = (int)pendingCrackX;
+        int y = (int)pendingCrackY;
+        int z = (int)pendingCrackZ;
+        mWorld->CheckForTorchSupport(x, y, z, mWorld->GetBlock(x, y, z));
+        mWorld->CheckForLadderSupport(x, y, z);
+        mWorld->DestroyAroundTrapdoors(x, y, z);
+        mWorld->DestroyAroundItemFrames(x, y, z);
+    }
+
     if(mWorld->armorAm[0] <= 0)
     {
         mWorld->armorId[0] = 324;
@@ -8851,7 +9911,7 @@ void StatePlay::Update(StateManager* sManager)
     }
     mWorld->AP = mWorld->FetchArmorPoints(mWorld->armorId[3],mWorld->armorId[2],mWorld->armorId[1],mWorld->armorId[0]);
 
-    if(menuState == 0)//game state
+    if(WorldRunning())//game state
     {
         cubeLight = mWorld->BlockFinalLight(playerPosition.x,playerPosition.y-1,playerPosition.z) * 1.2f;
         if(cubeLight > 1.0f)
@@ -8959,10 +10019,8 @@ void StatePlay::Update(StateManager* sManager)
                             float particle_y = (*it)->GetY()+(rand()%(11)/10.0f);
                             float particle_z = (*it)->GetZ()+(rand()%(11)/10.0f);
 
-                            Particle* Smoke = new Particle(mWorld, "black smoke",Vector3(particle_x,particle_y,particle_z));
-                            Particle* Flame = new Particle(mWorld, "flame",Vector3(particle_x,particle_y,particle_z));
-                            mParticles.push_back(Smoke);
-                            mParticles.push_back(Flame);
+                            Particle::Spawn(mWorld, "black smoke",Vector3(particle_x,particle_y,particle_z));
+                            Particle::Spawn(mWorld, "flame",Vector3(particle_x,particle_y,particle_z));
                          }
                     }
                     if((*it)->particleDelay2 <= 0)
@@ -8975,10 +10033,8 @@ void StatePlay::Update(StateManager* sManager)
                             float particle_y = (*it)->GetY()+(rand()%(11)/10.0f);
                             float particle_z = (*it)->GetZ()+(rand()%(11)/10.0f);
 
-                            Particle* Smoke = new Particle(mWorld, "black smoke",Vector3(particle_x,particle_y,particle_z));
-                            Particle* Flame = new Particle(mWorld, "flame",Vector3(particle_x,particle_y,particle_z));
-                            mParticles.push_back(Smoke);
-                            mParticles.push_back(Flame);
+                            Particle::Spawn(mWorld, "black smoke",Vector3(particle_x,particle_y,particle_z));
+                            Particle::Spawn(mWorld, "flame",Vector3(particle_x,particle_y,particle_z));
                          }
                     }
 
@@ -9017,7 +10073,8 @@ void StatePlay::Update(StateManager* sManager)
 
                                     float spawn_y = mWorld->groundHeight(spawn_x+0.5f,(*it)->GetY()+1,spawn_z+0.5f)+1.2f;
 
-                                    mWorld->SpawnZombie((*it)->GetX()-1+rand()%3,(*it)->GetY()+1,(*it)->GetZ()-1+rand()%3);
+                                    if(mWorld->CanSpawnHostile())
+                                        mWorld->SpawnZombie((*it)->GetX()-1+rand()%3,(*it)->GetY()+1,(*it)->GetZ()-1+rand()%3);
                                 }
                             }
                         }
@@ -9043,6 +10100,9 @@ void StatePlay::Update(StateManager* sManager)
             fppCam->RotateView(0,0,90,0);
             fppCam->upDownAngle = 0;
             fppCam->horAngle = 270;
+                fppCam->RebuildView();
+            bodyYaw = 270.0f;      // snap the model with it: this is a teleport, not a turn
+            headYawOffset = 0.0f;
 
             sleepTime = 0.0f;
             sleepMessageType = 0;
@@ -9144,19 +10204,34 @@ void StatePlay::Update(StateManager* sManager)
             Vector3 testPos ;
 
             // collider
-            BoundingBox collider = mWorld->blockTypes[mWorld->GetBlock(testPos.x,testPos.y,testPos.z)].collideBox;
+            block_t aimBlock = mWorld->GetBlock(testPos.x,testPos.y,testPos.z);
+            BoundingBox collider = mWorld->GetBlockSelectionBox(testPos.x,testPos.y,testPos.z,aimBlock);
             BoundingBox testBox = BoundingBox(testPos.x+collider.min.x, testPos.y+collider.min.y, testPos.z+collider.min.z, testPos.x+collider.max.x, testPos.y+collider.max.y, testPos.z+collider.max.z);
 
             //moving slowly to the target
-            for(float i = 0; i < 5.25f; i+=0.1f)
+            // The aim itself. This loop is the only place the pick is decided -- cubePos feeds the
+            // outline drawn here *and* the placement site at the top of this file -- so it is exact in
+            // both halves: the loop visits every cell the look crosses, one step per cell wall
+            // (CraftWorld::NextCellDistance), and the test is a clip against that cell's selection box
+            // rather than "is this point inside it". The shape that needs both is a wire's 1 px plate:
+            // thinner than a fixed step, so a march can step over the cell it lies in, and thin enough
+            // that the look can cross it between two samples. The box is the *selection* shape and not
+            // the collision shape, so the outline is drawn on the surface the player can see.
+            Ray aimRay(fppCam->m_vPosition, rayDir);
+
+            for(float i = 0.0f; i < 5.25f; i = CraftWorld::NextCellDistance(fppCam->m_vPosition, rayDir, i))
             {
                 testPos = fppCam->m_vPosition + (rayDir * i);
 
-                collider = mWorld->blockTypes[mWorld->GetBlock(testPos.x,testPos.y,testPos.z)].collideBox;
+                aimBlock = mWorld->GetBlock(testPos.x,testPos.y,testPos.z);
+                collider = mWorld->GetBlockSelectionBox(testPos.x,testPos.y,testPos.z,aimBlock);
                 testBox = BoundingBox(floorf(testPos.x)+0.5f+collider.min.x, floorf(testPos.y)+0.5f+collider.min.y, floorf(testPos.z)+0.5f+collider.min.z, floorf(testPos.x)+0.5f+collider.max.x, floorf(testPos.y)+0.5f+collider.max.y, floorf(testPos.z)+0.5f+collider.max.z);
 
                 //check if we touching something
-                if(mWorld->BlockEditable(testPos.x,testPos.y,testPos.z) && testBox.contains(testPos) == true)
+                float aimDist = -1.0f;
+                aimRay.hasIntersected(testBox, aimDist);
+
+                if(mWorld->BlockEditable(testPos.x,testPos.y,testPos.z) && aimDist != -1.0f)
                 {
                     //if yes then show pick cube
                     cubePos.x = (int)testPos.x + 0.5f;
@@ -9174,7 +10249,7 @@ void StatePlay::Update(StateManager* sManager)
         //RenderManager::InstancePtr()
 
         //update player position
-        if(dt < 0.1f)
+        if(dt <= 0.1f)
         {
             /// player timers
             musicTime -= dt;
@@ -9198,21 +10273,38 @@ void StatePlay::Update(StateManager* sManager)
                 if (tickChunk >= 10.0f)
                 {
                     chunkId = mWorld->getChunkId(playerPosition);
-                    mWorld->UpdateChunkBlocks(chunkId);
-                    mWorld->RebuildFullMeshChunk(chunkId);
+                    if(chunkId >= 0 && chunkId < (int)mWorld->mChunks.size() && mWorld->mChunks[chunkId])
+                    {
+                        unsigned int beforeHash = mWorld->HashSectionBlocks(mWorld->mChunks[chunkId]->chunkStartX, mWorld->mChunks[chunkId]->chunkStartY, mWorld->mChunks[chunkId]->chunkStartZ);
+                        mWorld->UpdateChunkBlocks(chunkId);
+                        unsigned int afterHash = mWorld->HashSectionBlocks(mWorld->mChunks[chunkId]->chunkStartX, mWorld->mChunks[chunkId]->chunkStartY, mWorld->mChunks[chunkId]->chunkStartZ);
+                        if(beforeHash != afterHash)
+                            mWorld->mChunks[chunkId]->needUpdate = true;
+                    }
                     tickChunk -= 10.0f;
                 }
 				//Block Physics
 				if (tickChunk >= 0.5f)
                 {
-                    chunkId = mWorld->getChunkId(playerPosition);
-                    mWorld->UpdateBlockPhysics(chunkId);
-                    mWorld->RebuildFullMeshChunk(chunkId);
+                    if(CHUNK_SIZE > 0)
+                    {
+                        int sx = ChunkFloorDiv((int)playerPosition.x, CHUNK_SIZE) * CHUNK_SIZE;
+                        int sz = ChunkFloorDiv((int)playerPosition.z, CHUNK_SIZE) * CHUNK_SIZE;
+                        int sy = ((int)playerPosition.y / CHUNK_SIZE) * CHUNK_SIZE;
+                        mWorld->UpdateBlockPhysicsBox(sx, sy, sz);
+                    }
                     tickChunk -= 0.5f;
                 }
             }
 
             {
+                // The passive hunger tick. This is NOT Java's model -- Java has no timed hunger drain
+                // at all; its only passive cost is healing (6 exhaustion per hit point, i.e. 1.5
+                // hunger, at food 18 or more) and this port does not charge for healing. The tick
+                // stands in for that and for the fact that a session is long, which is why it is left
+                // alone here: 25% chance of a point every 75 s while the bar is above 16, else a
+                // certain one. Movement, jumping, hits and blows no longer touch HG directly -- they
+                // go through CraftWorld::AddExhaustion, where the per-metre rates live.
                 tickHunger += dt;
                 if(tickHunger >= 75)
                 {
@@ -9326,13 +10418,16 @@ void StatePlay::Update(StateManager* sManager)
                 if(mWorld->PlayerInWater(headPosition))
                 {
                     //change gravity
-                    if (playerVelocity.y > -3)
+                    if(!canFly)
                     {
-                        playerVelocity.y += (GRAVITY/3.0f) * dt;
-                    }
-                    else
-                    {
-                        playerVelocity.y = -3;
+                        if (playerVelocity.y > -3)
+                        {
+                            playerVelocity.y += (GRAVITY/3.0f) * dt;
+                        }
+                        else
+                        {
+                            playerVelocity.y = -3;
+                        }
                     }
                     /*if(headInWater == false)
                     {
@@ -9359,7 +10454,10 @@ void StatePlay::Update(StateManager* sManager)
                 if(mWorld->PlayerInLava(headPosition))
                 {
                     //change gravity
-                    playerVelocity.y += (GRAVITY/3.0f) * dt;
+                    if(!canFly)
+                    {
+                        playerVelocity.y += (GRAVITY/3.0f) * dt;
+                    }
                     headInLava = true;
                 }
                 else
@@ -9367,12 +10465,12 @@ void StatePlay::Update(StateManager* sManager)
                     headInLava = false;
                 }
 
-                if(!headInLava && !headInWater)
+                if(!canFly && !headInLava && !headInWater)
                 {
                     playerVelocity.y += GRAVITY * 3.4f * dt;
                 }
 
-                if(mWorld->PlayerCollisionWithLadder(playerPosition) && moving == false)
+                if(!canFly && mWorld->PlayerCollisionWithLadder(playerPosition) && moving == false)
                 {
                     playerVelocity.y = -CLIMBVELOCITY;
                 }
@@ -9383,6 +10481,8 @@ void StatePlay::Update(StateManager* sManager)
                     touchingCactus = true;
                 }
 
+                if(!canFly)
+                {
                 //check if we will stand on ground
                 Vector3 futureFootPosition = Vector3(footPosition.x,footPosition.y+playerVelocity.y*dt,footPosition.z);
                 if(mWorld->SolidAtPointForPlayer(futureFootPosition))
@@ -9508,7 +10608,9 @@ void StatePlay::Update(StateManager* sManager)
                             walkingOnGround = false;
 
                             mWorld->mainStatistics.jumps += 1;
-                            mWorld->HG -= (1.0f)/55.0f;
+                            // Java's EntityPlayer.jump(): a sprint-jump costs four times a standing
+                            // one, which is what stops bunny-hopping from being free travel.
+                            mWorld->AddExhaustion(sprinting ? EXHAUST_SPRINT_JUMP : EXHAUST_JUMP);
                         }
                         jumping = false;
                     }
@@ -9524,6 +10626,12 @@ void StatePlay::Update(StateManager* sManager)
                 {
                     int blockIn = (int)(futureHeadPosition.y);
                     playerPosition.y = (float)(blockIn-0.2f); //0.15
+                    playerVelocity.y = 0.0f;
+                }
+                }
+                else
+                {
+                    walkingOnGround = mWorld->SolidAtPointForPlayer(footPosition);
                     playerVelocity.y = 0.0f;
                 }
             }
@@ -9572,7 +10680,9 @@ void StatePlay::Update(StateManager* sManager)
                 if(mWorld->kickedBy == 2) // creeper or TNT
                 {
                     walkingOnGround = false;
-                    playerVelocity.y = 1.2f * JUMPVELOCITY;
+                    // A blast supplies its own distance-scaled launch; a creeper kick does not and keeps
+                    // the original flat hop.
+                    playerVelocity.y = (mWorld->kickedVelY > 0.0f) ? mWorld->kickedVelY : 1.2f * JUMPVELOCITY;
                     mWorld->kickedTimer = 0.6f;
                     fppCam->needUpdate = true;
 
@@ -9612,6 +10722,9 @@ void StatePlay::Update(StateManager* sManager)
                 mWorld->kickedStart = false;
                 mWorld->kickedBy = 0;
                 mWorld->kickedDamage = 0;
+                // kickedVelY is consumed here; kickedPush has to survive until the slide below, so it
+                // is cleared with kickedAngle once the timer runs out.
+                mWorld->kickedVelY = 0.0f;
             }
 
             //update position
@@ -9640,7 +10753,7 @@ void StatePlay::Update(StateManager* sManager)
                 }
                 else
                 {
-                    if(mWorld->mainOptions.autoJump)
+                    if(mWorld->mainOptions.autoJump && !sneaking)
                     {
                         if(jumping == false)
                         {
@@ -9654,7 +10767,7 @@ void StatePlay::Update(StateManager* sManager)
                 }
                 else
                 {
-                    if(mWorld->mainOptions.autoJump)
+                    if(mWorld->mainOptions.autoJump && !sneaking)
                     {
                         if(jumping == false)
                         {
@@ -9667,37 +10780,61 @@ void StatePlay::Update(StateManager* sManager)
             if(mWorld->kickedTimer > 0.0f)
             {
                 mWorld->kickedTimer -= dt;
-                TryToMove(Vector3(sinf(mWorld->kickedAngle+PI)*0.1,0,cosf(mWorld->kickedAngle+PI)*0.1),dt);
+                // A blast's sideways throw scales with how close it was; mob kicks keep the flat 0.1.
+                float kickPush = (mWorld->kickedPush > 0.0f) ? mWorld->kickedPush : 0.1f;
+                TryToMove(Vector3(sinf(mWorld->kickedAngle+PI)*kickPush,0,cosf(mWorld->kickedAngle+PI)*kickPush),dt);
             }
             else
             {
                 mWorld->kickedTimer = 0.0f;
                 mWorld->kickedAngle = 0.0f;
+                mWorld->kickedPush = 0.0f;
 
                 fppCam->needUpdate = true;
             }
 
+            // Portal travel runs before the camera is placed: a swap moves the player, and the camera
+            // has to follow it in the same frame rather than lag a frame behind.
+            mWorld->UpdatePortalTravel(dt);
+            if(mWorld->travelledThisFrame)
+            {
+                playerPosition = newPlayerPos = oldPlayerPos = mWorld->playerPos;
+                mWorld->travelledThisFrame = false;
+            }
+
+#if MC_AUTO_FLY
+            AutoFlyPlace(dt, playerPosition, fppCam);
+            mWorld->HP = 20;
+            // The menu's default (StateMenu); a probe never passes through it and the world's own
+            // default of 1 leaves the ground outside the mesh zone at flying height.
+            mWorld->mainOptions.verticalViewDistance = 2;
+#endif
             //update camera
-            Vector3 delta = fppCam->m_vView - fppCam->m_vPosition;
             fppCam->m_vPosition = playerPosition;
-            fppCam->m_vView = fppCam->m_vPosition + delta;
+            // The portal's wobble. Applied here rather than inside the camera update because
+            // RebuildView rebuilds the up vector from scratch every frame and would drop the roll.
+            fppCam->rollAngle = mWorld->GetPortalWobbleAngle();
+            fppCam->RebuildView();
             fppCam->m_vVelocity = Vector3(0,0,0);
             fppCam->needUpdate = true;
 
             mWorld->UpdateWorldTime(dt);
             skyLight->UpdateLightSource(mWorld->skyTime);
-            mWorld->UpdateWorldProcesses(dt);
         }
 
-        if(fppCam->needUpdate)
-        {
-            mWorld->UpdatePlayerZoneBB(fppCam->m_vPosition);
-        }
+        mWorld->UpdatePlayerZoneBB(playerPosition);
+        mWorld->UpdateWorldProcesses(dt > 0.1f ? 0.1f : dt);
 
         //walking sound & walking animation
-        if(isWalking && walkingOnGround && (!footInWater || !footInLava))
+        if(isWalking && walkingOnGround && !canFly && (!footInWater || !footInLava))
         {
             float walkSoundSpeed = dt;
+            // Footsteps are paced by the same clock as the legs, so a sprint takes steps 1.3x sooner.
+            // Java's step sounds are distance-triggered for exactly this reason.
+            if(sprinting)
+            {
+                walkSoundSpeed *= SPRINT_SPEED_MULT;
+            }
             if(footInLava || footInWater)
             {
                 walkSoundSpeed *= 0.7f;
@@ -9713,57 +10850,81 @@ void StatePlay::Update(StateManager* sManager)
 				mSoundMgr->PlayWalkSound(soundBlockType);
 				walkSoundAccu = 0.0f;
 			}
-
-			float animSpeed = 2.621*PI*dt;
-			if(footInLava || footInWater)
-            {
-                animSpeed *= 0.7f;
-            }
-			if(headInLava || headInWater)
-            {
-                animSpeed *= 0.5f;
-            }
-
-            if(bobType == 0)
-            {
-                if (bobCycle < PI)
-                {
-                    bobCycle += animSpeed;
-                }
-                else
-                {
-                    bobType = 1;
-                }
-            }
-            else
-            {
-                if (bobCycle > 0)
-                {
-                    bobCycle -= animSpeed;
-                }
-                else
-                {
-                    bobType = 0;
-                }
-            }
-
-            float bobSine = sinf(bobCycle/2.0f -PI/2.0f);
-            float bobCose = cosf(bobCycle - (PI/2.0f) + PI)/3.0f;
-            fppCam->m_vOffset = Vector3(0,0*bobSine+-0.04f,-0.02f);
 		}
 		else
 		{
 			walkSoundAccu = 0.45f;
-            if(bobCycle > PI/2.0f)
-            {
-                bobCycle -= (bobCycle-(PI/2.0f))/3.0f;
-            }
-            else
-            {
-                bobCycle += ((PI/2.0f) - bobCycle)/3.0f;
-            }
-            fppCam->m_vOffset = Vector3(0.0f,0.0,0.0f);
 		}
+        {
+            float dx = playerPosition.x - oldPlayerPos.x;
+            float dz = playerPosition.z - oldPlayerPos.z;
+            float step = sqrtf(dx * dx + dz * dz);
+            oldPlayerPos = playerPosition;
+
+            // Hunger's movement cost, Java's EntityPlayer.addMovementStat: exhaustion is charged per
+            // *metre* actually travelled, so a sprinted metre (0.1) is ten walked ones (0.01) and the
+            // bar empties about ten times faster for the same distance -- which is the difference the
+            // old per-second subtraction could not express. Charged here, once per frame, because this
+            // is the only place that knows the distance that survived collision and whether the player
+            // was sprinting, wading or airborne. Airborne horizontal travel is deliberately free, as
+            // in Java, unless the player is in water, which is checked first for the same reason.
+            if(step > 0.0001f && !canFly)
+            {
+                if(footInWater || headInWater)
+                    mWorld->AddExhaustion(step * EXHAUST_SWIM);
+                else if(walkingOnGround)
+                    mWorld->AddExhaustion(step * (sprinting ? EXHAUST_SPRINT : EXHAUST_WALK));
+            }
+
+            // The limb animation is shared between ground and air on purpose: it is driven by
+            // horizontal distance, not by contact, so a jump, a fall or creative flight keeps the
+            // limbs moving exactly as they would on the ground. Java does the same -- limbSwing
+            // advances with horizontal speed in EntityLivingBase, and it never consults the ground --
+            // and it is what makes a jump read as part of a run instead of a pause in it, and what
+            // animates a flying player at all. Only the footstep sound stays ground-gated. There is
+            // no canFly test here in either play state: survival cannot fly, and creative wants the
+            // animation precisely while it is flying.
+            float target = isWalking ? (sneaking ? 0.35f : 1.0f) : 0.0f;
+            float k = 8.0f * dt;
+            if(k > 1.0f)
+                k = 1.0f;
+            bobWalk += (target - bobWalk) * k;
+
+            // The camera bob is a *separate* quantity in Java, and a fussier one. EntityPlayerSP
+            // .onLivingUpdate builds cameraYaw from the *per-tick horizontal distance travelled*,
+            // capped at 0.1 and forced to zero whenever the player is not on the ground:
+            //
+            //     float f2 = sqrt(dx*dx + dz*dz);
+            //     if (f2 > 0.1F) f2 = 0.1F;
+            //     if (!this.onGround || this.getHealth() <= 0.0F) f2 = 0.0F;
+            //     this.cameraYaw += (f2 - this.cameraYaw) * 0.4F;
+            //
+            // Reproduced with Java's numbers rather than reused from bobWalk, because all three of its
+            // properties matter and none of them survive aliasing it to the limb amplitude: it is
+            // proportional to speed (so sneaking bobs about 60% as far as walking), it saturates at
+            // walking pace (so sprinting does not bob harder, as in Java), and it stops dead in the
+            // air. ApplyWalkBob works in tenths of a block, so the 10x is just the unit change.
+            // Java's 0.4-per-tick ease is 8 per second, which is the k above.
+            float camSpeed = (dt > 0.0f) ? (step / (20.0f * dt)) : 0.0f;
+            if(camSpeed > 0.1f)
+                camSpeed = 0.1f;
+            if(!(isWalking && walkingOnGround && !canFly))
+                camSpeed = 0.0f;
+            bobCamera += (camSpeed - bobCamera) * k;
+
+            if(step > 0.0001f)
+            {
+                // Distance-derived, so the cycle already runs 1.3x faster while sprinting because the
+                // player covers 1.3x the ground. The extra factor on top is for readability: at this
+                // screen size 1.3x alone reads as a slightly brisk walk, and a run should read as a
+                // run. It is the one deliberate departure from Java's numbers in the walk cycle.
+                float cycleScale = sprinting ? 1.15f : 1.0f;
+                bobCycle += step * 0.6f * PI * cycleScale;
+            }
+
+            float camBob = bobCamera * 10.0f;
+            fppCam->ApplyWalkBob(camBob, bobCycle);
+        }
 
         if(invEn == true || craft3xEn == true || chestEn == true || furnaceEn == true)
         {
@@ -9781,7 +10942,93 @@ void StatePlay::Update(StateManager* sManager)
 
 
 void StatePlay::Draw(StateManager* sManager)
-{
+{    // Sprint FOV. Java's EntityRenderer widens the FOV by 15% while sprinting, and eases it there
+    // rather than snapping, so the zoom reads as acceleration. Rebuilt before StartFrame because
+    // SetupCameraMatrices loads the projection, and only touched when it actually changes: SetPerspective
+    // rebuilds the projection matrix, which is not free.
+    if(mWorld != NULL && mRender != NULL)
+    {
+        float targetBoost = sprinting ? ((float)mWorld->mainOptions.fov * SPRINT_FOV_MULT) : 0.0f;
+        float lerp = (dt > 0.0f) ? (12.0f * dt) : 1.0f;
+        if(lerp > 1.0f)
+            lerp = 1.0f;
+        sprintFovBoost += (targetBoost - sprintFovBoost) * lerp;
+        float wantFov = (float)mWorld->mainOptions.fov + sprintFovBoost;
+        if(wantFov < 40.0f)
+            wantFov = 40.0f;
+        if(wantFov > 120.0f)
+            wantFov = 120.0f;
+        if(fabsf(mRender->fovv - wantFov) > 0.01f)
+        {
+            mRender->fovv = wantFov;
+            RenderManager::InstancePtr()->SetPerspective(0, 480.0f / 272.0f, 0.18f, 1000.f);
+        }
+    }
+
+    if(menuState == 0 && mWorld != NULL && fppCam != NULL)
+    {
+        Vector3 fwd = fppCam->m_vView - fppCam->m_vPosition;
+        fwd.normalize();
+
+        // Third person. The view matrix is built from m_vPosition + m_vBoom, so this is a render-only
+        // offset: the eye stays on the player, and every pick ray, particle, sky and sound that reads
+        // the camera keeps working from the eyes exactly as before. The boom is walked backwards from
+        // the eye and cut at the last clear step, which is what stops the camera ending up inside a
+        // wall. Rotating or moving already marks the camera for update, so needUpdate is only forced
+        // when the boom itself changes -- that is what refreshes the frustum on the frame the view is
+        // toggled, without asking for one every frame.
+        //
+        // The front view is the same walk in the other direction plus the mirror flag, which turns the
+        // view matrix round to look back at the player (see RenderManager::SetupCameraMatrices). Both
+        // third-person views are therefore mirrors of each other through the eye, so the eye stays the
+        // pivot and the crosshair keeps aiming where the player is looking.
+        Vector3 wantBoom = Vector3(0.0f,0.0f,0.0f);
+        bool wantMirror = false;
+        if(thirdPersonView > 0)
+        {
+            float boomSide = (thirdPersonView == 2) ? 1.0f : -1.0f;
+            float boom = THIRD_PERSON_DISTANCE;
+            for(int i = 1; i <= THIRD_PERSON_STEPS; i++)
+            {
+                float d = THIRD_PERSON_DISTANCE * (float)i / (float)THIRD_PERSON_STEPS;
+                Vector3 sample = fppCam->m_vPosition + (fwd * (d * boomSide));
+                if(mWorld->BlockSolid((int)floorf(sample.x),(int)floorf(sample.y),(int)floorf(sample.z)))
+                {
+                    boom = THIRD_PERSON_DISTANCE * (float)(i-1) / (float)THIRD_PERSON_STEPS;
+                    break;
+                }
+            }
+            if(boom < THIRD_PERSON_NEVER_BELOW)
+                boom = THIRD_PERSON_NEVER_BELOW;
+
+            wantBoom = fwd * (boom * boomSide);
+            wantMirror = (thirdPersonView == 2);
+        }
+
+        if(wantBoom.x != fppCam->m_vBoom.x || wantBoom.y != fppCam->m_vBoom.y || wantBoom.z != fppCam->m_vBoom.z
+           || wantMirror != fppCam->m_vMirror)
+        {
+            fppCam->m_vBoom = wantBoom;
+            fppCam->m_vMirror = wantMirror;
+            fppCam->needUpdate = true;
+        }
+
+        Vector3 camUp = fppCam->m_vUpVector;
+        Vector3 camRight = Vector3::cross(fwd, camUp);
+        if(camRight.magnitudeSq() < 0.0001f)
+            camRight = Vector3(1.0f, 0.0f, 0.0f);
+        else
+            camRight.normalize();
+        camUp = Vector3::cross(camRight, fwd);
+        camUp.normalize();
+        if(pendingCrackId >= 0)
+        {
+            Particle::QueueBlockCrack(mWorld, Vector3(pendingCrackX, pendingCrackY, pendingCrackZ), pendingCrackId);
+            pendingCrackId = -1;
+        }
+        Particle::UpdateAll(mWorld, dt, camRight, camUp);
+    }
+
     mWorld->startSkyColor = mWorld->startClearSkyColor*(1.0-mWorld->rainyColorAlpha)+mWorld->startRainySkyColor*mWorld->rainyColorAlpha;
     mWorld->endSkyColor = mWorld->endClearSkyColor*(1.0-mWorld->rainyColorAlpha)+mWorld->endRainySkyColor*mWorld->rainyColorAlpha;
     mWorld->dawnSunsetSkyColor = mWorld->dawnSunsetClearSkyColor*(1.0-mWorld->rainyColorAlpha)+mWorld->dawnSunsetRainySkyColor*mWorld->rainyColorAlpha;
@@ -9830,6 +11077,12 @@ void StatePlay::Draw(StateManager* sManager)
         angleFactor = 1.0f;
     }
 
+	// The nether has no sky of its own. The overworld's is what washed the whole dimension grey, so
+	// instead it gets a fixed dark red for both the clear colour and the fog, and everything that
+	// draws a sky -- skybox, stars, sun, moon, clouds -- is skipped below.
+	const bool nether = (mWorld->dimension == 1);
+	const Vector3 netherSky(0.28f, 0.05f, 0.05f);
+
 	bool needUpdate = fppCam->needUpdate;
 	float nullFactor = (1.0f-mWorld->dawnSunsetFactor)+(1.0f-angleFactor);
 	if(nullFactor > 1.0f)
@@ -9837,7 +11090,11 @@ void StatePlay::Draw(StateManager* sManager)
         nullFactor = 1.0f;
     }
 
-    if(playerPosition.y <= 48)
+    if(nether)
+    {
+        mRender->StartFrame(netherSky.x,netherSky.y,netherSky.z);
+    }
+    else if(playerPosition.y <= 48)
     {
         Vector3 color = ((mWorld->startSkyColor*mWorld->brightFactor)*nullFactor+(mWorld->dawnSunsetSkyColor*mWorld->dawnSunsetFactor*angleFactor))*(playerPosition.y/48.0f)*(playerPosition.y/48.0f);
         mRender->StartFrame(color.x,color.y,color.z);
@@ -9847,6 +11104,8 @@ void StatePlay::Draw(StateManager* sManager)
         Vector3 color = (mWorld->startSkyColor*mWorld->brightFactor)*nullFactor+(mWorld->dawnSunsetSkyColor*mWorld->dawnSunsetFactor*angleFactor);
         mRender->StartFrame(color.x,color.y,color.z);
     }
+    // StartFrame has waited for the previous frame's GE work; the atlases are free to change.
+    mWorld->ApplyTextureAnimation();
 
     if(mWorld->mainOptions.smoothLighting == 1)
     {
@@ -9857,17 +11116,17 @@ void StatePlay::Draw(StateManager* sManager)
         sceGuShadeModel(GU_FLAT);
     }
 
-    if(mWorld->mainOptions.detailedSky == 1)
+    if(mWorld->mainOptions.detailedSky == 1 && !nether)
     {
         if(playerPosition.y <= 48)
         {
             Vector3 color = ((mWorld->startSkyColor*mWorld->brightFactor)*nullFactor+(mWorld->dawnSunsetSkyColor*mWorld->dawnSunsetFactor*angleFactor))*(playerPosition.y/48.0f)*(playerPosition.y/48.0f);
-            sceGuFog(mWorld->mainOptions.horizontalViewDistance * 7, mWorld->mainOptions.horizontalViewDistance * 14 + 168.0f, GU_COLOR(color.x,color.y,color.z,1.0));
+            sceGuFog(mWorld->mainOptions.horizontalViewDistance * 8, mWorld->mainOptions.horizontalViewDistance * 16 + 168.0f, GU_COLOR(color.x,color.y,color.z,1.0));
         }
         else
         {
             Vector3 color = (mWorld->startSkyColor*mWorld->brightFactor)*nullFactor+(mWorld->dawnSunsetSkyColor*mWorld->dawnSunsetFactor*angleFactor);
-            sceGuFog(mWorld->mainOptions.horizontalViewDistance * 7, mWorld->mainOptions.horizontalViewDistance * 14 + 168.0f, GU_COLOR(color.x,color.y,color.z,1.0));
+            sceGuFog(mWorld->mainOptions.horizontalViewDistance * 8, mWorld->mainOptions.horizontalViewDistance * 16 + 168.0f, GU_COLOR(color.x,color.y,color.z,1.0));
         }
         sceGuEnable(GU_FOG);
 
@@ -9968,12 +11227,12 @@ void StatePlay::Draw(StateManager* sManager)
                     if(playerPosition.y <= 48)
                     {
                         Vector3 color = (( mWorld->startSkyColor*mWorld->brightFactor)*nullFactor+(mWorld->dawnSunsetSkyColor*mWorld->dawnSunsetFactor*angleFactor))*(playerPosition.y/48.0f)*(playerPosition.y/48.0f);
-                        sceGuFog(mWorld->mainOptions.horizontalViewDistance * 7 + 48.0f, mWorld->mainOptions.horizontalViewDistance * 14 + 122.0f, GU_COLOR(color.x,color.y,color.z,1.0));
+                        sceGuFog(mWorld->mainOptions.horizontalViewDistance * 8 + 48.0f, mWorld->mainOptions.horizontalViewDistance * 16 + 122.0f, GU_COLOR(color.x,color.y,color.z,1.0));
                     }
                     else
                     {
                         Vector3 color = (mWorld->startSkyColor*mWorld->brightFactor)*nullFactor+(mWorld->dawnSunsetSkyColor*mWorld->dawnSunsetFactor*angleFactor);
-                        sceGuFog(mWorld->mainOptions.horizontalViewDistance * 7 + 48.0f, mWorld->mainOptions.horizontalViewDistance * 14 + 122.0f, GU_COLOR(color.x,color.y,color.z,1.0));
+                        sceGuFog(mWorld->mainOptions.horizontalViewDistance * 8 + 48.0f, mWorld->mainOptions.horizontalViewDistance * 16 + 122.0f, GU_COLOR(color.x,color.y,color.z,1.0));
                     }
                 }
                 sceGuEnable(GU_FOG);
@@ -10049,12 +11308,25 @@ void StatePlay::Draw(StateManager* sManager)
         else
         {
             float fog_start = 20.0f;
-            float fog_end = mWorld->mainOptions.horizontalViewDistance * 4 + 40.00f;
+            float fog_end = mWorld->EffectiveViewDistance() * 4 + 40.00f;
             if(fog_start < 0.0f)
             {
                 fog_start = 0.0f;
             }
-            if(playerPosition.y <= 48)
+            if(nether)
+            {
+                // Pulled in closer than the overworld's: the nether should feel enclosed, and the fog
+                // is what stops the far wall of a cavern reading as flat untextured rock. The 0.6 also
+                // keeps the fog inside the mesh zone now that the nether's effective view is one chunk
+                // shorter -- see CraftWorld::EffectiveViewDistance -- so the shorter view cannot show
+                // an edge of unmeshed terrain past the fog.
+                float nether_end = fog_end * 0.6f;
+                float mesh_edge = (float)(mWorld->EffectiveViewDistance() * CHUNK_SIZE);
+                if(nether_end > mesh_edge)
+                    nether_end = mesh_edge;
+                sceGuFog(fog_start, nether_end, GU_COLOR(netherSky.x,netherSky.y,netherSky.z,1.0));
+            }
+            else if(playerPosition.y <= 48)
             {
                 Vector3 color = ((Vector3(0.8f-(mWorld->rainyColorAlpha/10.0f)*3,0.8f-(mWorld->rainyColorAlpha/10.0f)*3,0.8f-(mWorld->rainyColorAlpha/10.0f)*3)*mWorld->brightFactor)*nullFactor+(mWorld->dawnSunsetSkyColor*mWorld->dawnSunsetFactor*angleFactor))*(playerPosition.y/48.0f)*(playerPosition.y/48.0f);
                 sceGuFog(fog_start, fog_end, GU_COLOR(color.x,color.y,color.z,1.0));
@@ -10078,7 +11350,7 @@ void StatePlay::Draw(StateManager* sManager)
         sceGuEnable(GU_TEXTURE_2D);
         if(mWorld->mainOptions.mipMapTexturing)
         {
-            TextureManager::Instance()->SetMipMaps2Textures(texture, texture_mips);
+            TextureManager::Instance()->SetMipMaps2Textures(texture, texture_mips, mWorld->mainOptions.mipMapBias);
         }
         else
         {
@@ -10086,7 +11358,9 @@ void StatePlay::Draw(StateManager* sManager)
         }
 
         sceGumPushMatrix();
+        MC_PERF_PHASE_BEGIN(kPhDrawWorld);
         mWorld->drawWorld(fppCam->mFrustum,needUpdate);
+        MC_PERF_PHASE_END(kPhDrawWorld);
         sceGumPopMatrix();
         sceGuDisable(GU_TEXTURE_2D);
     }
@@ -10100,12 +11374,12 @@ void StatePlay::Draw(StateManager* sManager)
             {
                 Drop* TestDrop = mWorld->mDrops[d];
 
-                if(menuState == 0)//game state
+                if(WorldRunning())//game state
                 {
                     TestDrop->Update(dt);
                 }
 
-                if(TestDrop->GetId() < 250)
+                if(IsBlockId(TestDrop->GetId()))
                 {
                     TextureManager::Instance()->SetTextureModeulate(texture);
                 }
@@ -10150,14 +11424,14 @@ void StatePlay::Draw(StateManager* sManager)
             {
                 if(TestTNT->toDestroy == false)
                 {
-                    if(menuState == 0)//game state
+                    if(WorldRunning())//game state
                     {
                         TestTNT->Update(dt);
                         int time = TestTNT->timeToExplode*100;
                         if(time % 4 == 0 && rand()%10 <= 6 && time > 40 && TestTNT->ignitedByPlayer)
                         {
 
-                            Particle* Smoke = new Particle(mWorld,"smoke",Vector3(TestTNT->position.x+(-0.1f+(rand()%10)/100.0f),TestTNT->position.y+0.60f,TestTNT->position.z+(-0.1f+(rand()%10)/100.0f)));
+                            Particle* Smoke = Particle::Spawn(mWorld,"smoke",Vector3(TestTNT->position.x+(-0.1f+(rand()%10)/100.0f),TestTNT->position.y+0.60f,TestTNT->position.z+(-0.1f+(rand()%10)/100.0f)));
                             Smoke->SetVelocity(Vector3(0,1.5f+(rand()%10)/10.0f,0));
                             Smoke->SetScale(0.1f+(rand()%10)/100.0f);
                             Smoke->SetMaxLiveTime(1000);
@@ -10165,7 +11439,6 @@ void StatePlay::Draw(StateManager* sManager)
                             Smoke->SetBrightness(0.15,0.25);
                             Smoke->friction = 4.0f;
 
-                            mParticles.push_back(Smoke);
                         }
                     }
 
@@ -10178,32 +11451,26 @@ void StatePlay::Draw(StateManager* sManager)
                     {
                         for(float horAngle = 0.0f; horAngle <= PI*2; horAngle += PI/2.0f)
                         {
-                            if(mParticles.size() > 52)
+                            if(Particle::ActiveCount() > 52)
                             {
                                 continue;
                             }
                             float radius = 4.5f + (rand() % 100)/10.0f;
 
-                            Particle* Smoke = new Particle(mWorld,"smoke",Vector3(TestTNT->position.x,TestTNT->position.y,TestTNT->position.z));
+                            Particle* Smoke = Particle::Spawn(mWorld,"smoke",Vector3(TestTNT->position.x,TestTNT->position.y,TestTNT->position.z));
                             Smoke->SetVelocity(Vector3(mWorld->LengthDirX(horAngle,verAngle)*radius,mWorld->LengthDirY(horAngle,verAngle)*radius,mWorld->LengthDirZ(horAngle,verAngle)*radius));
                             Smoke->SetScale(0.3f+(rand()%25)/100.0f);
                             Smoke->friction = 4.25f;
 
-                            mParticles.push_back(Smoke);
                         }
                     }
-                    if(mParticles.size() < 64)
+                    if(Particle::ActiveCount() < 64)
                     {
-                        Particle* Explosion = new Particle(mWorld,"explosion",Vector3(TestTNT->position.x-1.2f,TestTNT->position.y-1.2f,TestTNT->position.z));
-                        Particle* Explosion2 = new Particle(mWorld,"explosion",Vector3(TestTNT->position.x+1.2f,TestTNT->position.y+1.2f,TestTNT->position.z));
-                        Particle* Explosion3 = new Particle(mWorld,"explosion",Vector3(TestTNT->position.x,TestTNT->position.y-1.2f,TestTNT->position.z-1.2f));
-                        Particle* Explosion4 = new Particle(mWorld,"explosion",Vector3(TestTNT->position.x,TestTNT->position.y+1.2f,TestTNT->position.z+1.2f));
-                        Particle* Explosion5 = new Particle(mWorld,"explosion",Vector3(TestTNT->position.x,TestTNT->position.y,TestTNT->position.z));
-                        mParticles.push_back(Explosion);
-                        mParticles.push_back(Explosion2);
-                        mParticles.push_back(Explosion3);
-                        mParticles.push_back(Explosion4);
-                        mParticles.push_back(Explosion5);
+                        Particle::Spawn(mWorld,"explosion",Vector3(TestTNT->position.x-1.2f,TestTNT->position.y-1.2f,TestTNT->position.z));
+                        Particle::Spawn(mWorld,"explosion",Vector3(TestTNT->position.x+1.2f,TestTNT->position.y+1.2f,TestTNT->position.z));
+                        Particle::Spawn(mWorld,"explosion",Vector3(TestTNT->position.x,TestTNT->position.y-1.2f,TestTNT->position.z-1.2f));
+                        Particle::Spawn(mWorld,"explosion",Vector3(TestTNT->position.x,TestTNT->position.y+1.2f,TestTNT->position.z+1.2f));
+                        Particle::Spawn(mWorld,"explosion",Vector3(TestTNT->position.x,TestTNT->position.y,TestTNT->position.z));
                     }
 
                     mWorld->DestroyTNTentity(k);
@@ -10216,6 +11483,48 @@ void StatePlay::Draw(StateManager* sManager)
         }
     }
 
+    /// THIRD-PERSON PLAYER MODEL
+    // Drawn where the mobs are drawn, so it sits in the world pass with the same lighting and its own
+    // depth. Only in third person: in first person the player is the camera and the hand/model pass
+    // further down covers it.
+    if(thirdPersonView > 0 && mWorld->HP > 0 && sleepTime <= 0.0f)
+    {
+        // Swing comes from the walk bob the camera already computes: bobCycle advances with distance
+        // travelled rather than with time, so the legs stop moving the moment the player does, and
+        // bobWalk fades the whole swing out so a standing player is not left frozen mid-stride.
+        // Arms swing against the leg on the same side, as in Java.
+        float walkSwing = sinf(bobCycle) * 0.85f * bobWalk;
+
+        // Soles, from the game's own standing relation: the eye is playerGrowth - 0.05 above them.
+        Vector3 feet = Vector3(playerPosition.x,
+                               playerPosition.y - (mWorld->playerGrowth - 0.05f),
+                               playerPosition.z);
+
+        // The mobs' angle convention: their forward is (sin, 0, cos) while the camera's is
+        // (cos, 0, sin), so the quarter turn is the conversion. This is the *body's* heading, which
+        // lags the camera; the head is turned past it by headYawOffset and nods with the camera's own
+        // pitch, so the player keeps looking where the camera looks while the body swings round.
+        float faceAngle = PI/2.0f - (bodyYaw/180.0f)*PI;
+        float headTurn = -(headYawOffset/180.0f)*PI;
+
+        float playerLight = mWorld->BlockFinalLight((int)floorf(feet.x),(int)floorf(feet.y + 1.0f),(int)floorf(feet.z));
+
+        // Punch and place. animDest runs 0..PI over a swing, so sin() of it is the 0..1..0 arc, which
+        // is Java's swingProgress*PI exactly -- the same curve the first-person hand uses. 1.3 rad at
+        // the peak puts the arm a little past horizontal, less than the first-person hand's 1.5
+        // because this arm cannot also turn across the body without a second axis.
+        float hitSwing = sinf(animDest) * 1.3f;
+
+        TextureManager::Instance()->SetTextureModeulate(invPlayerTex);
+        invPlayer->RenderInWorld(mWorld, feet, faceAngle, walkSwing, -walkSwing, playerLight,
+                                 invPlayerTex, mWorld->invId[27+barPosition],
+                                 headTurn, fppCam->upDownAngle, hitSwing,
+                                 // -1 = a bow in hand but no draw, so the arm keeps its walk pose;
+                                 // 0..3 = the string is being pulled, which lifts the arm. See
+                                 // InventoryPlayer::RenderInWorld and kBowArmRaise.
+                                 bowCharging == true ? BowDrawStage(bowCharge) : -1);
+    }
+
     /// ZOMBIE
     if(mWorld->mZombies.empty() == false)
     {
@@ -10225,7 +11534,7 @@ void StatePlay::Draw(StateManager* sManager)
             {
                 Zombie* TestZombie = mWorld->mZombies[d];
 
-                if(menuState == 0)//game state
+                if(WorldRunning())//game state
                 {
                     TestZombie->Update(mWorld, playerPosition, dt);
                 }
@@ -10309,8 +11618,7 @@ void StatePlay::Draw(StateManager* sManager)
 
                     for(int k = 0; k <= 7; k++)
                     {
-                        Particle* Smoke = new Particle(mWorld, "smoke",Vector3(TestZombie->position.x-0.4+(rand()%9/10.0f),TestZombie->position.y+0.2f+(rand()%7/5.0f),TestZombie->position.z-0.4+(rand()%9/10.0f)));
-                        mParticles.push_back(Smoke);
+                        Particle::Spawn(mWorld, "smoke",Vector3(TestZombie->position.x-0.4+(rand()%9/10.0f),TestZombie->position.y+0.2f+(rand()%7/5.0f),TestZombie->position.z-0.4+(rand()%9/10.0f)));
                     }
                     mWorld->DestroyZombie(d);
                     d --;
@@ -10328,7 +11636,7 @@ void StatePlay::Draw(StateManager* sManager)
             {
                 Cow* TestCow = mWorld->mCows[d];
 
-                if(menuState == 0)//game state
+                if(WorldRunning())//game state
                 {
                     TestCow->handItemId = mWorld->invId[27+barPosition];
                     TestCow->Update(mWorld, playerPosition, dt);
@@ -10349,7 +11657,7 @@ void StatePlay::Draw(StateManager* sManager)
 
                 if(TestCow->toDestroy == true || (TestCow->killed == true && TestCow->deathTimer < 0.0f))
                 {
-                    if(TestCow->killed == true)
+                    if(TestCow->killed == true && TestCow->IsBaby() == false)
                     {
                         mWorld->DropThis(RawBeef::getID(),1+rand()%2,true,Vector3(TestCow->position.x,TestCow->position.y+0.3f,TestCow->position.z));
                         mWorld->DropThis(Leather::getID(),1+rand()%2,true,Vector3(TestCow->position.x,TestCow->position.y+0.3f,TestCow->position.z));
@@ -10357,9 +11665,8 @@ void StatePlay::Draw(StateManager* sManager)
 
                     for(int k = 0; k <= 7; k++)
                     {
-                        Particle* Smoke = new Particle(mWorld, "smoke",Vector3(TestCow->position.x-0.5+(rand()%11/10.0f),TestCow->position.y+0.2+(rand()%4/5.0f),TestCow->position.z-0.5+(rand()%11/10.0f)));
+                        Particle* Smoke = Particle::Spawn(mWorld, "smoke",Vector3(TestCow->position.x-0.5+(rand()%11/10.0f),TestCow->position.y+0.2+(rand()%4/5.0f),TestCow->position.z-0.5+(rand()%11/10.0f)));
                         k % 2 == 0 ? Smoke->SetVelocity(Vector3(-3*rand()%2,0,-3*rand()%2)) : Smoke->SetVelocity(Vector3(3*rand()%2,0,3*rand()%2));
-                        mParticles.push_back(Smoke);
                     }
 
                     mWorld->DestroyCow(d);
@@ -10378,7 +11685,7 @@ void StatePlay::Draw(StateManager* sManager)
             {
                 Sheep* TestSheep = mWorld->mSheeps[d];
 
-                if(menuState == 0)//game state
+                if(WorldRunning())//game state
                 {
                     TestSheep->handItemId = mWorld->invId[27+barPosition];
                     TestSheep->Update(mWorld, playerPosition, dt);
@@ -10399,7 +11706,7 @@ void StatePlay::Draw(StateManager* sManager)
 
                 if(TestSheep->toDestroy == true || (TestSheep->killed == true && TestSheep->deathTimer < 0.0f))
                 {
-                    if(TestSheep->killed == true && TestSheep->sheared == false)
+                    if(TestSheep->killed == true && TestSheep->sheared == false && TestSheep->IsBaby() == false)
                     {
                         mWorld->DropThis(BlackWoolBlock::getID()+TestSheep->GetFurColor(),1,true,Vector3(TestSheep->position.x,TestSheep->position.y+0.3f,TestSheep->position.z));
 					mWorld->DropThis(RawMutton::getID(),1+rand()%2,true,Vector3(TestSheep->position.x,TestSheep->position.y+0.3f,TestSheep->position.z));
@@ -10407,9 +11714,8 @@ void StatePlay::Draw(StateManager* sManager)
 
                     for(int k = 0; k <= 7; k++)
                     {
-                        Particle* Smoke = new Particle(mWorld, "smoke",Vector3(TestSheep->position.x-0.5+(rand()%11/10.0f),TestSheep->position.y+0.2+(rand()%4/5.0f),TestSheep->position.z-0.5+(rand()%11/10.0f)));
+                        Particle* Smoke = Particle::Spawn(mWorld, "smoke",Vector3(TestSheep->position.x-0.5+(rand()%11/10.0f),TestSheep->position.y+0.2+(rand()%4/5.0f),TestSheep->position.z-0.5+(rand()%11/10.0f)));
                         k % 2 == 0 ? Smoke->SetVelocity(Vector3(-3*rand()%2,0,-3*rand()%2)) : Smoke->SetVelocity(Vector3(3*rand()%2,0,3*rand()%2));
-                        mParticles.push_back(Smoke);
                     }
 
                     mWorld->DestroySheep(d);
@@ -10428,7 +11734,7 @@ void StatePlay::Draw(StateManager* sManager)
             {
                 Creeper* TestCreeper = mWorld->mCreepers[d];
 
-                if(menuState == 0)//game state
+                if(WorldRunning())//game state
                 {
                     TestCreeper->Update(mWorld, playerPosition, dt);
                 }
@@ -10473,9 +11779,8 @@ void StatePlay::Draw(StateManager* sManager)
 
                     for(int k = 0; k <= 7; k++)
                     {
-                        Particle* Smoke = new Particle(mWorld, "smoke",Vector3(TestCreeper->position.x-0.5+(rand()%11/10.0f),TestCreeper->position.y+0.2+(rand()%4/5.0f),TestCreeper->position.z-0.5+(rand()%11/10.0f)));
+                        Particle* Smoke = Particle::Spawn(mWorld, "smoke",Vector3(TestCreeper->position.x-0.5+(rand()%11/10.0f),TestCreeper->position.y+0.2+(rand()%4/5.0f),TestCreeper->position.z-0.5+(rand()%11/10.0f)));
                         k % 2 == 0 ? Smoke->SetVelocity(Vector3(-3*rand()%2,0,-3*rand()%2)) : Smoke->SetVelocity(Vector3(3*rand()%2,0,3*rand()%2));
-                        mParticles.push_back(Smoke);
                     }
 
                     mWorld->DestroyCreeper(d);
@@ -10487,32 +11792,26 @@ void StatePlay::Draw(StateManager* sManager)
                     {
                         for(float horAngle = 0.0f; horAngle <= PI*2; horAngle += PI/2.0f)
                         {
-                            if(mParticles.size() > 52)
+                            if(Particle::ActiveCount() > 52)
                             {
                                 continue;
                             }
                             float radius = 4.5f + (rand() % 100)/10.0f;
 
-                            Particle* Smoke = new Particle(mWorld,"smoke",Vector3(TestCreeper->position.x,TestCreeper->position.y,TestCreeper->position.z));
+                            Particle* Smoke = Particle::Spawn(mWorld,"smoke",Vector3(TestCreeper->position.x,TestCreeper->position.y,TestCreeper->position.z));
                             Smoke->SetVelocity(Vector3(mWorld->LengthDirX(horAngle,verAngle)*radius,mWorld->LengthDirY(horAngle,verAngle)*radius,mWorld->LengthDirZ(horAngle,verAngle)*radius));
                             Smoke->SetScale(0.3f+(rand()%25)/100.0f);
                             Smoke->friction = 4.25f;
 
-                            mParticles.push_back(Smoke);
                         }
                     }
-                    if(mParticles.size() < 64)
+                    if(Particle::ActiveCount() < 64)
                     {
-                        Particle* Explosion = new Particle(mWorld,"explosion",Vector3(TestCreeper->position.x-1.2f,TestCreeper->position.y-1.2f,TestCreeper->position.z));
-                        Particle* Explosion2 = new Particle(mWorld,"explosion",Vector3(TestCreeper->position.x+1.2f,TestCreeper->position.y+1.2f,TestCreeper->position.z));
-                        Particle* Explosion3 = new Particle(mWorld,"explosion",Vector3(TestCreeper->position.x,TestCreeper->position.y-1.2f,TestCreeper->position.z-1.2f));
-                        Particle* Explosion4 = new Particle(mWorld,"explosion",Vector3(TestCreeper->position.x,TestCreeper->position.y+1.2f,TestCreeper->position.z+1.2f));
-                        Particle* Explosion5 = new Particle(mWorld,"explosion",Vector3(TestCreeper->position.x,TestCreeper->position.y,TestCreeper->position.z));
-                        mParticles.push_back(Explosion);
-                        mParticles.push_back(Explosion2);
-                        mParticles.push_back(Explosion3);
-                        mParticles.push_back(Explosion4);
-                        mParticles.push_back(Explosion5);
+                        Particle::Spawn(mWorld,"explosion",Vector3(TestCreeper->position.x-1.2f,TestCreeper->position.y-1.2f,TestCreeper->position.z));
+                        Particle::Spawn(mWorld,"explosion",Vector3(TestCreeper->position.x+1.2f,TestCreeper->position.y+1.2f,TestCreeper->position.z));
+                        Particle::Spawn(mWorld,"explosion",Vector3(TestCreeper->position.x,TestCreeper->position.y-1.2f,TestCreeper->position.z-1.2f));
+                        Particle::Spawn(mWorld,"explosion",Vector3(TestCreeper->position.x,TestCreeper->position.y+1.2f,TestCreeper->position.z+1.2f));
+                        Particle::Spawn(mWorld,"explosion",Vector3(TestCreeper->position.x,TestCreeper->position.y,TestCreeper->position.z));
                     }
 
                     mSoundMgr->TNTSound();
@@ -10524,7 +11823,7 @@ void StatePlay::Draw(StateManager* sManager)
         }
     }
 
-	/*// PIG
+    /// PIG
     if(mWorld->mPigs.empty() == false)
     {
         for(int d = 0; d < mWorld->mPigs.size(); d++)
@@ -10532,28 +11831,37 @@ void StatePlay::Draw(StateManager* sManager)
             if(d < mWorld->mPigs.size() && mWorld->mPigs.empty() == false)
             {
                 Pig* TestPig = mWorld->mPigs[d];
+
+                if(WorldRunning())//game state
+                {
+                    TestPig->handItemId = mWorld->invId[27+barPosition];
+                    TestPig->Update(mWorld, playerPosition, dt);
+                }
                 TestPig->Render(fppCam->mFrustum, dt);
 
                 if(TestPig->playHurtSound)
                 {
+                    mSoundMgr->PlayPigHurtSound(TestPig->FastDistanceToPlayer());
+                    TestPig->playHurtSound = false;
                 }
 
                 if(TestPig->playSaySound)
                 {
+                    mSoundMgr->PlayPigSaySound(TestPig->FastDistanceToPlayer());
+                    TestPig->playSaySound = false;
                 }
 
                 if(TestPig->toDestroy == true || (TestPig->killed == true && TestPig->deathTimer < 0.0f))
                 {
-                    if(TestPig->killed == true)
+                    if(TestPig->killed == true && TestPig->IsBaby() == false)
                     {
-                        mWorld->DropThis(RawBeef::getID(),1+rand()%2,true,Vector3(TestPig->position.x,TestPig->position.y+0.3f,TestPig->position.z));
+                        mWorld->DropThis(RawPorkchop::getID(),1+rand()%2,true,Vector3(TestPig->position.x,TestPig->position.y+0.3f,TestPig->position.z));
                     }
 
                     for(int k = 0; k <= 7; k++)
                     {
-                        Particle* Smoke = new Particle(mWorld, "smoke",Vector3(TestPig->position.x-0.5+(rand()%11/10.0f),TestPig->position.y+0.2+(rand()%4/5.0f),TestPig->position.z-0.5+(rand()%11/10.0f)));
+                        Particle* Smoke = Particle::Spawn(mWorld, "smoke",Vector3(TestPig->position.x-0.5+(rand()%11/10.0f),TestPig->position.y+0.2+(rand()%4/5.0f),TestPig->position.z-0.5+(rand()%11/10.0f)));
                         k % 2 == 0 ? Smoke->SetVelocity(Vector3(-3*rand()%2,0,-3*rand()%2)) : Smoke->SetVelocity(Vector3(3*rand()%2,0,3*rand()%2));
-                        mParticles.push_back(Smoke);
                     }
 
                     mWorld->DestroyPig(d);
@@ -10562,7 +11870,259 @@ void StatePlay::Draw(StateManager* sManager)
             }
         }
     }
-	*/
+
+    /// chickens. The mesh is smaller than the pig's. Drops feathers and raw chicken when killed, and
+    /// lays an egg on a timer (see Chicken::Update).
+    if (mWorld->mChickens.empty() == false)
+    {
+        for(int d = 0; d < mWorld->mChickens.size(); d++)
+        {
+            if(d < mWorld->mChickens.size() && mWorld->mChickens.empty() == false)
+            {
+                Chicken* TestChicken = mWorld->mChickens[d];
+
+                if(WorldRunning())//game state
+                {
+                    TestChicken->handItemId = mWorld->invId[27+barPosition];
+                    TestChicken->Update(mWorld, playerPosition, dt);
+                }
+                TestChicken->Render(fppCam->mFrustum, dt);
+
+                // Chicken audio, converted from the vanilla 1.7.3 assets by
+                // tools/make-vanilla-mob-sounds.py (mob/chicken hurt1-2, say1-3, step1-2, plop).
+                if(TestChicken->playHurtSound)
+                {
+                    mSoundMgr->PlayChickenHurtSound(TestChicken->FastDistanceToPlayer());
+                }
+
+                if(TestChicken->playSaySound)
+                {
+                    mSoundMgr->PlayChickenSaySound(TestChicken->FastDistanceToPlayer());
+                }
+
+                if(TestChicken->playPlopSound)
+                {
+                    mSoundMgr->PlayChickenPlopSound(TestChicken->FastDistanceToPlayer());
+                }
+
+                TestChicken->playHurtSound = false;
+                TestChicken->playSaySound = false;
+                TestChicken->playPlopSound = false;
+
+                if(TestChicken->toDestroy == true || (TestChicken->killed == true && TestChicken->deathTimer < 0.0f))
+                {
+                    if(TestChicken->killed == true && TestChicken->IsBaby() == false)
+                    {
+                        mWorld->DropThis(Feather::getID(),1+rand()%2,true,Vector3(TestChicken->position.x,TestChicken->position.y+0.3f,TestChicken->position.z));
+                        mWorld->DropThis(RawChicken::getID(),1,true,Vector3(TestChicken->position.x,TestChicken->position.y+0.3f,TestChicken->position.z));
+                    }
+
+                    for(int k = 0; k <= 7; k++)
+                    {
+                        Particle* Smoke = Particle::Spawn(mWorld, "smoke",Vector3(TestChicken->position.x-0.5+(rand()%11/10.0f),TestChicken->position.y+0.2+(rand()%4/5.0f),TestChicken->position.z-0.5+(rand()%11/10.0f)));
+                        k % 2 == 0 ? Smoke->SetVelocity(Vector3(-3*rand()%2,0,-3*rand()%2)) : Smoke->SetVelocity(Vector3(3*rand()%2,0,3*rand()%2));
+                    }
+
+                    mWorld->DestroyChicken(d);
+                    d --;
+                }
+            }
+        }
+    }
+
+
+    /// SPIDERS. Four-footed like the pig on the API side, but hostile and with its own walk cycle:
+    /// the class drives all eight legs off one phase, so the loop only has to feed it the player and
+    /// the frame time. Drops string, and a spider eye one time in three (Java: 0-2 string always,
+    /// one eye at a 1/3 chance).
+    if (mWorld->mSpiders.empty() == false)
+    {
+        for(int d = 0; d < mWorld->mSpiders.size(); d++)
+        {
+            if(d < mWorld->mSpiders.size() && mWorld->mSpiders.empty() == false)
+            {
+                Spider* TestSpider = mWorld->mSpiders[d];
+
+                if(WorldRunning())//game state
+                {
+                    TestSpider->Update(mWorld, playerPosition, dt);
+                }
+                TestSpider->Render(fppCam->mFrustum, dt);
+
+                // Spider audio, converted from the vanilla 1.7.3 assets by
+                // tools/make-vanilla-mob-sounds.py (mob/spider say1-4, step1-4, death).
+                if(TestSpider->playHurtSound)
+                {
+                    mSoundMgr->PlaySpiderHurtSound(TestSpider->FastDistanceToPlayer());
+                }
+
+                if(TestSpider->playSaySound)
+                {
+                    mSoundMgr->PlaySpiderSaySound(TestSpider->FastDistanceToPlayer());
+                }
+
+                if(TestSpider->playStepSound)
+                {
+                    mSoundMgr->PlaySpiderStepSound(TestSpider->FastDistanceToPlayer());
+                }
+
+                if(TestSpider->killed == true)
+                {
+                    if(TestSpider->playDieSound)
+                    {
+                        mSoundMgr->PlaySpiderDeathSound(TestSpider->FastDistanceToPlayer());
+                        TestSpider->playDieSound = false;
+                    }
+                }
+
+                TestSpider->playHurtSound = false;
+                TestSpider->playSaySound = false;
+                TestSpider->playStepSound = false;
+
+                if(TestSpider->toDestroy == true || (TestSpider->killed == true && TestSpider->deathTimer < 0.0f))
+                {
+                    if(TestSpider->killed == true && TestSpider->IsBaby() == false)
+                    {
+                        mWorld->DropThis(String::getID(),1+rand()%2,true,Vector3(TestSpider->position.x,TestSpider->position.y+0.3f,TestSpider->position.z));
+                        if(rand() % 3 == 0)
+                        {
+                            mWorld->DropThis(SpiderEye::getID(),1,true,Vector3(TestSpider->position.x,TestSpider->position.y+0.3f,TestSpider->position.z));
+                        }
+                    }
+
+                    for(int k = 0; k <= 7; k++)
+                    {
+                        Particle* Smoke = Particle::Spawn(mWorld, "smoke",Vector3(TestSpider->position.x-0.5+(rand()%11/10.0f),TestSpider->position.y+0.2+(rand()%4/5.0f),TestSpider->position.z-0.5+(rand()%11/10.0f)));
+                        k % 2 == 0 ? Smoke->SetVelocity(Vector3(-3*rand()%2,0,-3*rand()%2)) : Smoke->SetVelocity(Vector3(3*rand()%2,0,3*rand()%2));
+                    }
+
+                    mWorld->DestroySpider(d);
+                    d --;
+                }
+            }
+        }
+    }
+
+    /// skeletons
+    if (mWorld->mSkeletons.empty() == false)
+    {
+        for(int d = 0; d < mWorld->mSkeletons.size(); d++)
+        {
+            if(d < mWorld->mSkeletons.size() && mWorld->mSkeletons.empty() == false)
+            {
+                Skeleton* TestSkeleton = mWorld->mSkeletons[d];
+
+                if(WorldRunning())//game state
+                {
+                    TestSkeleton->Update(mWorld, playerPosition, dt);
+                }
+                TestSkeleton->Render(fppCam->mFrustum, dt);
+
+                // Skeleton audio, converted from the vanilla 1.7.3 assets by
+                // tools/make-vanilla-mob-sounds.py (mob/skeleton say1-3, hurt1-4, step1-4, death).
+                if(TestSkeleton->playHurtSound)
+                {
+                    mSoundMgr->PlaySkeletonHurtSound(TestSkeleton->FastDistanceToPlayer());
+                }
+
+                if(TestSkeleton->playSaySound)
+                {
+                    mSoundMgr->PlaySkeletonSaySound(TestSkeleton->FastDistanceToPlayer());
+                }
+
+                if(TestSkeleton->playStepSound)
+                {
+                    mSoundMgr->PlaySkeletonStepSound(TestSkeleton->FastDistanceToPlayer());
+                }
+
+                if(TestSkeleton->killed == true)
+                {
+                    if(TestSkeleton->playDieSound)
+                    {
+                        mSoundMgr->PlaySkeletonDeathSound(TestSkeleton->FastDistanceToPlayer());
+                        TestSkeleton->playDieSound = false;
+                    }
+                }
+
+                TestSkeleton->playHurtSound = false;
+                TestSkeleton->playSaySound = false;
+                TestSkeleton->playStepSound = false;
+
+                if(TestSkeleton->toDestroy == true || (TestSkeleton->killed == true && TestSkeleton->deathTimer < 0.0f))
+                {
+                    if(TestSkeleton->killed == true)
+                    {
+                        // Vanilla EntitySkeleton.dropFewItems: 0-2 bones, then 0-2 arrows, and a bow
+                        // on roughly one death in twelve.
+                        int bones = rand() % 3;
+                        for(int b = 0; b < bones; b++)
+                        {
+                            mWorld->DropThis(Bone::getID(),1,true,Vector3(TestSkeleton->position.x,TestSkeleton->position.y+0.3f,TestSkeleton->position.z));
+                        }
+                        int arrows = rand() % 3;
+                        for(int a = 0; a < arrows; a++)
+                        {
+                            mWorld->DropThis(Arrow::getID(),1,true,Vector3(TestSkeleton->position.x,TestSkeleton->position.y+0.3f,TestSkeleton->position.z));
+                        }
+                        if(rand() % 4 == 0)
+                        {
+                            // Dropped as a usable bow, not a one-use one: a non-stacking item carries
+                            // its durability in the drop's amount field, the same way a worn tool
+                            // dropped from the hotbar does. See CraftWorld::FreshItemAmount.
+                            mWorld->DropThis(Bow::getID(),mWorld->FreshItemAmount(Bow::getID()),false,Vector3(TestSkeleton->position.x,TestSkeleton->position.y+0.3f,TestSkeleton->position.z));
+                        }
+                    }
+
+                    for(int k = 0; k <= 7; k++)
+                    {
+                        Particle* Smoke = Particle::Spawn(mWorld, "smoke",Vector3(TestSkeleton->position.x-0.5+(rand()%11/10.0f),TestSkeleton->position.y+0.2+(rand()%4/5.0f),TestSkeleton->position.z-0.5+(rand()%11/10.0f)));
+                        k % 2 == 0 ? Smoke->SetVelocity(Vector3(-3*rand()%2,0,-3*rand()%2)) : Smoke->SetVelocity(Vector3(3*rand()%2,0,3*rand()%2));
+                    }
+
+                    mWorld->DestroySkeleton(d);
+                    d --;
+                }
+            }
+        }
+    }
+
+    /// Arrows: fly them, resolve what they hit, land them, collect them, cap them. All of it is one
+    /// call into the world (CraftWorld::UpdateArrows) so that this state and the creative one cannot
+    /// disagree about what a shot does -- which is the point of moving it out, because these two
+    /// loops used to hold two copies of the whole thing and only one of the copies ever gets edited.
+    if(WorldRunning())//game state
+    {
+        mWorld->UpdateArrows(dt);
+    }
+
+    /// Draw the shots that are left: the ones in the air, and the ones that have landed and are
+    /// waiting to be walked over. A landed arrow is not simulated any more, so its own geometry is
+    /// rebuilt here instead of in Update -- it has stopped, so the heading it arrived on is the one it
+    /// keeps, and it still has to take the light where it fell.
+    if (mWorld->mArrows.empty() == false)
+    {
+        for(unsigned int i = 0; i < mWorld->mArrows.size(); i++)
+        {
+            if(i < mWorld->mArrows.size() && mWorld->mArrows.empty() == false)
+            {
+                Arrow2* UseArrow = mWorld->mArrows[i];
+
+                UseArrow->BuildVertices(mWorld);
+
+                MatrixPush();
+                MatrixTranslation(Vector3(0,0,0));
+                DrawSetDepthTest(true);
+                DrawSetAlphaTest(true);
+
+                UseArrow->Render();
+
+                DrawSetAlphaTest(false);
+                DrawSetDepthTest(false);
+                MatrixPop();
+            }
+        }
+    }
+
     /// render snowballs
     if (mSnowBalls.empty() == false)
     {
@@ -10573,7 +12133,7 @@ void StatePlay::Draw(StateManager* sManager)
                 TextureManager::Instance()->SetTextureModeulate(snowBall4);
                 SnowBall2* UseSnowBall = mSnowBalls[i];
 
-                if(menuState == 0)//game state
+                if(WorldRunning())//game state
                 {
                     UseSnowBall->Update(mWorld, dt);
                 }
@@ -10591,14 +12151,13 @@ void StatePlay::Draw(StateManager* sManager)
 
                 if(UseSnowBall->CheckCollision(mWorld) == true)
                 {
-                    if(mParticles.size() <= 52)
+                    if(Particle::ActiveCount() <= 52)
                     {
                         for(int k = 0; k <= 3; k++) // 4 particles
                         {
-                            Particle* SnowballPart = new Particle(mWorld,"item crack",Vector3(UseSnowBall->position.x,UseSnowBall->position.y+0.1f,UseSnowBall->position.z));
+                            Particle* SnowballPart = Particle::Spawn(mWorld,"item crack",Vector3(UseSnowBall->position.x,UseSnowBall->position.y+0.1f,UseSnowBall->position.z));
                             SnowballPart->var1 = SnowBallItem::getID()-250;
                             SnowballPart->SetScale(0.06f, 0.12f);
-                            mParticles.push_back(SnowballPart);
                         }
                     }
 
@@ -10611,29 +12170,8 @@ void StatePlay::Draw(StateManager* sManager)
     }
 
     /// render particles
-    if (mParticles.empty() == false)
-    {
-        for(unsigned int i = 0; i < mParticles.size(); i++)
-        {
-            if(i < mParticles.size() && mParticles.empty() == false)
-            {
-                Particle* TestParticle = mParticles[i];
-                if(menuState == 0)//game state
-                {
-                    TestParticle->Update(mWorld, dt);
-                }
-
-                TestParticle->Render(fppCam->mFrustum);
-
-                if(TestParticle->toDestroy == true)
-                {
-                    delete mParticles[i];
-                    mParticles.erase(mParticles.begin()+i);
-                    i --;
-                }
-            }
-        }
-    }
+    if(fppCam != NULL)
+        Particle::RenderAll(fppCam->mFrustum);
 
     /// render items in item frames
     if (mWorld->mItemFrames.empty() == false)
@@ -10655,7 +12193,7 @@ void StatePlay::Draw(StateManager* sManager)
     }
 
     /// weather effects rendering
-    if(menuState == 0 || makeScreen == true)
+    if(WorldRunning() || makeScreen == true)
     {
         if(mWorld->worldWeather->GetWeatherType() == 1) // if it is rain
         {
@@ -10669,22 +12207,21 @@ void StatePlay::Draw(StateManager* sManager)
             }
 
             rainSoundFrequency -= dt;
-            if(rainSoundFrequency <= 0.0f)
+            if(!mSoundMgr->RainSoundPlaying())
             {
-                int raindropsCount = mWorld->worldWeather->raindropsCount;
-                if(raindropsCount > 18)
-                {
-                    raindropsCount = 18;
-                }
-                if(raindropsCount > 0)
-                {
-                    mSoundMgr->PlayRainSound((raindropsCount/20.0f)*45);
-                }
-                rainSoundFrequency = 1.2 + (rand()%6)/10.0f;
+                mSoundMgr->PlayRainSound(20);
+                rainSoundFrequency = 0.55f;
+            }
+            else if(rainSoundFrequency <= 0.0f)
+            {
+                mSoundMgr->PlayRainSound(20);
+                rainSoundFrequency = 0.55f;
             }
         }
         else // clear weather
         {
+            mSoundMgr->StopRainSound();
+            rainSoundFrequency = 0.0f;
             if(mWorld->rainyColorAlpha > 0.0f)
             {
                 mWorld->rainyColorAlpha -= dt/8.0f;
@@ -10695,6 +12232,8 @@ void StatePlay::Draw(StateManager* sManager)
             }
         }
         mWorld->worldWeather->Update(mWorld, dt);
+        mWorld->UpdateButtons(dt);
+        mWorld->UpdateRepeaters(dt);
         mWorld->worldWeather->Render(mWorld, fppCam->mFrustum, fppCam->upDownAngle, playerPosition, dt);
     }
 
@@ -10715,7 +12254,7 @@ void StatePlay::Draw(StateManager* sManager)
         sceGuTexFilter(GU_NEAREST,GU_NEAREST);
         TextureManager::Instance()->SetTextureModeulate(texture);
 
-		destroyer->Update(dStd, mWorld, mWorld->GetBlock(cubePos.x,cubePos.y,cubePos.z));
+		destroyer->Update(dStd, mWorld, mWorld->GetBlock(cubePos.x,cubePos.y,cubePos.z), (int)cubePos.x, (int)cubePos.y, (int)cubePos.z);
 		destroyer->Render(dStd);
 
 		sceGuDepthMask(0);
@@ -10727,10 +12266,15 @@ void StatePlay::Draw(StateManager* sManager)
 		MatrixPop();
 	}
 
-	if(mWorld->mainOptions.guiDrawing == 1 && mWorld->HP > 0)
+    // First-person hand and held item. Skipped in third person: the model standing in the world is
+    // already holding the item, so drawing this too would put it inside the camera as well.
+	if(mWorld->mainOptions.guiDrawing == 1 && mWorld->HP > 0 && thirdPersonView == 0)
 	{
-        float cubeBob = sinf(bobCycle - (3.14/2) + 3.14)/16; // some animtaion vars
-        float cubeBob2 = cosf(bobCycle - (3.14/2) + 3.14)/18;
+        float cubeBob = 0.0f;
+        // No hand bob while flying; see StatePlayCreative's copy for the reasoning. canFly is always
+        // false in survival today, so this is a no-op here -- it is written the same way so the two
+        // hand blocks cannot drift apart if that ever changes.
+        float cubeBob2 = canFly ? 0.0f : (-fabsf(cosf(bobCycle)) * bobWalk / 18);
 
         sceGuColor(GU_COLOR(cubeLight,cubeLight,cubeLight,1)); // set color to drawing model
         if(sleepTime <= 0.0f)
@@ -10739,6 +12283,7 @@ void StatePlay::Draw(StateManager* sManager)
             {
                 TextureManager::Instance()->SetTextureModeulate(invPlayerTex);
                 sceGumPushMatrix();
+                sceGumLoadIdentity(); // hand is drawn in view space: drop the world-origin shift
 
                 //set view matrix to identity
                 sceGumMatrixMode(GU_VIEW);
@@ -10764,10 +12309,11 @@ void StatePlay::Draw(StateManager* sManager)
                 sceGumPopMatrix();
             }
 
-            if(mWorld->invId[27+barPosition] < 250 && mWorld->invId[27+barPosition] != -1)
+            if(IsBlockId(mWorld->invId[27+barPosition]) && mWorld->invId[27+barPosition] != -1)
             {
                 TextureManager::Instance()->SetTextureModeulate(texture);
                 sceGumPushMatrix();
+                sceGumLoadIdentity(); // hand is drawn in view space: drop the world-origin shift
 
                 //set view matrix to identity
                 sceGumMatrixMode(GU_VIEW);
@@ -10792,10 +12338,20 @@ void StatePlay::Draw(StateManager* sManager)
                 sceGumPopMatrix();
             }
 
-            if(mWorld->invId[27+barPosition] >= 250)
+            if(IsItemId(mWorld->invId[27+barPosition]))
             {
+                // A held bow is drawn as a weapon, and while the string is pulled it is drawn as one of
+                // its three pulling frames. Those frames are item types of their own, because an item's
+                // atlas cell is baked into its mesh at load and this is the only way to get a different
+                // cell into the hand. Both facts are shared with the skeleton and the third-person
+                // model, so a bow looks the same in every hand that holds one.
+                const int heldId = mWorld->invId[27+barPosition];
+                const bool holdingBow = IsBowItem(heldId);
+                const int drawId = holdingBow ? BowHeldMeshId(bowCharging == true ? BowDrawStage(bowCharge) : 0) : heldId;
+
                 mWorld->ItemHaveTerrainTexture(mWorld->invId[27+barPosition]) ? TextureManager::Instance()->SetTextureModeulate(texture) : TextureManager::Instance()->SetTextureModeulate(barItems);
                 sceGumPushMatrix();
+                sceGumLoadIdentity(); // hand is drawn in view space: drop the world-origin shift
 
                 //set view matrix to identity
                 sceGumMatrixMode(GU_VIEW);
@@ -10807,15 +12363,21 @@ void StatePlay::Draw(StateManager* sManager)
                 //rotate
                 sceGumRotateX(-0.33f);
                 sceGumRotateY(-1.47+sinf(animDest)*-0.3+PI); //-1.47
-                sceGumRotateZ(-3.13-sinf(animDest)*1.4); //-3.8
-                //scale
-                ScePspFVector3 scale = {0.435f,0.435f,0.435f};
+                // ~-PI stands the sprite up (GetItemVerts authors it upside down); the tilt is this
+                // hand's own solved angle, which puts the artwork's arrow in the plane the shot leaves
+                // along. The third person and the skeleton need different numbers -- their chains are
+                // different chains. See kHeldBowFirstPersonTilt.
+                sceGumRotateZ(-3.13-sinf(animDest)*1.4+(holdingBow ? kHeldBowFirstPersonTilt : 0.0f)); //-3.8
+                //scale. A bow is drawn at weapon size; every other item keeps the size its 16x16 face
+                // was tuned for. See kHeldBowScale.
+                float heldScale = (holdingBow == true) ? kHeldBowScale : 0.435f;
+                ScePspFVector3 scale = {heldScale,heldScale,heldScale};
                 sceGumScale(&scale);
 
                 //draw item
                 sceGuDisable(GU_DEPTH_TEST);
                 sceGuDepthMask(1);
-                mWorld->drawHandItems(mWorld->invId[27+barPosition],cubeLight);
+                mWorld->drawHandItems(drawId,cubeLight);
                 sceGuEnable(GU_DEPTH_TEST);
                 sceGuDepthMask(0);
 
@@ -10829,6 +12391,19 @@ void StatePlay::Draw(StateManager* sManager)
 
 	/// GUI
 	mRender->SetOrtho(0,0,0,0,0,0);
+
+	DrawSetDepthTest(false);
+    DrawSetDepthMask(true);
+    DrawSetBlend(true);
+    DrawPlaceTexture(true);
+
+    TextureManager::Instance()->SetTextureModeulate(Xpbar);
+	advancedBlit(0,0,SCR_WIDTH,SCR_HEIGHT,0,0,32);
+
+    DrawPlaceTexture(false);
+    DrawSetBlend(false);
+    DrawSetDepthMask(false);
+    DrawSetDepthTest(true);
 
     if(mWorld->HP <= 0)
 	{
@@ -10864,10 +12439,6 @@ void StatePlay::Draw(StateManager* sManager)
         DrawSetBlend(false);
         DrawSetDepthMask(false);
         DrawSetDepthTest(true);
-		
-        float bobSine = sinf(bobCycle/2.0f -PI/2.0f);
-        float bobCose = cosf(bobCycle - (PI/2.0f) + PI)/3.0f;
-        fppCam->m_vOffset = Vector3(0.02f,0.04f*bobSine+-0.04f,-0.02f);
 	}
 
 	if(headInLava == 1 || footInLava == 1)
@@ -10990,7 +12561,6 @@ void StatePlay::Draw(StateManager* sManager)
             hpAnim = 0.0f;
         }
         barSprite->Draw();
-		xpSprite->Draw();
         if (menuState != 1 || makeScreen == true)
         {
             /// HP and HG RENDERING
@@ -11199,9 +12769,9 @@ void StatePlay::Draw(StateManager* sManager)
             {
                 MatrixPush();
 
-                if(mWorld->invId[27+k] < 250)
+                if(IsBlockId(mWorld->invId[27+k]))
                 {
-					MatrixTranslation(Vector3(122 + k * 29, 230, 0));
+					MatrixTranslation(Vector3(108.0f + (11.0f + k * 20.0f) * (264.0f / 182.0f), 230, 0));
                     TextureManager::Instance()->SetTextureModeulate(texture);
 
                     sceGuDisable(GU_DEPTH_TEST);
@@ -11233,9 +12803,9 @@ void StatePlay::Draw(StateManager* sManager)
                     sceGuEnable(GU_DEPTH_TEST);
                 }
 
-                if(mWorld->invId[27+k] >= 250)
+                if(IsItemId(mWorld->invId[27+k]))
                 {
-                    MatrixTranslation(Vector3(122 + k * 29, 230, 0));
+                    MatrixTranslation(Vector3(108.0f + (11.0f + k * 20.0f) * (264.0f / 182.0f), 230, 0));
                     mWorld->ItemHaveTerrainTexture(mWorld->invId[27+k]) ? TextureManager::Instance()->SetTextureModeulate(texture) : TextureManager::Instance()->SetTextureModeulate(barItems);
 
                     MatrixAngle(Vector3(0,0,0));
@@ -11275,16 +12845,16 @@ void StatePlay::Draw(StateManager* sManager)
                 {
                     MatrixPush();
 
-                    MatrixTranslation(Vector3(276+j*36,46+i*36,0.0f));
+                    MatrixTranslation(Vector3(GuiSlotX(guiInvW, guiScale, 97.0f + j * 18.0f), GuiSlotY(guiInvH, guiScale, 14.0f + i * 18.0f), 0.0f));
 
-                    if(craftSlotId[i*2+j] < 250)
+                    if(IsBlockId(craftSlotId[i*2+j]))
                     {
                         TextureManager::Instance()->SetTextureModeulate(texture);
 
                         mWorld->drawHudCubes(craftSlotId[i*2+j]);
                     }
 
-                    if(craftSlotId[i*2+j] >= 250)
+                    if(IsItemId(craftSlotId[i*2+j]))
                     {
                         mWorld->ItemHaveTerrainTexture(craftSlotId[i*2+j]) ? TextureManager::Instance()->SetTextureModeulate(texture) : TextureManager::Instance()->SetTextureModeulate(barItems);
 
@@ -11295,28 +12865,33 @@ void StatePlay::Draw(StateManager* sManager)
             }
         }
 
-        for(int i = 0; i <= 1; i++)
+        // The armour slots are the four boxes that flank the player preview in inventory1.png,
+        // a 2x2 grid: (7,4) (61,4) / (7,40) (61,40) in texture units. Slot index runs along the
+        // rows, so helmet, chestplate on top and leggings, boots underneath.
+        for(int aRow = 0; aRow <= 1; aRow++)
         {
-            for(int j = 0; j <= 1; j++)
+            for(int aCol = 0; aCol <= 1; aCol++)
             {
-                if(mWorld->armorId[i*2+j] != -1)
+                int a = aRow * 2 + aCol;
+
+                if(mWorld->armorId[a] != -1)
                 {
                     MatrixPush();
 
-                    MatrixTranslation(Vector3(96+j*108,26+i*72,0.0f));
+                    MatrixTranslation(Vector3(GuiSlotX(guiInvW, guiScale, 7.0f + aCol * 54.0f), GuiSlotY(guiInvH, guiScale, 4.0f + aRow * 36.0f), 0.0f));
 
-                    if(mWorld->armorId[i*2+j] < 250)
+                    if(IsBlockId(mWorld->armorId[a]))
                     {
                         TextureManager::Instance()->SetTextureModeulate(texture);
 
-                        mWorld->drawHudCubes(mWorld->armorId[i*2+j]);
+                        mWorld->drawHudCubes(mWorld->armorId[a]);
                     }
 
-                    if(mWorld->armorId[i*2+j] >= 250)
+                    if(IsItemId(mWorld->armorId[a]))
                     {
-                        mWorld->ItemHaveTerrainTexture(mWorld->armorId[i*2+j]) ? TextureManager::Instance()->SetTextureModeulate(texture) : TextureManager::Instance()->SetTextureModeulate(barItems);
+                        mWorld->ItemHaveTerrainTexture(mWorld->armorId[a]) ? TextureManager::Instance()->SetTextureModeulate(texture) : TextureManager::Instance()->SetTextureModeulate(barItems);
 
-                        mWorld->drawHudItems(mWorld->armorId[i*2+j]);
+                        mWorld->drawHudItems(mWorld->armorId[a]);
                     }
                     MatrixPop();
                 }
@@ -11329,16 +12904,16 @@ void StatePlay::Draw(StateManager* sManager)
         {
             MatrixPush();
 
-            MatrixTranslation(Vector3(384,66,0.0f));
+            MatrixTranslation(Vector3(GuiSlotX(guiInvW, guiScale, 151.0f), GuiSlotY(guiInvH, guiScale, 24.0f), 0.0f));
 
-            if(craftItemId < 250)
+            if(IsBlockId(craftItemId))
             {
                 TextureManager::Instance()->SetTextureModeulate(texture);
 
                 mWorld->drawHudCubes(craftItemId);
             }
 
-            if(craftItemId >= 250)
+            if(IsItemId(craftItemId))
             {
                 mWorld->ItemHaveTerrainTexture(craftItemId) ? TextureManager::Instance()->SetTextureModeulate(texture) : TextureManager::Instance()->SetTextureModeulate(barItems);
 
@@ -11390,16 +12965,16 @@ void StatePlay::Draw(StateManager* sManager)
                 {
                     MatrixPush();
 
-                    MatrixTranslation(Vector3(204+j*36,26+i*36,0.0f));
+                    MatrixTranslation(Vector3(GuiSlotX(guiCrtW, guiScale, 61.0f + j * 18.0f), GuiSlotY(guiCrtH, guiScale, 4.0f + i * 18.0f), 0.0f));
 
-                    if(craftSlotId3[i*3+j] < 250)
+                    if(IsBlockId(craftSlotId3[i*3+j]))
                     {
                         TextureManager::Instance()->SetTextureModeulate(texture);
 
                         mWorld->drawHudCubes(craftSlotId3[i*3+j]);
                     }
 
-                    if(craftSlotId3[i*3+j] >= 250)
+                    if(IsItemId(craftSlotId3[i*3+j]))
                     {
                         mWorld->ItemHaveTerrainTexture(craftSlotId3[i*3+j] ) ? TextureManager::Instance()->SetTextureModeulate(texture) : TextureManager::Instance()->SetTextureModeulate(barItems);
 
@@ -11416,16 +12991,16 @@ void StatePlay::Draw(StateManager* sManager)
         {
             MatrixPush();
 
-            MatrixTranslation(Vector3(348,62,0.0f));
+            MatrixTranslation(Vector3(GuiSlotX(guiCrtW, guiScale, 133.0f), GuiSlotY(guiCrtH, guiScale, 22.0f), 0.0f));
 
-            if(craftItemId3 < 250)
+            if(IsBlockId(craftItemId3))
             {
                 TextureManager::Instance()->SetTextureModeulate(texture);
 
                 mWorld->drawHudCubes(craftItemId3);
             }
 
-            if(craftItemId3 >= 250)
+            if(IsItemId(craftItemId3))
             {
                 mWorld->ItemHaveTerrainTexture(craftItemId3) ? TextureManager::Instance()->SetTextureModeulate(texture) : TextureManager::Instance()->SetTextureModeulate(barItems);
 
@@ -11446,16 +13021,16 @@ void StatePlay::Draw(StateManager* sManager)
                 {
                     MatrixPush();
 
-                    MatrixTranslation(Vector3(96+j*36,26+i*36,0.0f));
+                    MatrixTranslation(Vector3(GuiSlotX(guiChtW, guiScale, 7.0f + j * 18.0f), GuiSlotY(guiChtH, guiScale, 4.0f + i * 18.0f), 0.0f));
 
-                    if(UseChest->chestSlotId[i*9+j] < 250)
+                    if(IsBlockId(UseChest->chestSlotId[i*9+j]))
                     {
                         TextureManager::Instance()->SetTextureModeulate(texture);
 
                         mWorld->drawHudCubes(UseChest->chestSlotId[i*9+j]);
                     }
 
-                    if(UseChest->chestSlotId[i*9+j] >= 250)
+                    if(IsItemId(UseChest->chestSlotId[i*9+j]))
                     {
                         mWorld->ItemHaveTerrainTexture(UseChest->chestSlotId[i*9+j]) ? TextureManager::Instance()->SetTextureModeulate(texture) : TextureManager::Instance()->SetTextureModeulate(barItems);
 
@@ -11473,17 +13048,17 @@ void StatePlay::Draw(StateManager* sManager)
         if(UseFurnace->furnaceSlotId[0] != -1)
         {
             sceGumPushMatrix();
-            ScePspFVector3 loc = {204,26,0.0f};
+            ScePspFVector3 loc = {GuiSlotX(guiFurW, guiScale, 61.0f), GuiSlotY(guiFurH, guiScale, 4.0f), 0.0f};
             sceGumTranslate(&loc);
 
-            if(UseFurnace->furnaceSlotId[0] < 250)
+            if(IsBlockId(UseFurnace->furnaceSlotId[0]))
             {
                 TextureManager::Instance()->SetTextureModeulate(texture);
 
                 mWorld->drawHudCubes(UseFurnace->furnaceSlotId[0]);
             }
 
-            if(UseFurnace->furnaceSlotId[0] >= 250)
+            if(IsItemId(UseFurnace->furnaceSlotId[0]))
             {
                 mWorld->ItemHaveTerrainTexture(UseFurnace->furnaceSlotId[0]) ? TextureManager::Instance()->SetTextureModeulate(texture) : TextureManager::Instance()->SetTextureModeulate(barItems);
 
@@ -11495,17 +13070,17 @@ void StatePlay::Draw(StateManager* sManager)
         if(UseFurnace->furnaceSlotId[1] != -1)
         {
             sceGumPushMatrix();
-            ScePspFVector3 loc = {204,98,0.0f};
+            ScePspFVector3 loc = {GuiSlotX(guiFurW, guiScale, 61.0f), GuiSlotY(guiFurH, guiScale, 40.0f), 0.0f};
             sceGumTranslate(&loc);
 
-            if(UseFurnace->furnaceSlotId[1] < 250)
+            if(IsBlockId(UseFurnace->furnaceSlotId[1]))
             {
                 TextureManager::Instance()->SetTextureModeulate(texture);
 
                 mWorld->drawHudCubes(UseFurnace->furnaceSlotId[1]);
             }
 
-            if(UseFurnace->furnaceSlotId[1] >= 250)
+            if(IsItemId(UseFurnace->furnaceSlotId[1]))
             {
                 mWorld->ItemHaveTerrainTexture(UseFurnace->furnaceSlotId[1]) ? TextureManager::Instance()->SetTextureModeulate(texture) : TextureManager::Instance()->SetTextureModeulate(barItems);
 
@@ -11517,17 +13092,17 @@ void StatePlay::Draw(StateManager* sManager)
         if(UseFurnace->furnaceSlotId[2] != -1)
         {
             sceGumPushMatrix();
-            ScePspFVector3 loc = {312,62,0.0f};
+            ScePspFVector3 loc = {GuiSlotX(guiFurW, guiScale, 115.0f), GuiSlotY(guiFurH, guiScale, 22.0f), 0.0f};
             sceGumTranslate(&loc);
 
-            if(UseFurnace->furnaceSlotId[2] < 250)
+            if(IsBlockId(UseFurnace->furnaceSlotId[2]))
             {
                 TextureManager::Instance()->SetTextureModeulate(texture);
 
                 mWorld->drawHudCubes(UseFurnace->furnaceSlotId[2]);
             }
 
-            if(UseFurnace->furnaceSlotId[2] >= 250)
+            if(IsItemId(UseFurnace->furnaceSlotId[2]))
             {
                 mWorld->ItemHaveTerrainTexture(UseFurnace->furnaceSlotId[2]) ? TextureManager::Instance()->SetTextureModeulate(texture) : TextureManager::Instance()->SetTextureModeulate(barItems);
 
@@ -11546,16 +13121,33 @@ void StatePlay::Draw(StateManager* sManager)
                 if(mWorld->invId[i*9+j] != -1)
                 {
                     MatrixPush();
-                    MatrixTranslation(Vector3(96+j*36,138+i*36,0.0f));
+                    float panelW = guiInvW;
+                    float panelH = guiInvH;
+                    if(craft3xEn)
+                    {
+                        panelW = guiCrtW;
+                        panelH = guiCrtH;
+                    }
+                    else if(chestEn)
+                    {
+                        panelW = guiChtW;
+                        panelH = guiChtH;
+                    }
+                    else if(furnaceEn)
+                    {
+                        panelW = guiFurW;
+                        panelH = guiFurH;
+                    }
+                    MatrixTranslation(Vector3(GuiSlotX(panelW, guiScale, 7.0f + j * 18.0f), GuiPlayerInvItemY(panelH, guiScale, i), 0.0f));
 
-                    if(mWorld->invId[i*9+j] < 250)
+                    if(IsBlockId(mWorld->invId[i*9+j]))
                     {
                         TextureManager::Instance()->SetTextureModeulate(texture);
 
                         mWorld->drawHudCubes(mWorld->invId[i*9+j]);
                     }
 
-                    if(mWorld->invId[i*9+j] >= 250)
+                    if(IsItemId(mWorld->invId[i*9+j]))
                     {
                         mWorld->ItemHaveTerrainTexture(mWorld->invId[i*9+j]) ? TextureManager::Instance()->SetTextureModeulate(texture) : TextureManager::Instance()->SetTextureModeulate(barItems);
 
@@ -11578,41 +13170,63 @@ void StatePlay::Draw(StateManager* sManager)
             {
                 if (invEn == 1)
                 {
-                    MatrixTranslation(Vector3(276+invXPosition*36,38+invYPosition*36,0.0f));
+                    MatrixTranslation(Vector3(GuiSlotX(guiInvW, guiScale, 97.0f + invXPosition * 18.0f), GuiSlotY(guiInvH, guiScale, 14.0f + invYPosition * 18.0f) - 8.0f, 0.0f));
                 }
                 if (craft3xEn == 1)
                 {
-                    MatrixTranslation(Vector3(204+invXPosition*36,18+invYPosition*36,0.0f));
+                    MatrixTranslation(Vector3(GuiSlotX(guiCrtW, guiScale, 61.0f + invXPosition * 18.0f), GuiSlotY(guiCrtH, guiScale, 4.0f + invYPosition * 18.0f) - 8.0f, 0.0f));
                 }
                 if (chestEn == 1)
                 {
-                    MatrixTranslation(Vector3(96+invXPosition*36,18+invYPosition*36,0.0f));
+                    MatrixTranslation(Vector3(GuiSlotX(guiChtW, guiScale, 7.0f + invXPosition * 18.0f), GuiSlotY(guiChtH, guiScale, 4.0f + invYPosition * 18.0f) - 8.0f, 0.0f));
                 }
                 if (furnaceEn == 1)
                 {
-                    MatrixTranslation(Vector3(204,18+(invYPosition * 72),0.0f));
+                    MatrixTranslation(Vector3(GuiSlotX(guiFurW, guiScale, 61.0f), GuiSlotY(guiFurH, guiScale, 4.0f + invYPosition * 36.0f) - 8.0f, 0.0f));
                 }
             }
             else
             {
                 if(armorEn == false)
                 {
-                    MatrixTranslation(Vector3(96 + (invXPosition * 36),130+(invYPosition * 36),0.0f)); // 8 upper
+                    float panelW = guiInvW;
+                    float panelH = guiInvH;
+                    if(craft3xEn)
+                    {
+                        panelW = guiCrtW;
+                        panelH = guiCrtH;
+                    }
+                    else if(chestEn)
+                    {
+                        panelW = guiChtW;
+                        panelH = guiChtH;
+                    }
+                    else if(furnaceEn)
+                    {
+                        panelW = guiFurW;
+                        panelH = guiFurH;
+                    }
+                    MatrixTranslation(Vector3(GuiSlotX(panelW, guiScale, 7.0f + invXPosition * 18.0f), GuiPlayerInvSlotY(panelH, guiScale, invYPosition) - 8.0f, 0.0f));
                 }
                 else
                 {
-                    MatrixTranslation(Vector3(96 + (invXPosition * 108),18+(invYPosition * 72),0.0f)); // 8 upper
+                    // The item held on the cursor while it is over the armour grid. This is the same
+                    // 2x2 the armour icons and the cursor use -- it was still on the old 1-D column
+                    // (x pinned at 7, y = 8 + row*18), so a carried item followed a place the grid no
+                    // longer is. The -8.0f matches the inventory branch above: the HUD item draw
+                    // centres half a slot low, so every caller pulls it up by the same amount.
+                    MatrixTranslation(Vector3(GuiSlotX(guiInvW, guiScale, 7.0f + invXPosition * 54.0f), GuiSlotY(guiInvH, guiScale, 4.0f + invYPosition * 36.0f) - 8.0f, 0.0f));
                 }
             }
 
-            if (mWorld->mId < 250)
+            if (IsBlockId(mWorld->mId))
             {
                 TextureManager::Instance()->SetTextureModeulate(texture);
 
                 mWorld->drawHudCubes(mWorld->mId);
             }
 
-            if (mWorld->mId >= 250)
+            if (IsItemId(mWorld->mId))
             {
                 mWorld->ItemHaveTerrainTexture(mWorld->mId) ? TextureManager::Instance()->SetTextureModeulate(texture) : TextureManager::Instance()->SetTextureModeulate(barItems);
 
@@ -11631,7 +13245,7 @@ void StatePlay::Draw(StateManager* sManager)
     {
         for(int k = 0; k <= 8; k++)
         {
-            if(mWorld->invId[27+k] >= 250)
+            if(IsItemId(mWorld->invId[27+k]))
             {
                 if(mWorld->DurabilityPointsItem(mWorld->invId[27+k]) != -1) // if it is tool
                 {
@@ -11653,30 +13267,32 @@ void StatePlay::Draw(StateManager* sManager)
         {
             for(int j = 0; j <= 1; j++)
             {
-                if(craftSlotId[i*2+j] >= 250 && mWorld->DurabilityPointsItem(craftSlotId[i*2+j]) != -1)
+                if(IsItemId(craftSlotId[i*2+j]) && mWorld->DurabilityPointsItem(craftSlotId[i*2+j]) != -1)
                 {
                     if(craftSlotAm[i*2+j] != mWorld->DurabilityPointsItem(craftSlotId[i*2+j])) // checking durability
                     {
                         unsigned int toolPointStd = roundf((float)(craftSlotAm[i*2+j]) / (float)(mWorld->DurabilityPointsItem(craftSlotId[i*2+j])) * 13);
 
-                        toolPointSprite[toolPointStd]->SetPosition(264+j*36,56+i*36);
+                        toolPointSprite[toolPointStd]->SetPosition(GuiDurX(GuiSlotX(guiInvW, guiScale, 97.0f + j * 18.0f)), GuiDurY(GuiSlotY(guiInvH, guiScale, 14.0f + i * 18.0f)));
                         toolPointSprite[toolPointStd]->Draw();
                     }
                 }
             }
         }
 
-        for(int i = 0; i <= 1; i++)
+        for(int aRow = 0; aRow <= 1; aRow++)
         {
-            for(int j = 0; j <= 1; j++)
+            for(int aCol = 0; aCol <= 1; aCol++)
             {
-                if(mWorld->armorId[i*2+j] >= 250 && mWorld->DurabilityPointsItem(mWorld->armorId[i*2+j]) != -1)
-                {
-                    if(mWorld->armorAm[i*2+j] != mWorld->DurabilityPointsItem(mWorld->armorId[i*2+j])) // checking durability
-                    {
-                        unsigned int toolPointStd = roundf((float)(mWorld->armorAm[i*2+j]) / (float)(mWorld->DurabilityPointsItem(mWorld->armorId[i*2+j])) * 13);
+                int a = aRow * 2 + aCol;
 
-                        toolPointSprite[toolPointStd]->SetPosition(84+j*108,36+i*72);
+                if(IsItemId(mWorld->armorId[a]) && mWorld->DurabilityPointsItem(mWorld->armorId[a]) != -1)
+                {
+                    if(mWorld->armorAm[a] != mWorld->DurabilityPointsItem(mWorld->armorId[a])) // checking durability
+                    {
+                        unsigned int toolPointStd = roundf((float)(mWorld->armorAm[a]) / (float)(mWorld->DurabilityPointsItem(mWorld->armorId[a])) * 13);
+
+                        toolPointSprite[toolPointStd]->SetPosition(GuiDurX(GuiSlotX(guiInvW, guiScale, 7.0f + aCol * 54.0f)), GuiDurY(GuiSlotY(guiInvH, guiScale, 4.0f + aRow * 36.0f)));
                         toolPointSprite[toolPointStd]->Draw();
                     }
                 }
@@ -11690,13 +13306,13 @@ void StatePlay::Draw(StateManager* sManager)
         {
             for(int j = 0; j <= 2; j++)
             {
-                if(craftSlotId3[i*3+j] >= 250 && mWorld->DurabilityPointsItem(craftSlotId3[i*3+j]) != -1)
+                if(IsItemId(craftSlotId3[i*3+j]) && mWorld->DurabilityPointsItem(craftSlotId3[i*3+j]) != -1)
                 {
                     if(craftSlotAm3[i*3+j] != mWorld->DurabilityPointsItem(craftSlotId3[i*3+j])) // checking durability
                     {
                         unsigned int toolPointStd = roundf((float)(craftSlotAm3[i*3+j]) / (float)(mWorld->DurabilityPointsItem(craftSlotId3[i*3+j])) * 13);
 
-                        toolPointSprite[toolPointStd]->SetPosition(192+j*36,36+i*36);
+                        toolPointSprite[toolPointStd]->SetPosition(GuiDurX(GuiSlotX(guiCrtW, guiScale, 61.0f + j * 18.0f)), GuiDurY(GuiSlotY(guiCrtH, guiScale, 4.0f + i * 18.0f)));
                         toolPointSprite[toolPointStd]->Draw();
                     }
                 }
@@ -11710,13 +13326,13 @@ void StatePlay::Draw(StateManager* sManager)
         {
             for(int j = 0; j <= 8; j++)
             {
-                if(UseChest->chestSlotId[i*9+j] >= 250 && mWorld->DurabilityPointsItem(UseChest->chestSlotId[i*9+j]) != -1)
+                if(IsItemId(UseChest->chestSlotId[i*9+j]) && mWorld->DurabilityPointsItem(UseChest->chestSlotId[i*9+j]) != -1)
                 {
                     if(UseChest->chestSlotAm[i*9+j] != mWorld->DurabilityPointsItem(UseChest->chestSlotId[i*9+j])) // checking durability
                     {
                         unsigned int toolPointStd = roundf((float)(UseChest->chestSlotAm[i*9+j]) / (float)(mWorld->DurabilityPointsItem(UseChest->chestSlotId[i*9+j])) * 13);
 
-                        toolPointSprite[toolPointStd]->SetPosition(84+j*36,36+i*36);
+                        toolPointSprite[toolPointStd]->SetPosition(GuiDurX(GuiSlotX(guiChtW, guiScale, 7.0f + j * 18.0f)), GuiDurY(GuiSlotY(guiChtH, guiScale, 4.0f + i * 18.0f)));
                         toolPointSprite[toolPointStd]->Draw();
                     }
                 }
@@ -11726,24 +13342,30 @@ void StatePlay::Draw(StateManager* sManager)
 
     if(furnaceEn == true)
     {
-        if(UseFurnace->furnaceSlotId[0] >= 250 && mWorld->DurabilityPointsItem(UseFurnace->furnaceSlotId[0]) != -1) // it is item and it have durability points
+        if(IsItemId(UseFurnace->furnaceSlotId[0]) && mWorld->DurabilityPointsItem(UseFurnace->furnaceSlotId[0]) != -1) // it is item and it have durability points
         {
-            if(UseFurnace->furnaceSlotAm[0] != mWorld->DurabilityPointsItem(UseFurnace->furnaceSlotId[0]) != -1)
+            // Only when the tool is actually damaged. The trailing `!= -1` that used to be here made this
+            // `((am != max) != -1)`, which is true for a full tool as well, so the bar was drawn for an
+            // undamaged one. The outer if has already established the item has durability, so the
+            // comparison on its own is the whole test -- the same shape as the inventory, crafting and
+            // chest slots above.
+            if(UseFurnace->furnaceSlotAm[0] != mWorld->DurabilityPointsItem(UseFurnace->furnaceSlotId[0])) // checking durability
             {
                 unsigned int toolPointStd = roundf((float)(UseFurnace->furnaceSlotAm[0]) / (float)(mWorld->DurabilityPointsItem(UseFurnace->furnaceSlotId[0])) * 13);
 
-                toolPointSprite[toolPointStd]->SetPosition(192,36);
+                toolPointSprite[toolPointStd]->SetPosition(GuiDurX(GuiSlotX(guiFurW, guiScale, 61.0f)), GuiDurY(GuiSlotY(guiFurH, guiScale, 4.0f)));
                 toolPointSprite[toolPointStd]->Draw();
             }
         }
 
-        if(UseFurnace->furnaceSlotId[1] >= 250 && mWorld->DurabilityPointsItem(UseFurnace->furnaceSlotId[1]) != -1) // it is item and it have durability points
+        if(IsItemId(UseFurnace->furnaceSlotId[1]) && mWorld->DurabilityPointsItem(UseFurnace->furnaceSlotId[1]) != -1) // it is item and it have durability points
         {
-            if(UseFurnace->furnaceSlotAm[1] != mWorld->DurabilityPointsItem(UseFurnace->furnaceSlotId[1]) != -1)
+            // See the slot 0 case above: the trailing `!= -1` made this guard always true.
+            if(UseFurnace->furnaceSlotAm[1] != mWorld->DurabilityPointsItem(UseFurnace->furnaceSlotId[1])) // checking durability
             {
                 unsigned int toolPointStd = roundf((float)(UseFurnace->furnaceSlotAm[1]) / (float)(mWorld->DurabilityPointsItem(UseFurnace->furnaceSlotId[1])) * 13);
 
-                toolPointSprite[toolPointStd]->SetPosition(192,108);
+                toolPointSprite[toolPointStd]->SetPosition(GuiDurX(GuiSlotX(guiFurW, guiScale, 61.0f)), GuiDurY(GuiSlotY(guiFurH, guiScale, 40.0f)));
                 toolPointSprite[toolPointStd]->Draw();
             }
         }
@@ -11755,7 +13377,7 @@ void StatePlay::Draw(StateManager* sManager)
         {
             for(int j = 0; j <= 8; j++)
             {
-                if(mWorld->invId[i*9+j] >= 250)
+                if(IsItemId(mWorld->invId[i*9+j]))
                 {
                     if(mWorld->DurabilityPointsItem(mWorld->invId[i*9+j]) != -1) // if it is tool
                     {
@@ -11763,7 +13385,24 @@ void StatePlay::Draw(StateManager* sManager)
                         {
                             unsigned int toolPointStd = roundf((float)(mWorld->invAm[i*9+j]) / (float)(mWorld->DurabilityPointsItem(mWorld->invId[i*9+j])) * 13);
 
-                            toolPointSprite[toolPointStd]->SetPosition(84+j*36,148+i*36);
+                            float panelW = guiInvW;
+                            float panelH = guiInvH;
+                            if(craft3xEn)
+                            {
+                                panelW = guiCrtW;
+                                panelH = guiCrtH;
+                            }
+                            else if(chestEn)
+                            {
+                                panelW = guiChtW;
+                                panelH = guiChtH;
+                            }
+                            else if(furnaceEn)
+                            {
+                                panelW = guiFurW;
+                                panelH = guiFurH;
+                            }
+                            toolPointSprite[toolPointStd]->SetPosition(GuiDurX(GuiSlotX(panelW, guiScale, 7.0f + j * 18.0f)), GuiDurY(GuiPlayerInvItemY(panelH, guiScale, i)));
                             toolPointSprite[toolPointStd]->Draw();
                         }
                     }
@@ -11771,7 +13410,7 @@ void StatePlay::Draw(StateManager* sManager)
             }
         }
 
-        if (mWorld->mId >= 250 && mWorld->DurabilityPointsItem(mWorld->mId) != -1)
+        if (IsItemId(mWorld->mId) && mWorld->DurabilityPointsItem(mWorld->mId) != -1)
         {
             if(mWorld->mAm != mWorld->DurabilityPointsItem(mWorld->mId))
             {
@@ -11910,16 +13549,16 @@ void StatePlay::Draw(StateManager* sManager)
             {
                 if(mWorld->invId[i*9+j] != -1 && mWorld->invAm[i*9+j] > 1)
                 {
-                    if(mWorld->invId[i*9+j] >= 250)
+                    if(IsItemId(mWorld->invId[i*9+j]))
                     {
                         if(mWorld->DurabilityPointsItem(mWorld->invId[i*9+j]) == -1)
                         {
-                            DrawAmount(106+j*36,164+i*36,mWorld->invAm[i*9+j]);
+                            DrawAmount((int)GuiAmtX(GuiSlotX(guiInvW, guiScale, 7.0f + j * 18.0f)), (int)GuiAmtY(GuiPlayerInvSlotY(guiInvH, guiScale, i)), mWorld->invAm[i*9+j]);
                         }
                     }
                     else
                     {
-                        DrawAmount(106+j*36,164+i*36,mWorld->invAm[i*9+j]);
+                        DrawAmount((int)GuiAmtX(GuiSlotX(guiInvW, guiScale, 7.0f + j * 18.0f)), (int)GuiAmtY(GuiPlayerInvSlotY(guiInvH, guiScale, i)), mWorld->invAm[i*9+j]);
                     }
                 }
             }
@@ -11929,7 +13568,7 @@ void StatePlay::Draw(StateManager* sManager)
         {
             bool canDraw = false;
 
-            if(mWorld->mId >= 250)
+            if(IsItemId(mWorld->mId))
             {
                 if(mWorld->DurabilityPointsItem(mWorld->mId) == -1)
                 {
@@ -11986,7 +13625,7 @@ void StatePlay::Draw(StateManager* sManager)
         {
             if (mWorld->invAm[27+k] > 1)
             {
-                if(mWorld->invId[27+k] >= 250) // if it is item but not a tool
+                if(IsItemId(mWorld->invId[27+k])) // if it is item but not a tool
                 {
                     if(mWorld->DurabilityPointsItem(mWorld->invId[27+k]) == -1)
                     {
@@ -12009,7 +13648,7 @@ void StatePlay::Draw(StateManager* sManager)
             {
                 if(craftSlotId[i*2+j] != -1 && craftSlotAm[i*2+j] > 1)
                 {
-                    if(craftSlotId[i*2+j] >= 250)
+                    if(IsItemId(craftSlotId[i*2+j]))
                     {
                         if(mWorld->DurabilityPointsItem(craftSlotId[i*2+j]) == -1)
                         {
@@ -12026,7 +13665,7 @@ void StatePlay::Draw(StateManager* sManager)
 
         if(craftItemId != -1)
         {
-            if(craftItemId >= 250)
+            if(IsItemId(craftItemId))
             {
                 if(mWorld->DurabilityPointsItem(craftItemId) == -1)
                 {
@@ -12048,7 +13687,7 @@ void StatePlay::Draw(StateManager* sManager)
             {
                 if(craftSlotId3[i*3+j] != -1 && craftSlotAm3[i*3+j] > 1)
                 {
-                    if(craftSlotId3[i*3+j] >= 250)
+                    if(IsItemId(craftSlotId3[i*3+j]))
                     {
                         if(mWorld->DurabilityPointsItem(craftSlotId3[i*3+j]) == -1)
                         {
@@ -12065,7 +13704,7 @@ void StatePlay::Draw(StateManager* sManager)
 
         if(craftItemId3 != -1)
         {
-            if(craftItemId3 >= 250)
+            if(IsItemId(craftItemId3))
             {
                 if(mWorld->DurabilityPointsItem(craftItemId3) == -1)
                 {
@@ -12087,7 +13726,7 @@ void StatePlay::Draw(StateManager* sManager)
             {
                 if(UseChest->chestSlotId[i*9+j] != -1 && UseChest->chestSlotAm[i*9+j] > 1)
                 {
-                    if(UseChest->chestSlotId[i*9+j] >= 250)
+                    if(IsItemId(UseChest->chestSlotId[i*9+j]))
                     {
                         if(mWorld->DurabilityPointsItem(UseChest->chestSlotId[i*9+j]) == -1)
                         {
@@ -12107,7 +13746,7 @@ void StatePlay::Draw(StateManager* sManager)
     {
         if(UseFurnace->furnaceSlotId[0] != -1 && UseFurnace->furnaceSlotAm[0] > 1)
         {
-            if(UseFurnace->furnaceSlotId[0] >= 250)
+            if(IsItemId(UseFurnace->furnaceSlotId[0]))
             {
                 if(mWorld->DurabilityPointsItem(UseFurnace->furnaceSlotId[0]) == -1)
                 {
@@ -12121,7 +13760,7 @@ void StatePlay::Draw(StateManager* sManager)
         }
         if(UseFurnace->furnaceSlotId[1] != -1 && UseFurnace->furnaceSlotAm[1] > 1)
         {
-            if(UseFurnace->furnaceSlotId[1] >= 250)
+            if(IsItemId(UseFurnace->furnaceSlotId[1]))
             {
                 if(mWorld->DurabilityPointsItem(UseFurnace->furnaceSlotId[1]) == -1)
                 {
@@ -12153,6 +13792,66 @@ void StatePlay::Draw(StateManager* sManager)
     int language = mRender->GetFontLanguage();
     mRender->SetFontStyle(0.345f,0xFFFFFFFF,0,0x00000200);
 
+    // Name of the item under the inventory cursor. The panels had no equivalent of the hotbar's name
+    // label below, which made the spawn eggs a guessing game: they are sixteen near-identical 16x16
+    // sprites, so telling one from another meant picking it up and putting it on the bar first.
+    //
+    // The cursor -> slot mapping is taken from the take/put code in HandleEvents, which is the only
+    // place it is actually defined. upEn picks the upper panel (2x2 craft grid, 3x3 craft grid, chest
+    // or furnace) and armorEn replaces the player grid with the 2x2 armour grid, and each of those
+    // uses its own index formula -- *9 for the inventory and chest, *2 and *3 for the craft grids,
+    // *2 + invXPosition for armour, and a bare invYPosition for the furnace. The two crafting OUTPUTS
+    // are deliberately absent: they sit at x 151 while the cursor stops at 115, so it can never rest
+    // on one (they are taken with a button press instead, whatever the cursor is over).
+    if(invEn == true || craft3xEn == true || chestEn == true || furnaceEn == true || armorEn == true)
+    {
+        int hoverId = -1;
+        if(armorEn == true)
+        {
+            // The armour grid is 2x2, indexed down its rows (armorId[invYPosition*2 + invXPosition]).
+            // An "empty" armour slot does not hold -1: it holds the id of the sample armour item for
+            // that slot, which is what HandleEvents tests against (armorId[i] != 324+i). Translating
+            // it here is the difference between the label naming the armour you are wearing and the
+            // label naming a piece that is not there at all.
+            int armorIdx = invYPosition * 2 + invXPosition;
+            if(mWorld->armorId[armorIdx] != 324 + armorIdx)
+            {
+                hoverId = mWorld->armorId[armorIdx];
+            }
+        }
+        else if(upEn == 1)
+        {
+            if(invEn == true)          hoverId = craftSlotId[invYPosition*2 + invXPosition];
+            else if(craft3xEn == true) hoverId = craftSlotId3[invYPosition*3 + invXPosition];
+            else if(chestEn == true)   hoverId = UseChest->chestSlotId[invYPosition*9 + invXPosition];
+            else if(furnaceEn == true) hoverId = UseFurnace->furnaceSlotId[invYPosition];
+        }
+        else
+        {
+            hoverId = mWorld->invId[invYPosition*9 + invXPosition];
+        }
+
+        // The label describes the slot under the cursor; when that slot is empty it describes what
+        // you are carrying instead, so "what did I just pick up?" is answerable in place too.
+        if(hoverId == -1)
+        {
+            hoverId = mWorld->mId;
+        }
+
+        if(hoverId != -1)
+        {
+            std::string hoverName = mWorld->NameBlock(hoverId);
+            if(hoverName != "null")   // NameBlock's answer for an id it does not know
+            {
+                mRender->SetFontStyle(0.5f,GU_COLOR(1,1,1,1),GU_COLOR(0.15f,0.15f,0.15f,1),0x00000200);
+                float hoverNameW = (float)mRender->GetTextWidth(hoverName.c_str());
+                float hoverX = GuiHoverLabelX(selectInvSprite->GetPositionX(),hoverNameW);
+                float hoverY = GuiHoverLabelY(selectInvSprite->GetPositionY());
+                mRender->DebugPrint((int)hoverX,(int)hoverY,"%s",hoverName.c_str());
+                mRender->SetFontStyle(0.345f,0xFFFFFFFF,0,0x00000200);
+            }
+        }
+    }
 
     if(invEn == false && craft3xEn == false && chestEn == false && furnaceEn == false && menuState == 0)
     {
@@ -12439,8 +14138,13 @@ void StatePlay::Draw(StateManager* sManager)
 
                 DrawText(240,24,GU_COLOR(1,1,1,1),default_size,"Options");
 
-                DrawText(110,24,GU_COLOR(1,1,1,1),default_size,"L");
-                DrawText(370,24,GU_COLOR(1,1,1,1),default_size,"R");
+                if(PauseOptionsIsSlider(optionsMenuPos))
+                {
+                    int sliderX = (optionsMenuPos < 8) ? 110 : 370;
+                    int sliderY = ((optionsMenuPos < 8) ? optionsMenuPos : (optionsMenuPos - 8)) * 30 + 49;
+                    DrawText(sliderX - 98, sliderY, GU_COLOR(1,1,0,1), default_size, "L");
+                    DrawText(sliderX + 98, sliderY, GU_COLOR(1,1,0,1), default_size, "R");
+                }
             }
         }
         else
@@ -12560,7 +14264,7 @@ void StatePlay::Draw(StateManager* sManager)
             if(tick_fps > dt/500.0f) // each 2 ms
             {
                 pre_fps += (1.0f/dt);
-                tick_fps - dt/500.0f;
+                tick_fps -= dt/500.0f;
                 ticks ++;
             }
 
@@ -12579,6 +14283,70 @@ void StatePlay::Draw(StateManager* sManager)
 
         mRender->DebugPrint(15,20,"Position: %f,%f,%f",playerPosition.x,playerPosition.y,playerPosition.z);
     }
+
+    if(menuState == 0)
+        mChat.Draw(mRender);
+
+    // The purple wash while a portal pulls the player through.
+    //
+    // Drawn as a screen-space quad rather than with Sprite. Sprite works in GU_TRANSFORM_3D, so it goes
+    // through the model matrix, while everything else on this screen -- the hotbar, the xp bar, the
+    // chat, the debug dim -- is 2D and bypasses it. A 2D quad also lets the 16x16 texture be stretched
+    // over the whole screen by giving the vertices the full screen rectangle and the texels only 0..16.
+    // advancedBlit cannot express that (it maps texels onto pixels one to one, which is why the xp bar
+    // has to be a native 480x272 image), and a Sprite would need a 30x17 scale that the model matrix
+    // then displaces.
+    //
+    // The blend function is set here rather than trusting whatever the world pass left behind: the
+    // transparent chunk pass and parts of the HUD switch between additive, inverted and straight alpha,
+    // and depth test is turned off here so the wash covers the world instead of being culled by it.
+    const float portalOverlay = mWorld->GetPortalOverlayAlpha();
+    if(portalOverlay > 0.0f)
+    {
+        // Diagnostic, so a run can prove the wash was both reached and drawn instead of the question
+        // being settled from a screenshot. Logged on the crossing of half, and re-armed below a fifth so
+        // a second portal logs again -- otherwise this is 120 lines per transition.
+        static bool sLoggedPortalWash = false;
+        if(portalOverlay > 0.5f && sLoggedPortalWash == false)
+        {
+            MC_DEBUG_LOG("portal wash reached alpha=%.2f\n", portalOverlay);
+            sLoggedPortalWash = true;
+        }
+        else if(portalOverlay < 0.2f)
+        {
+            sLoggedPortalWash = false;
+        }
+
+        if(portalFadeTex < 0)
+            portalFadeTex = TextureHelper::Instance()->GetTexture(TextureHelper::PortalFade);
+
+        if(portalFadeTex >= 0)
+        {
+            // Texturing is not switched on by SetTextureModeulate, only bound, and the HUD leaves it off
+            // in places -- the xp bar's full-screen blit turns it back off immediately after itself.
+            // Without this the quad modulates by nothing and reads as a white wash instead of purple.
+            DrawPlaceTexture(true);
+            TextureManager::Instance()->SetTextureModeulate(portalFadeTex);
+
+            sceGuDisable(GU_DEPTH_TEST);
+            sceGuEnable(GU_BLEND);
+            sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
+            sceGuColor(GU_COLOR(1, 1, 1, portalOverlay));
+
+            // GU_SPRITES with two vertices, which is the call advancedBlit uses for every 2D blit in the
+            // HUD and the one the xp bar fills the screen with, rather than a four-vertex triangle strip.
+            // The sprite is the screen rectangle and its corners carry texels 0 and 16, which is how the
+            // whole 16x16 texture is stretched across 480x272.
+            TexturesPSPVertex16* quad = (TexturesPSPVertex16*)sceGuGetMemory(2 * sizeof(TexturesPSPVertex16));
+            quad[0].u = 0;  quad[0].v = 0;  quad[0].x = 0;         quad[0].y = 0;         quad[0].z = 0;
+            quad[1].u = 16; quad[1].v = 16; quad[1].x = SCR_WIDTH; quad[1].y = SCR_HEIGHT; quad[1].z = 0;
+            sceGuDrawArray(GU_SPRITES, GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D, 2, 0, quad);
+        }
+    }
+
+    // The debug stick's menu, last so it sits over the world, the HUD and the chat. It handles its
+    // own depth-test and blend state, the same way the pause menu's button block does.
+    debugMenu.Render(mRender);
 
     //end frame
     mRender->EndFrame();
@@ -12638,7 +14406,15 @@ bool StatePlay::TryToMove(Vector3 moveVector,float dt)
 
     if (!mWorld->SolidAtPointForPlayer(movePosition) && !mWorld->SolidAtPointForPlayer(lowerBodyPoint) && !mWorld->SolidAtPointForPlayer(midBodyPoint))
     {
-        playerPosition = playerPosition + moveVector*slowDown;
+        Vector3 dest = playerPosition + moveVector*slowDown;
+        if(sneaking && walkingOnGround && (moveVector.x != 0.0f || moveVector.z != 0.0f))
+        {
+            Vector3 destFoot = dest + Vector3(0.0f, -mWorld->playerGrowth - 0.05f, 0.0f);
+            Vector3 curFoot = playerPosition + Vector3(0.0f, -mWorld->playerGrowth - 0.05f, 0.0f);
+            if(mWorld->SolidAtPointForPlayer(curFoot) && !mWorld->SolidAtPointForPlayer(destFoot))
+                return false;
+        }
+        playerPosition = dest;
 
         return true;
     }
@@ -12653,12 +14429,12 @@ bool StatePlay::TryToMove(Vector3 moveVector,float dt)
     midLowBodyPoint = movePosition + Vector3(0, -mWorld->playerGrowth+0.6f, 0);
     lowerBodyPoint = movePosition + Vector3(0, -mWorld->playerGrowth+0.1f, 0);
 
-    Vector3 footPosition = playerPosition + Vector3(0.0f, -1.65f, 0.0f);
+    Vector3 footPosition = playerPosition + Vector3(0.0f, -mWorld->playerGrowth, 0.0f);
 
-    unsigned char lowerBlock = mWorld->BlockAtPoint(lowerBodyPoint);
-    unsigned char midLowBlock = mWorld->BlockAtPoint(midLowBodyPoint);
-    unsigned char midBlock = mWorld->BlockAtPoint(midBodyPoint);
-    unsigned char upperBlock = mWorld->BlockAtPoint(movePosition);
+    block_t lowerBlock = mWorld->BlockAtPoint(lowerBodyPoint);
+    block_t midLowBlock = mWorld->BlockAtPoint(midLowBodyPoint);
+    block_t midBlock = mWorld->BlockAtPoint(midBodyPoint);
+    block_t upperBlock = mWorld->BlockAtPoint(movePosition);
 
 
     if ((mWorld->blockTypes[lowerBlock].blockModel == 1 || (mWorld->blockTypes[lowerBlock].blockModel >= 6 && mWorld->blockTypes[lowerBlock].blockModel <= 9)) &&
@@ -12672,7 +14448,7 @@ bool StatePlay::TryToMove(Vector3 moveVector,float dt)
         return true;
     }
 
-    unsigned char footBlock = mWorld->GetBlock(footPosition.x,footPosition.y,footPosition.z);
+    block_t footBlock = mWorld->GetBlock(footPosition.x,footPosition.y,footPosition.z);
     if (mWorld->blockTypes[footBlock].blockModel == 1 &&
         mWorld->blockTypes[lowerBlock].solid == true &&
         mWorld->blockTypes[midLowBlock].solid == false &&
@@ -12849,6 +14625,140 @@ bool StatePlay::keyPressed(int currentKey)
     return false;
 }
 
+#if MC_AUTO_WALK
+// ---------------------------------------------------------------------------------------------
+// Development-only auto-walk -- see MC_AUTO_WALK in DebugConfig.h for why it exists.
+//
+// StatePlay::keyHold turns the analog into the four direction booleans the movement code consumes
+// (keys 11-14; the connection table in InputHelper.cpp binds Forward/Back/Left/Right to analog
+// up/down/left/right). Returning the probe's direction from that ONE place means the walk is driven by
+// exactly the code a human drives. It deliberately does not write the player's position: bypassing the
+// movement path would skip collision, the camera-relative direction and the speed ramp, i.e. most of
+// what is being measured.
+//
+// The path is a patrol, one leg per direction, so the player keeps crossing ground it has not loaded,
+// which is the case the streamer and the mesher are measured on. A straight line runs into the first
+// hill and stops; a circle comes back round to ground already resident.
+//
+// Eight headings rather than four, and a stuck check, because the overworld's square does not survive
+// the nether. Measured on the nether probe: 174 of 178 seconds were spent standing still. A cave there
+// is a corridor of netherrack, so a leg pointing at a wall is a leg that never happens, and whichever
+// direction the square asked for next was the same wall twice more often than not. Turning alone does
+// not fix it either -- the legs were long enough that one blocked leg was most of the run.
+//
+// So: shorter legs, and the heading moves on by one when the player stops making progress. Nothing here
+// teleports the player or reads the terrain; a blocked path is detected only by the fact that the
+// player's own collision did not let them move, which is the same signal a human would act on.
+namespace autowalk
+{
+    const float kSettleSecs = 8.0f;    // let the world finish its first mesh before walking into it
+    const float kLegSecs    = 12.0f;   // one leg of the patrol
+    const float kStuckSecs  = 2.5f;    // this long without progress means the way ahead is blocked
+    const float kStuckDist  = 0.75f;   // horizontal blocks that count as real progress over that window
+
+    float t = 0.0f;
+    int   heading = 0;                 // added to the leg index, so a turn takes effect immediately
+    float sinceCheck = 0.0f;
+    float lastX = 0.0f;
+    float lastZ = 0.0f;
+    bool  haveLast = false;
+    float logTimer = 0.0f;
+    int   stuckCount = 0;
+    // Per-second counts of how often keyHold was actually ASKED for each direction by the movement
+    // code. This is what separates the two ways a walk can stand still: the request never reaches the
+    // movement code (nothing asks), or it reaches it and the world refuses (something asks, the player
+    // does not move). The camera velocity in the log tells the same two apart from the other side.
+    int   ask[4] = { 0, 0, 0, 0 };      // forward, back, left, right
+
+    // Heading 0..7 clockwise from forward. The movement code reads forward/back and left/right as
+    // separate booleans and combines them, so a diagonal is simply two of them set -- which is also
+    // why the diagonals are reachable here at all (see the analog block in keyHold).
+    const bool kDir[8][4] = {
+        // fwd    back   left   right
+        { true,  false, false, false },   // 0  forward
+        { true,  false, false, true  },   // 1  forward-right
+        { false, false, false, true  },   // 2  right
+        { false, true,  false, true  },   // 3  back-right
+        { false, true,  false, false },   // 4  back
+        { false, true,  true,  false },   // 5  back-left
+        { false, false, true,  false },   // 6  left
+        { true,  false, true,  false },   // 7  forward-left
+    };
+}
+
+// Which directions the probe is asking for right now.
+static void AutoWalkDirections(bool &fwd, bool &back, bool &left, bool &right)
+{
+    fwd = back = left = right = false;
+    if(autowalk::t < autowalk::kSettleSecs)
+        return;
+    const float leg = autowalk::t - autowalk::kSettleSecs;
+    const int legIndex = (int)(leg / autowalk::kLegSecs);
+    const int h = (legIndex + autowalk::heading) & 7;
+    fwd   = autowalk::kDir[h][0];
+    back  = autowalk::kDir[h][1];
+    left  = autowalk::kDir[h][2];
+    right = autowalk::kDir[h][3];
+}
+
+// Called once a frame from Update, NOT from keyHold: keyHold is called once per action per frame, so a
+// clock advanced in there would run several times faster than real time.
+static void AutoWalkTick(float dt)
+{
+    autowalk::t += dt;
+}
+
+// Called once a frame from Update with the player's feet, which keyHold has no way to supply. Bumps the
+// heading when a whole window passes without the player actually going anywhere -- see the namespace
+// comment for why the nether needs it.
+static void AutoWalkProgress(float dt, float x, float y, float z, float vx, float vz, float hp)
+{
+    if(autowalk::t < autowalk::kSettleSecs)
+        return;
+    if(!autowalk::haveLast)
+    {
+        autowalk::haveLast = true;
+        autowalk::lastX = x;
+        autowalk::lastZ = z;
+        return;
+    }
+    autowalk::sinceCheck += dt;
+
+    // Once a second, where the player actually is. This is here because `mesh/s` cannot answer "did the
+    // walk move": a cave pocket is fully meshed within a few seconds, so a player walking around inside
+    // one produces no meshing at all and the perf line reads as idle while the walk is working fine.
+    // Only the position settles whether a leg is blocked.
+    autowalk::logTimer += dt;
+    if(autowalk::logTimer >= 1.0f)
+    {
+        autowalk::logTimer -= 1.0f;
+        // asked = keyHold was consulted that many times this second for fwd/back/left/right; vel = the
+        // camera's own horizontal velocity, so a non-zero component with a static position means the
+        // input arrived and collision is refusing the move.
+        Aurora::Utils::Logger::Instance()->LogMessage(
+            "walk t=%.1f pos=%.2f,%.2f,%.2f hp=%.1f heading=%d turns=%d asked=%d/%d/%d/%d vel=%.3f,%.3f\n",
+            autowalk::t, x, y, z, hp, autowalk::heading, autowalk::stuckCount,
+            autowalk::ask[0], autowalk::ask[1], autowalk::ask[2], autowalk::ask[3], vx, vz);
+        autowalk::ask[0] = autowalk::ask[1] = autowalk::ask[2] = autowalk::ask[3] = 0;
+    }
+
+    if(autowalk::sinceCheck < autowalk::kStuckSecs)
+        return;
+
+    const float dx = x - autowalk::lastX;
+    const float dz = z - autowalk::lastZ;
+    const float dist = sqrtf(dx * dx + dz * dz);
+    autowalk::sinceCheck = 0.0f;
+    autowalk::lastX = x;
+    autowalk::lastZ = z;
+    if(dist < autowalk::kStuckDist)
+    {
+        autowalk::heading = (autowalk::heading + 1) & 7;
+        autowalk::stuckCount++;
+    }
+}
+#endif
+
 bool StatePlay::keyHold(int currentKey)
 {
     if(currentKey == 0)//cross
@@ -12879,14 +14789,60 @@ bool StatePlay::keyHold(int currentKey)
         return mSystemMgr->KeyHold(PSP_CTRL_START);
 
     //analog stick....
-    if(currentKey == 12)//cross
-        return (mSystemMgr->GetAnalogY() > InputHelper::Instance()->analogYup);//analog up
-    if(currentKey == 11)//cross
-        return (mSystemMgr->GetAnalogY() < InputHelper::Instance()->analogYdown);//analog down
-    if(currentKey == 13)//cross
-        return (mSystemMgr->GetAnalogX() < InputHelper::Instance()->analogXleft);//analog left
-    if(currentKey == 14)//cross
-        return (mSystemMgr->GetAnalogX() > InputHelper::Instance()->analogXright);//analog right
+    //
+    // One radial deadzone for the whole stick, then an 8-way test on the components, rather than
+    // four independent per-axis thresholds. A per-axis test cannot express a diagonal: it made a
+    // 45-degree push clear BOTH axis thresholds at once, which needs sqrt(2) more throw than a
+    // straight push, so once the sensitivity setting was high enough a diagonal fell between the
+    // two and registered nothing -- which is exactly how it presented (forward/back/left/right
+    // fine, every diagonal dead). Here the stick clears the same distance in every direction, and
+    // a second direction counts when its component is at least kAnalogDiagonalShare of the larger
+    // one, so a straight push claims one way and a diagonal claims two. The movement code reads
+    // forward/back and left/right as separate booleans and combines them, so that is all it needs.
+    if(currentKey >= 11 && currentKey <= 14)
+    {
+#if MC_AUTO_WALK
+        // Development-only auto-walk. Falls through to the real stick while the probe is not walking
+        // yet, so the pad still works in a probe build and the settle window is honest.
+        {
+            bool fwd, back, left, right;
+            AutoWalkDirections(fwd, back, left, right);
+            if(fwd || back || left || right)
+            {
+                if(currentKey == 11) { autowalk::ask[0]++; return fwd; }      // analog up    -- Forward
+                if(currentKey == 12) { autowalk::ask[1]++; return back; }     // analog down  -- Back
+                if(currentKey == 13) { autowalk::ask[2]++; return left; }     // analog left  -- Left
+                autowalk::ask[3]++; return right;                             // analog right -- Right
+            }
+        }
+#endif
+        float ax = mSystemMgr->GetAnalogX();
+        float ay = mSystemMgr->GetAnalogY();
+        float mag = sqrtf(ax * ax + ay * ay);
+
+        // The four per-axis settings (0.1 .. 0.9, from Settings) average to the single radius a
+        // radial deadzone is defined by; they are kept symmetric in practice, and a radial gate is
+        // symmetric by construction. Two are stored negative, hence the sum rather than a min.
+        float dead = (InputHelper::Instance()->analogYup - InputHelper::Instance()->analogYdown
+                    + InputHelper::Instance()->analogXright - InputHelper::Instance()->analogXleft) * 0.25f;
+        if(dead < 0.0f)
+            dead = -dead;
+        if(mag < dead)
+            return false;
+
+        const float kAnalogDiagonalShare = 0.5f;   // a component this much of the larger axis is a second way
+        float axAbs = fabsf(ax);
+        float ayAbs = fabsf(ay);
+        float big = (axAbs > ayAbs) ? axAbs : ayAbs;
+
+        if(currentKey == 11)   //analog up (action Forward is bound here on this build)
+            return (ay < 0.0f && ayAbs >= big * kAnalogDiagonalShare);
+        if(currentKey == 12)   //analog down (action Back)
+            return (ay > 0.0f && ayAbs >= big * kAnalogDiagonalShare);
+        if(currentKey == 13)   //analog left (action Left)
+            return (ax < 0.0f && axAbs >= big * kAnalogDiagonalShare);
+        return (ax > 0.0f && axAbs >= big * kAnalogDiagonalShare);   //analog right (action Right)
+    }
 
     return false;
 }
@@ -12970,6 +14926,8 @@ void StatePlay::HurtPlayer(float damage)
     last_HP = mWorld->HP;
     mWorld->HP -= damage;
     mWorld->mainStatistics.damageRecieved += damage;
+    // Java: EntityPlayer.damageEntity -> addExhaustion(0.1F). Taking a beating is hungry work.
+    mWorld->AddExhaustion(EXHAUST_DAMAGE);
 
     if(mWorld->HP > 0)
     {
@@ -12992,6 +14950,46 @@ void StatePlay::HurtPlayerConsiderArmor(float damage)
         hurt_time = 1.0f;
         hpAnim = 0.0f;
     }
+}
+
+// The bow's release. bowCharge is 0..1 (one second of draw) and vanilla bends it, not uses it
+// straight: f = (c^2 + 2c) / 3, so half a second gives 0.42 of full speed and the last fifth of the
+// draw is worth almost nothing. SetVeloc already applies the same power to the arrow's drop, which
+// is what makes a tapped shot fall short of a held one. Vanilla also refuses a shot drawn for less
+// than two ticks; 0.1 on the curve is that same floor.
+void StatePlay::FireBowArrow()
+{
+    float power = (bowCharge*bowCharge + 2.0f*bowCharge) / 3.0f;
+    if(power < 0.1f)
+        return;
+    if(power > 1.0f)
+        power = 1.0f;
+
+    // Creative looses without the pack: a world switched to creative in-game still runs this state,
+    // and the draw above already let the player pull the string with no arrows, so spending one here
+    // would be a dry release on a draw that was allowed to happen. `gameModeWorld` is the mode the
+    // world itself carries, which is what StatePlay goes by everywhere else; see HasItemInInventory.
+    if(mWorld->gameModeWorld != 1 && mWorld->ConsumeOneItemFromInventory(Arrow::getID()) == false)
+        return;
+
+    Arrow2* arrow = new Arrow2(fppCam->m_vPosition.x, fppCam->m_vPosition.y, fppCam->m_vPosition.z);
+    arrow->SetTexture(TextureHelper::Instance()->GetTexture(TextureHelper::arrowProjectileTexture));
+    arrow->SetVeloc(fppCam->upDownAngle, (fppCam->horAngle/(float)180)*PI, power);
+    // Banded the way the skeleton's shot is weighted (it fires a flat 2.0): a tap does 2, a full draw
+    // does 8. Same units as every other hit in the game -- 2.0 is one heart.
+    arrow->damage = 2.0f + 6.0f*power;
+    arrow->fromMob = false;
+    mWorld->mArrows.push_back(arrow);
+
+    // The shot is away, so the bow has been used: one point of its 384, and it breaks if that was
+    // the last one. After the push_back rather than before it, so a bow on its final use still
+    // looses the arrow it was drawn for -- vanilla fires the shot and then breaks the bow.
+    WearBowOnShot(mWorld, mSoundMgr, barPosition);
+
+    mSoundMgr->PlayBowSound();
+
+    animGo = true;
+    animDest = 0.0f;
 }
 
 void StatePlay::PutInInventory(int id, int num, bool st)
@@ -13062,16 +15060,423 @@ void StatePlay::PutInInventory(int id, int num, bool st)
     }
 }
 
+// Right-click with the debug stick in hand. Finds whatever is being aimed at and asks it to describe
+// its own debug menu; nothing is assumed about the mob here, which is what makes this work for a
+// block later without touching this function.
+void StatePlay::CheckDebugStickUse()
+{
+    if(mWorld == NULL || fppCam == NULL)
+        return;
+
+    Vector3 dir = fppCam->m_vView - fppCam->m_vPosition;
+    dir.normalize();
+
+    // The same 5-block reach the feeding and ignition rays use. A testing tool needs to be able to
+    // touch a mob without standing inside it, and standing inside it is exactly what a mob that is
+    // being debugged tends to do.
+    LameMob* mob = FindMobForUse(mWorld, fppCam->m_vPosition, dir, 5.0f);
+    if(mob == NULL)
+    {
+        mChat.AddLine("Debug stick: nothing to point it at", 1.0f, 0.6f, 0.3f);
+        return;
+    }
+
+    std::vector<std::string> options;
+    if(mob->DebugOptions(options) <= 0)
+    {
+        mChat.AddLine(std::string("Debug stick: ") + mob->debugName + " has no debug actions", 1.0f, 0.6f, 0.3f);
+        return;
+    }
+
+    // Held, not passed: the menu closes the moment the player picks something, and the action then
+    // has to be applied to the same mob on a later frame.
+    debugTarget = mob;
+    debugMenu.Open(mob->debugName, options);
+    mSoundMgr->PlayMenuSound2();
+}
+
+// Applies the debug menu's answer, if there is one. Reads and clears, so a choice is acted on once.
+void StatePlay::ApplyDebugMenuResult()
+{
+    int picked = debugMenu.ConsumeResult();
+    if(picked == DebugMenu::RESULT_NONE)
+        return;
+
+    if(picked == DebugMenu::RESULT_CANCELLED)
+    {
+        debugTarget = NULL;
+        return;
+    }
+
+    if(debugTarget != NULL)
+    {
+        // The mob may have been destroyed between opening the menu and choosing. The world is frozen
+        // while the menu is up so this should be impossible, but dereferencing a stale pointer is a
+        // crash rather than a wrong-looking menu, so it is worth the four lines.
+        bool live = false;
+        for(unsigned int i = 0; i < mWorld->mSkeletons.size(); i++)
+            if((LameMob*)mWorld->mSkeletons[i] == debugTarget) live = true;
+        for(unsigned int i = 0; i < mWorld->mZombies.size(); i++)
+            if((LameMob*)mWorld->mZombies[i] == debugTarget) live = true;
+        for(unsigned int i = 0; i < mWorld->mCows.size(); i++)
+            if((LameMob*)mWorld->mCows[i] == debugTarget) live = true;
+        for(unsigned int i = 0; i < mWorld->mPigs.size(); i++)
+            if((LameMob*)mWorld->mPigs[i] == debugTarget) live = true;
+        for(unsigned int i = 0; i < mWorld->mSheeps.size(); i++)
+            if((LameMob*)mWorld->mSheeps[i] == debugTarget) live = true;
+        for(unsigned int i = 0; i < mWorld->mChickens.size(); i++)
+            if((LameMob*)mWorld->mChickens[i] == debugTarget) live = true;
+        for(unsigned int i = 0; i < mWorld->mSpiders.size(); i++)
+            if((LameMob*)mWorld->mSpiders[i] == debugTarget) live = true;
+        for(unsigned int i = 0; i < mWorld->mCreepers.size(); i++)
+            if((LameMob*)mWorld->mCreepers[i] == debugTarget) live = true;
+
+        if(live == true)
+            debugTarget->DebugAction(picked);
+    }
+
+    debugTarget = NULL;
+}
+
+bool StatePlay::WorldRunning()
+{
+    // The world is ticked from Draw, not Update: StatePlay::Draw carries the mob, drop, TNT, arrow,
+    // snowball and weather updates, each individually guarded on `menuState == 0`. So the pause menu
+    // stops the world by leaving menuState at 1, and an early return from Update -- which is where the
+    // debug menu's hold started life -- stops nothing at all, because Update is not where the world
+    // advances. That is why a skeleton burned to death behind an open menu: the menu held Update, the
+    // mobs kept ticking in Draw. Every one of those guards now asks this instead.
+    //
+    // menuState stays 0 while the debug menu is up, so the world still renders; only its simulation
+    // is held.
+    return menuState == 0 && debugMenu.IsOpen() == false;
+}
+
+#if MC_PERF_PROBE
+// ---------------------------------------------------------------------------------------------
+// Development-only cost probe -- see MC_PERF_PROBE in DebugConfig.h.
+//
+// The per-second counters in Scripts/PerfCounters.h say how *much* work a frame did; they cannot
+// say what a unit of it costs. This closes that loop by timing one of each operation a running
+// circuit performs, in the world that was just generated. The world is a throwaway: this writes a
+// wire line and a torch into it and never saves, which is why the probe is a command-line switch
+// and not a build anyone plays.
+//
+// One caveat worth stating where the numbers are produced: these are microseconds on whatever is
+// running the EBOOT. In PPSSPP that is an x86 core at GHz speeds and the absolute figures are
+// meaningless -- the *ratios* between the seven lines are not, and those are what the probe is
+// for. A PSP run gives real microseconds.
+static unsigned int PerfProbeNow()
+{
+    return sceKernelGetSystemTimeLow();
+}
+
+#if MC_PERF_PROBE
+// ---------------------------------------------------------------------------------------------
+// The other half of the probe: a *running* clock. See StatePlay::PerfProbeDriveClock.
+//
+// The micro-benchmarks price one operation each, in isolation, with nothing else in flight -- which is
+// the right way to price a unit but not the shape of the thing being reported. A redstone clock is a
+// producer that runs faster than a frame, and what that costs is only visible in what the frame does
+// per second: how deep the mesh and light queues stand and whether the frame budget is spent working
+// or waiting. So the two torches the benchmarks leave in the world are kept flipping from the update
+// loop at a plain torch clock's rate for a bounded window, and the ordinary per-second `perf` lines
+// report the steady state.
+namespace probeclock
+{
+    const int   kTorches    = 2;
+    const float kPeriod     = 0.2f;   // 5 Hz per torch, i.e. the 10 flips/s of a plain torch clock
+    const float kRunSeconds = 20.0f;
+
+    int   px[kTorches];
+    int   py[kTorches];
+    int   pz[kTorches];
+    bool  lit[kTorches];
+    int   live     = 0;
+    float left     = 0.0f;
+    float acc      = 0.0f;
+}
+#endif
+
+void StatePlay::PerfProbeSelfTest()
+{
+    if(mWorld == NULL)
+        return;
+
+    const int bx = (int)playerPosition.x + 4;
+    const int bz = (int)playerPosition.z + 4;
+    const int by = mWorld->groundHeight(bx, bz) + 1;
+    if(by <= 1 || by + 4 >= WORLD_HEIGHT)
+    {
+        MC_DEBUG_LOG("perfprobe: no room at y=%d\n", by);
+        return;
+    }
+
+    // Clear a pad and lay the wire on it. The pad is bigger than the wire so the "empty window"
+    // case below is measuring an empty window and not the terrain that happened to be there.
+    for(int k = 0; k <= 3; k++)
+        for(int j = -1; j <= 4; j++)
+            for(int i = -1; i <= 40; i++)
+                mWorld->GetBlock(bx + i, by + k, bz + j) = 0;
+
+    const block_t wire = Redstoneoff::getID();
+    const int wireLen = 20;
+    for(int i = 0; i < wireLen; i++)
+        mWorld->GetBlock(bx + i, by, bz) = wire;
+
+    // Build the section that holds the wire first, so the mesh timings below are a rebuild and not
+    // a first build (which allocates the vertex buffers and is a different cost entirely).
+    const int cid = mWorld->getChunkId(Vector3((float)bx, (float)by, (float)bz));
+    if(cid != -1)
+    {
+        mWorld->RebuildOpaqueMeshChunk(cid);
+        mWorld->RebuildTransparentMeshChunk(cid);
+    }
+
+    unsigned int t0, t1;
+
+    const int N_DUST = 500;
+    t0 = PerfProbeNow();
+    for(int i = 0; i < N_DUST; i++)
+        mWorld->GetRedstoneDustPower(bx, by, bz);
+    t1 = PerfProbeNow();
+    const unsigned int usDust = (t1 - t0) / (unsigned int)N_DUST;
+
+    const int N_RS = 500;
+    t0 = PerfProbeNow();
+    for(int i = 0; i < N_RS; i++)
+        mWorld->UpdateRedstonePower(bx, by, bz);
+    t1 = PerfProbeNow();
+    const unsigned int usRsWire = (t1 - t0) / (unsigned int)N_RS;
+
+    t0 = PerfProbeNow();
+    for(int i = 0; i < N_RS; i++)
+        mWorld->UpdateRedstonePower(bx + 30, by, bz + 3);
+    t1 = PerfProbeNow();
+    const unsigned int usRsEmpty = (t1 - t0) / (unsigned int)N_RS;
+
+    // A torch flip, one direction at a time, alternating so each call actually flips. `torchZ` sits
+    // in the wire just laid, so both directions pay a dust recompute; `awayX` does not, which is what
+    // separates "the flip" from "the wire it is wired into".
+    const int torchX = bx + 2, torchY = by + 1, torchZ = bz;
+    const int awayX = bx + 30, awayY = by + 1, awayZ = bz;
+    mWorld->GetBlock(torchX, torchY, torchZ) = RedstoneTorch::getID();
+    mWorld->GetBlock(awayX, awayY, awayZ) = RedstoneTorch::getID();
+
+    const int N_FLIP = 40;
+    unsigned int accDark = 0, accLit = 0, accAway = 0;
+    for(int i = 0; i < N_FLIP; i++)
+    {
+        t0 = PerfProbeNow();
+        mWorld->SetRedstoneTorchLit(torchX, torchY, torchZ, false);
+        t1 = PerfProbeNow();
+        accDark += t1 - t0;
+
+        t0 = PerfProbeNow();
+        mWorld->SetRedstoneTorchLit(torchX, torchY, torchZ, true);
+        t1 = PerfProbeNow();
+        accLit += t1 - t0;
+
+        t0 = PerfProbeNow();
+        mWorld->SetRedstoneTorchLit(awayX, awayY, awayZ, false);
+        t1 = PerfProbeNow();
+        mWorld->SetRedstoneTorchLit(awayX, awayY, awayZ, true);
+        accAway += PerfProbeNow() - t0;
+    }
+    const unsigned int usTorchDark = accDark / (unsigned int)N_FLIP;
+    const unsigned int usTorchLit = accLit / (unsigned int)N_FLIP;
+    const unsigned int usTorchAway = accAway / (unsigned int)N_FLIP;
+
+    // The 19^3 rescan a flip queues, through the queue so the drain is what is timed and not the
+    // enqueue. QueueLightAreaIn keeps at most 8, which is why this fills 8 and drains 8. Best of
+    // them, not the average: the first pass through a cold section is not what a running clock pays.
+    for(int i = 0; i < 8; i++)
+        mWorld->QueueLightAreaIn(Vector3((float)torchX, (float)torchY, (float)torchZ));
+    unsigned int usLightScan = 0xFFFFFFFFu;
+    for(int i = 0; i < 8; i++)
+    {
+        t0 = PerfProbeNow();
+        mWorld->ProcessQueuedLightArea();
+        t1 = PerfProbeNow();
+        if(t1 - t0 < usLightScan)
+            usLightScan = t1 - t0;
+    }
+
+    unsigned int usMeshTransparent = 0, usMeshOpaque = 0, usMeshFull = 0;
+    unsigned int usMeshCache = 0;
+    if(cid != -1)
+    {
+        const int N_T = 10;
+        t0 = PerfProbeNow();
+        for(int i = 0; i < N_T; i++)
+            mWorld->RebuildTransparentMeshChunk(cid);
+        t1 = PerfProbeNow();
+        usMeshTransparent = (t1 - t0) / (unsigned int)N_T;
+
+        t0 = PerfProbeNow();
+        for(int i = 0; i < N_T; i++)
+            mWorld->RebuildOpaqueMeshChunk(cid);
+        t1 = PerfProbeNow();
+        usMeshOpaque = (t1 - t0) / (unsigned int)N_T;
+
+        const int N_F = 5;
+        t0 = PerfProbeNow();
+        for(int i = 0; i < N_F; i++)
+            mWorld->RebuildFullMeshChunk(cid);
+        t1 = PerfProbeNow();
+        usMeshFull = (t1 - t0) / (unsigned int)N_F;
+
+        // The fixed half of a remesh: the 18^3 light/block cache every rebuild fills, measured with no
+        // walk and no geometry around it. Everything else a rebuild costs scales with what is in the
+        // section; this does not, and it is the number to look at before optimising the meshers -- a
+        // section with almost nothing transparent in it still pays it in full.
+        const int N_C = 10;
+        t0 = PerfProbeNow();
+        mWorld->PerfProbeMeshCache(cid, N_C);
+        t1 = PerfProbeNow();
+        usMeshCache = (t1 - t0) / (unsigned int)N_C;
+    }
+
+    // Hand the torches to the driven clock. Both were left lit by the flip loop above, and they are the
+    // same two cells the numbers above were taken in, so the steady state that follows is a clock over
+    // the geometry that was just priced.
+    probeclock::px[0] = torchX; probeclock::py[0] = torchY; probeclock::pz[0] = torchZ;
+    probeclock::px[1] = awayX;  probeclock::py[1] = awayY;  probeclock::pz[1] = awayZ;
+    probeclock::lit[0] = true;  probeclock::lit[1] = true;
+    probeclock::live = probeclock::kTorches;
+    probeclock::left = probeclock::kRunSeconds;
+    probeclock::acc  = 0.0f;
+    MC_DEBUG_LOG("perfprobe: driving %d torches at %.0f Hz for %.0fs\n",
+                 probeclock::kTorches, 1.0f / probeclock::kPeriod, probeclock::kRunSeconds);
+
+    MC_DEBUG_LOG("perfprobe us/op wire=%d at (%d,%d,%d): dustPower=%u rsWire=%u rsEmpty=%u | torch dark=%u lit=%u away=%u | lightScan=%u | mesh transp=%u opaque=%u full=%u cache=%u\n",
+                 wireLen, bx, by, bz,
+                 usDust, usRsWire, usRsEmpty,
+                 usTorchDark, usTorchLit, usTorchAway,
+                 usLightScan, usMeshTransparent, usMeshOpaque, usMeshFull, usMeshCache);
+}
+#else
+void StatePlay::PerfProbeSelfTest()
+{
+    // MC_PERF_PROBE off: nothing to time. The declaration exists in the header so the two builds
+    // have the same class layout, and this keeps the symbol from being undefined.
+}
+#endif
+
+#if MC_PERF_PROBE
+// Called once a frame from Update. While the window PerfProbeSelfTest opened is open, this flips each
+// benchmark torch once every kPeriod and leaves the frame's other work to the engine -- the point is
+// the steady state the per-second counters report, not anything this function does itself.
+void StatePlay::PerfProbeDriveClock(float frameDt)
+{
+    if(probeclock::live <= 0)
+        return;
+
+    if(probeclock::left <= 0.0f)
+    {
+        MC_DEBUG_LOG("perfprobe: clock stopped\n");
+        probeclock::live = 0;
+        return;
+    }
+    probeclock::left -= frameDt;
+
+    // Accumulated rather than a timer per torch: Update can be called with any dt, and a period that
+    // does not divide the frame rate must still average the same rate as one that does.
+    probeclock::acc += frameDt;
+    while(probeclock::acc >= probeclock::kPeriod)
+    {
+        probeclock::acc -= probeclock::kPeriod;
+        for(int i = 0; i < probeclock::live; i++)
+        {
+            probeclock::lit[i] = !probeclock::lit[i];
+            mWorld->SetRedstoneTorchLit(probeclock::px[i], probeclock::py[i], probeclock::pz[i], probeclock::lit[i]);
+        }
+    }
+}
+#else
+void StatePlay::PerfProbeDriveClock(float frameDt)
+{
+    (void)frameDt;
+}
+#endif
+
 void StatePlay::DrawText(int x,int y, unsigned int color, float size, const char *message, ...)
 {
+    va_list argList;
+    char cbuffer[512];
+    va_start(argList, message);
+    vsnprintf(cbuffer, 512, message, argList);
+    va_end(argList);
+
+    RenderManager::InstancePtr()->SetFontStyle(size,GU_COLOR(0.1f,0.1f,0.1f,1),0,0x00000200|0x00000000);
+    RenderManager::InstancePtr()->DebugPrint(x+1,y+1,"%s",cbuffer);
     RenderManager::InstancePtr()->SetFontStyle(size,color,0,0x00000200|0x00000000);
-    RenderManager::InstancePtr()->DebugPrint(x,y,message);
+    RenderManager::InstancePtr()->DebugPrint(x,y,"%s",cbuffer);
 }
 
 void StatePlay::DrawText2(int x,int y, unsigned int color, float size, const char *message, ...)
 {
+    va_list argList;
+    char cbuffer[512];
+    va_start(argList, message);
+    vsnprintf(cbuffer, 512, message, argList);
+    va_end(argList);
+
+    RenderManager::InstancePtr()->SetFontStyle(size,GU_COLOR(0.1f,0.1f,0.1f,1),0,0x00004000|0x00000000);
+    RenderManager::InstancePtr()->DebugPrint(x+1,y+1,"%s",cbuffer);
     RenderManager::InstancePtr()->SetFontStyle(size,color,0,0x00004000|0x00000000);
-    RenderManager::InstancePtr()->DebugPrint(x,y,message);
+    RenderManager::InstancePtr()->DebugPrint(x,y,"%s",cbuffer);
+}
+
+void StatePlay::UpdateInvCursorPos()
+{
+    if(armorEn)
+    {
+        selectInvSprite->SetPosition(GuiSlotX(guiInvW, guiScale, 7.0f + invXPosition * 54.0f), GuiSlotY(guiInvH, guiScale, 4.0f + invYPosition * 36.0f));
+        return;
+    }
+    if(upEn)
+    {
+        if(invEn)
+        {
+            selectInvSprite->SetPosition(GuiSlotX(guiInvW, guiScale, 97.0f + invXPosition * 18.0f), GuiSlotY(guiInvH, guiScale, 14.0f + invYPosition * 18.0f));
+            return;
+        }
+        if(craft3xEn)
+        {
+            selectInvSprite->SetPosition(GuiSlotX(guiCrtW, guiScale, 61.0f + invXPosition * 18.0f), GuiSlotY(guiCrtH, guiScale, 4.0f + invYPosition * 18.0f));
+            return;
+        }
+        if(chestEn)
+        {
+            selectInvSprite->SetPosition(GuiSlotX(guiChtW, guiScale, 7.0f + invXPosition * 18.0f), GuiSlotY(guiChtH, guiScale, 4.0f + invYPosition * 18.0f));
+            return;
+        }
+        if(furnaceEn)
+        {
+            selectInvSprite->SetPosition(GuiSlotX(guiFurW, guiScale, 61.0f), GuiSlotY(guiFurH, guiScale, 4.0f + invYPosition * 36.0f));
+            return;
+        }
+    }
+
+    float w = guiInvW;
+    float h = guiInvH;
+    if(craft3xEn)
+    {
+        w = guiCrtW;
+        h = guiCrtH;
+    }
+    else if(chestEn)
+    {
+        w = guiChtW;
+        h = guiChtH;
+    }
+    else if(furnaceEn)
+    {
+        w = guiFurW;
+        h = guiFurH;
+    }
+    selectInvSprite->SetPosition(GuiSlotX(w, guiScale, 7.0f + invXPosition * 18.0f), GuiPlayerInvSlotY(h, guiScale, invYPosition));
 }
 
 void StatePlay::DrawAmount(int x,int y, int amount)

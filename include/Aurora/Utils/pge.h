@@ -12,6 +12,10 @@
 #ifndef __PGE_H__
 #define __PGE_H__
 
+#ifndef PGE_VERSION
+#define PGE_VERSION 3
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif

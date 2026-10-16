@@ -9,6 +9,26 @@
 #define ENGLISH 1
 #define RUSSIAN 2
 
+// Analog stick calibration, in the order the screen walks through them. Two measurement phases and not
+// one, because the two readings contradict each other: the resting offset has to be taken while the
+// stick is untouched, and the travel has to be taken while it is being pushed as far as it will go.
+static const int kCalRestIdle   = 0;   // waiting for the stick to be released
+static const int kCalRestSample = 1;   // averaging the resting reading
+static const int kCalRoll       = 2;   // tracking the sweep to the rim
+static const int kCalDone       = 3;   // calibrated, waiting to save
+
+// Frames the resting reading is averaged over: a third of a second, because the pad's low byte jitters
+// and a single sample would make the baseline depend on which frame it happened to land on.
+static const int   kCalSettleFrames = 20;
+// The furthest from centre a *resting* stick may read before the reading is refused. A stick held while
+// it is measured produces a baseline wrong by however far it was held, and nothing in the numbers says
+// so, which is why this is checked rather than assumed: the player gets told to let go.
+static const float kCalRestLimit    = 0.6f;
+// The least travel an axis may show and still count as a sweep, so a calibration cannot be "completed"
+// by pressing X twice without touching the stick. The same floor SetAnalogCalibration enforces; it is
+// repeated here only so the screen can say why it refused instead of silently doing nothing.
+static const float kCalMinRange     = 0.25f;
+
 StateOptions::StateOptions()
 {
 
@@ -69,6 +89,19 @@ void StateOptions::Init()
 	newKey = -1;
 
 	currentAnalogPos = 0;
+
+	//analog stick calibration
+	calState = kCalRestIdle;
+	calSamples = 0;
+	calFailed = false;
+	calSumX = 0.0f;
+	calSumY = 0.0f;
+	calMinX = 0.0f;
+	calMinY = 0.0f;
+	calMaxX = 0.0f;
+	calMaxY = 0.0f;
+	calBaseX = 0.0f;
+	calBaseY = 0.0f;
 }
 
 void StateOptions::Enter()
@@ -115,7 +148,7 @@ void StateOptions::HandleEvents(StateManager* sManager)
 			{
 				selectPos--;
 				if(selectPos < 0)
-					selectPos = 2;
+					selectPos = 3;
 
 				mSoundMgr->PlayMenuSound();
 			}
@@ -157,6 +190,12 @@ void StateOptions::HandleEvents(StateManager* sManager)
 					menuState = 2;
 					currentAnalogPos = 0;
 				}
+				// The Update entry that used to be here is gone, and its absence is the point of the
+				// Launcher rather than a lost feature. A game cannot replace the binary it is running,
+				// so updating from in here always needed a second program, a handoff file and a
+				// one-way launch that could not come back. The Launcher owns the install instead and
+				// can swap the game binary while nothing is running it. Cancel moves up into the slot
+				// the entry occupied, so the menu stays three buttons rather than three and a gap.
 				if(selectPos == 2)
 				{
 					InputHelper::Instance()->Save();
@@ -241,9 +280,9 @@ void StateOptions::HandleEvents(StateManager* sManager)
 
 					if(controlPos < 0)
 					{
-						controlPos = 16;
-						controlEnd = 16;
-						controlStart = 10;
+						controlPos = InputHelper::ACTION_COUNT;
+						controlEnd = InputHelper::ACTION_COUNT;
+						controlStart = InputHelper::ACTION_COUNT - 6;
 						if(controlStart < 0)
 							controlStart = 0;
 					}
@@ -259,14 +298,14 @@ void StateOptions::HandleEvents(StateManager* sManager)
 					{
 						controlStart++;
 						controlEnd++;
-						if(controlEnd > 16)//jest 15 opcji od 0
+						if(controlEnd > InputHelper::ACTION_COUNT)
 						{
-							controlStart = 10;
-							controlEnd = 16;
+							controlStart = InputHelper::ACTION_COUNT - 6;
+							controlEnd = InputHelper::ACTION_COUNT;
 						}
 					}
 
-					if(controlPos > 16)
+					if(controlPos > InputHelper::ACTION_COUNT)
 					{
 						controlPos = 0;
 						controlStart = 0;
@@ -283,7 +322,7 @@ void StateOptions::HandleEvents(StateManager* sManager)
 
 				if(mSystemMgr->KeyPressed(PSP_CTRL_CROSS))
 				{
-					if(controlPos == 16)//back button - exit from this menu
+					if(controlPos == InputHelper::ACTION_COUNT)//back button - exit from this menu
 					{
 
 						menuState = 0;
@@ -303,7 +342,7 @@ void StateOptions::HandleEvents(StateManager* sManager)
 				currentAnalogPos--;
 
 				if(currentAnalogPos < 0)
-					currentAnalogPos = 4;
+					currentAnalogPos = 5;
 
 				mSoundMgr->PlayMenuSound();
 			}
@@ -311,7 +350,7 @@ void StateOptions::HandleEvents(StateManager* sManager)
 			if(mSystemMgr->KeyPressed(PSP_CTRL_DOWN))
 			{
 				currentAnalogPos++;
-				if(currentAnalogPos > 4)
+				if(currentAnalogPos > 5)
 					currentAnalogPos = 0;
 
 				mSoundMgr->PlayMenuSound();
@@ -397,7 +436,131 @@ void StateOptions::HandleEvents(StateManager* sManager)
 			if(mSystemMgr->KeyPressed(PSP_CTRL_CROSS))
 			{
 				if(currentAnalogPos == 4)
+				{
+					// Enter calibration. Reset here rather than in Init so re-entering the screen always
+					// starts from "waiting for the stick", never from a half-finished sweep.
+					calState = kCalRestIdle;
+					calSamples = 0;
+					calFailed = false;
+					calSumX = 0.0f;
+					calSumY = 0.0f;
+					menuState = 3;
+				}
+				if(currentAnalogPos == 5)
 					menuState = 0;
+			}
+		}
+		break;
+		case 3://analog stick calibration
+		{
+			switch(calState)
+			{
+				case kCalRestIdle:
+				{
+					if(mSystemMgr->KeyPressed(PSP_CTRL_CROSS))
+					{
+						calSamples = 0;
+						calSumX = 0.0f;
+						calSumY = 0.0f;
+						calFailed = false;
+						calState = kCalRestSample;
+						mSoundMgr->PlayMenuSound();
+					}
+					break;
+				}
+				case kCalRestSample:
+				{
+					// Averaged rather than sampled once: the pad's low byte jitters frame to frame, so a
+					// single reading would make the baseline depend on which frame the button landed on.
+					calSumX += mSystemMgr->GetAnalogRawX();
+					calSumY += mSystemMgr->GetAnalogRawY();
+					calSamples++;
+
+					if(calSamples >= kCalSettleFrames)
+					{
+						float baseX = calSumX / (float)calSamples;
+						float baseY = calSumY / (float)calSamples;
+
+						// A stick that is still being held cannot be measured, and nothing in the numbers
+						// says so -- it just produces a baseline wrong by however far it was held. So the
+						// reading is checked against the nominal centre and refused by name instead.
+						if(baseX > kCalRestLimit || baseX < -kCalRestLimit ||
+						   baseY > kCalRestLimit || baseY < -kCalRestLimit)
+						{
+							calFailed = true;
+							calState = kCalRestIdle;
+							mSoundMgr->PlayMenuSound();
+							break;
+						}
+
+						calBaseX = baseX;
+						calBaseY = baseY;
+						calMinX = baseX;
+						calMaxX = baseX;
+						calMinY = baseY;
+						calMaxY = baseY;
+						calState = kCalRoll;
+					}
+					break;
+				}
+				case kCalRoll:
+				{
+					float rawX = mSystemMgr->GetAnalogRawX();
+					float rawY = mSystemMgr->GetAnalogRawY();
+					if(rawX < calMinX) calMinX = rawX;
+					if(rawX > calMaxX) calMaxX = rawX;
+					if(rawY < calMinY) calMinY = rawY;
+					if(rawY > calMaxY) calMaxY = rawY;
+
+					if(mSystemMgr->KeyPressed(PSP_CTRL_CROSS))
+					{
+						// Per axis, the larger of the two excursions from the base. The correction has to
+						// be one number per axis, and a player who has rolled the stick properly went
+						// about as far each way, so taking the larger side leaves the smaller one
+						// slightly conservative rather than clipping it short.
+						float rangeX = calMaxX - calBaseX;
+						float negX = calBaseX - calMinX;
+						if(negX > rangeX)
+							rangeX = negX;
+
+						float rangeY = calMaxY - calBaseY;
+						float negY = calBaseY - calMinY;
+						if(negY > rangeY)
+							rangeY = negY;
+
+						if(rangeX < kCalMinRange || rangeY < kCalMinRange)
+						{
+							calFailed = true;
+							calState = kCalRestIdle;
+							mSoundMgr->PlayMenuSound();
+							break;
+						}
+
+						mSystemMgr->SetAnalogCalibration(calBaseX, calBaseY, rangeX, rangeY);
+						calState = kCalDone;
+						mSoundMgr->PlayMenuSound();
+					}
+					break;
+				}
+			}
+
+			if(calState == kCalDone)
+			{
+				// Either button leaves once it is applied, and both save. The calibration is live the
+				// moment SetAnalogCalibration returns, so leaving without writing it would quietly lose
+				// it on the next boot -- a trap that is invisible until the drift comes back.
+				if(mSystemMgr->KeyPressed(PSP_CTRL_CROSS) || mSystemMgr->KeyPressed(PSP_CTRL_CIRCLE))
+				{
+					InputHelper::Instance()->Save();
+					mSoundMgr->PlayMenuSound();
+					menuState = 2;
+				}
+			}
+			else if(mSystemMgr->KeyPressed(PSP_CTRL_CIRCLE))
+			{
+				// Abandoning before the sweep completes is clean: nothing has been applied yet, so the
+				// calibration already in force is still the one that was there when the screen opened.
+				menuState = 2;
 			}
 		}
 		break;
@@ -440,7 +603,7 @@ void StateOptions::Draw(StateManager* sManager)
 			buttonSprite->SetPosition(240,150);
 			buttonSprite->Draw();
 
-			//back
+			//cancel
 			buttonSprite->SetPosition(240,180);
 			buttonSprite->Draw();
 
@@ -504,7 +667,7 @@ void StateOptions::Draw(StateManager* sManager)
 			}
 
 			//back
-			if(controlPos == 16)
+			if(controlPos == InputHelper::ACTION_COUNT)
 			{
 				sbuttonSprite->SetPosition(240,260);
 				sbuttonSprite->Draw();
@@ -542,12 +705,12 @@ void StateOptions::Draw(StateManager* sManager)
 
             if(mRender->GetFontLanguage() == ENGLISH)
             {
-                controlPos == 16 ? DrawText(240,269,GU_COLOR(1,1,0,1) ,default_size,"Cancel") : DrawText(240,269,GU_COLOR(1,1,1,1) ,default_size,"Cancel");
+                controlPos == InputHelper::ACTION_COUNT ? DrawText(240,269,GU_COLOR(1,1,0,1) ,default_size,"Cancel") : DrawText(240,269,GU_COLOR(1,1,1,1) ,default_size,"Cancel");
                 DrawText(240,29,GU_COLOR(1,1,1,1) ,default_size,"Controls");
             }
             if(mRender->GetFontLanguage() == RUSSIAN)
             {
-                controlPos == 16 ? DrawText(240,269,GU_COLOR(1,1,0,1) ,default_size,"Otmena") : DrawText(240,269,GU_COLOR(1,1,1,1) ,default_size,"Otmena");
+                controlPos == InputHelper::ACTION_COUNT ? DrawText(240,269,GU_COLOR(1,1,0,1) ,default_size,"Otmena") : DrawText(240,269,GU_COLOR(1,1,1,1) ,default_size,"Otmena");
                 DrawText(240,29,GU_COLOR(1,1,1,1) ,default_size,"Naznayenie knopok");
             }
 		}
@@ -580,6 +743,10 @@ void StateOptions::Draw(StateManager* sManager)
 			nbuttonSprite->SetPosition(240,190);
 			nbuttonSprite->Draw();
 
+			//calibrate stick
+			buttonSprite->SetPosition(240,230);
+			buttonSprite->Draw();
+
 			//back
 			buttonSprite->SetPosition(240,260);
 			buttonSprite->Draw();
@@ -587,6 +754,10 @@ void StateOptions::Draw(StateManager* sManager)
 			if(currentAnalogPos < 4)
 			{
 				sbuttonSprite->SetPosition(240,100 + (currentAnalogPos * 30));
+				sbuttonSprite->Draw();
+			}else if(currentAnalogPos == 4)
+			{
+				sbuttonSprite->SetPosition(240,230);
 				sbuttonSprite->Draw();
 			}else
 			{
@@ -624,8 +795,14 @@ void StateOptions::Draw(StateManager* sManager)
                 currentAnalogPos == 3 ? mRender->SetFontStyle(default_size,GU_COLOR(1,1,0.25f,1),0,0x00000200) : mRender->SetFontStyle(default_size,GU_COLOR(1,1,1,1),0,0x00000200);
                 mRender->DebugPrint(240,199,"Analog right : %d%%",(int)(fabs(InputHelper::Instance()->analogXright) * 112.0f));
 
-                currentAnalogPos >= 4 ? mRender->SetFontStyle(default_size,GU_COLOR(1,1,0.25f,1),0,0x00000200) : mRender->SetFontStyle(default_size,GU_COLOR(1,1,1,1),0,0x00000200);
+                currentAnalogPos == 4 ? mRender->SetFontStyle(default_size,GU_COLOR(1,1,0.25f,1),0,0x00000200) : mRender->SetFontStyle(default_size,GU_COLOR(1,1,1,1),0,0x00000200);
+                mRender->DebugPrint(240,239,"Calibrate stick");
+
+                currentAnalogPos >= 5 ? mRender->SetFontStyle(default_size,GU_COLOR(1,1,0.25f,1),0,0x00000200) : mRender->SetFontStyle(default_size,GU_COLOR(1,1,1,1),0,0x00000200);
                 mRender->DebugPrint(240,269,"Cancel");
+
+                mRender->SetFontStyle(default_size,GU_COLOR(1,1,1,1),0,0x00000200);
+                mRender->DebugPrint(240,49,mSystemMgr->IsAnalogCalibrated() ? "Stick: calibrated" : "Stick: default");
 
                 DrawText(240,29,GU_COLOR(1,1,1,1) ,default_size,"Analog stick");
             }
@@ -643,10 +820,103 @@ void StateOptions::Draw(StateManager* sManager)
                 currentAnalogPos == 3 ? mRender->SetFontStyle(default_size,GU_COLOR(1,1,0.25f,1),0,0x00000200) : mRender->SetFontStyle(default_size,GU_COLOR(1,1,1,1),0,0x00000200);
                 mRender->DebugPrint(240,199,"Stik vpravo : %d%%",(int)(fabs(InputHelper::Instance()->analogXright) * 112.0f));
 
-                currentAnalogPos >= 4 ? mRender->SetFontStyle(default_size,GU_COLOR(1,1,0.25f,1),0,0x00000200) : mRender->SetFontStyle(default_size,GU_COLOR(1,1,1,1),0,0x00000200);
+                currentAnalogPos == 4 ? mRender->SetFontStyle(default_size,GU_COLOR(1,1,0.25f,1),0,0x00000200) : mRender->SetFontStyle(default_size,GU_COLOR(1,1,1,1),0,0x00000200);
+                mRender->DebugPrint(240,239,"Kalibrovka stika");
+
+                currentAnalogPos >= 5 ? mRender->SetFontStyle(default_size,GU_COLOR(1,1,0.25f,1),0,0x00000200) : mRender->SetFontStyle(default_size,GU_COLOR(1,1,1,1),0,0x00000200);
                 mRender->DebugPrint(240,269,"Otmena");
 
+                mRender->SetFontStyle(default_size,GU_COLOR(1,1,1,1),0,0x00000200);
+                mRender->DebugPrint(240,49,mSystemMgr->IsAnalogCalibrated() ? "Stik: kalibrovan" : "Stik: po umolchaniyu");
+
                 DrawText(240,29,GU_COLOR(1,1,1,1) ,default_size,"Nastro~ki stika");
+            }
+		}
+		break;
+		case 3://analog stick calibration
+		{
+			sceGuDisable(GU_DEPTH_TEST);
+			sceGuEnable(GU_BLEND);
+			sceGuColor(GU_COLOR(1,1,1,1.0f));
+
+            for(int x = 0; x < 8; x++)
+            {
+                for(int y = 0; y < 5; y++)
+                {
+                    backSprite->SetPosition(x*64,y*64);
+                    backSprite->Draw();
+                }
+            }
+
+			sceGuDisable(GU_BLEND);
+			sceGuEnable(GU_DEPTH_TEST);
+
+            // The live reading this screen is working from, and drawn from the *raw* stick on purpose:
+            // this is the number the baseline and the range are about to be derived from, so it has to
+            // be the one the player can watch move. A calibrated readout would sit at zero while the
+            // stick was being pushed as far as it goes, which is the one thing it must not do here.
+            mRender->SetFontStyle(default_size,GU_COLOR(1,1,1,1),0,0x00000200);
+            mRender->DebugPrint(240,210,"X %d%%   Y %d%%",(int)(mSystemMgr->GetAnalogRawX() * 100.0f),(int)(mSystemMgr->GetAnalogRawY() * 100.0f));
+
+            mRender->SetFontStyle(default_size,GU_COLOR(1,1,1,1),0,0x00000200);
+
+            if(mRender->GetFontLanguage() == ENGLISH)
+            {
+                DrawText(240,29,GU_COLOR(1,1,1,1) ,default_size,"Calibrate stick");
+
+                if(calState == kCalRestIdle)
+                {
+                    if(calFailed)
+                        mRender->DebugPrint(240,110,"The stick was not resting,");
+                    mRender->DebugPrint(240,140,"Let go of the stick,");
+                    mRender->DebugPrint(240,160,"then press X");
+                }
+                else if(calState == kCalRestSample)
+                {
+                    mRender->DebugPrint(240,140,"Hold still...");
+                }
+                else if(calState == kCalRoll)
+                {
+                    mRender->DebugPrint(240,120,"Roll the stick all the way");
+                    mRender->DebugPrint(240,140,"out to its edges,");
+                    mRender->DebugPrint(240,160,"then press X");
+                }
+                else
+                {
+                    mRender->DebugPrint(240,140,"Calibrated.");
+                    mRender->DebugPrint(240,160,"Press X to save");
+                }
+
+                mRender->DebugPrint(240,250,"Circle to cancel");
+            }
+            if(mRender->GetFontLanguage() == RUSSIAN)
+            {
+                DrawText(240,29,GU_COLOR(1,1,1,1) ,default_size,"Kalibrovka stika");
+
+                if(calState == kCalRestIdle)
+                {
+                    if(calFailed)
+                        mRender->DebugPrint(240,110,"Stik ne v pokoe,");
+                    mRender->DebugPrint(240,140,"Otpusti stik,");
+                    mRender->DebugPrint(240,160,"zatem nazhmi X");
+                }
+                else if(calState == kCalRestSample)
+                {
+                    mRender->DebugPrint(240,140,"Derzhi nepodvizhno...");
+                }
+                else if(calState == kCalRoll)
+                {
+                    mRender->DebugPrint(240,120,"Provedi stik do upora");
+                    mRender->DebugPrint(240,140,"po vsem krayam,");
+                    mRender->DebugPrint(240,160,"zatem nazhmi X");
+                }
+                else
+                {
+                    mRender->DebugPrint(240,140,"Kalibrovka gotova.");
+                    mRender->DebugPrint(240,160,"Nazhmi X chtoby sohranit");
+                }
+
+                mRender->DebugPrint(240,250,"Krug dlya otmeny");
             }
 		}
 		break;

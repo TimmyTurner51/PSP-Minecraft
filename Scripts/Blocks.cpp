@@ -1643,6 +1643,41 @@ Torch::Torch():BaseBlock()
 }
 block_t Torch::getID(){ return 48;}
 
+static void InitWallTorch(BaseBlock& b)
+{
+    b.upPlane_x = 0;
+    b.upPlane_y = 5;
+    b.downPlane_x = 0;
+    b.downPlane_y = 5;
+    b.leftPlane_x = 0;
+    b.leftPlane_y = 5;
+    b.rightPlane_x = 0;
+    b.rightPlane_y = 5;
+    b.botPlane_x = 0;
+    b.botPlane_y = 5;
+    b.forPlane_x = 0;
+    b.forPlane_y = 5;
+    b.editable = true;
+    b.transparent = true;
+    b.soundType = 2;
+    b.lightSource = true;
+    b.blockModel = 5;
+    b.allowLight = true;
+    b.loot = 308;
+    b.solid = false;
+    b.name = "Torch block";
+    b.collideBox = BoundingBox(Vector3(-0.06f,-0.5f,-0.06f),Vector3(0.06f,0.15f,0.06f));
+}
+
+WallTorch1::WallTorch1():BaseBlock(){ InitWallTorch(*this); }
+block_t WallTorch1::getID(){ return 250;}
+WallTorch2::WallTorch2():BaseBlock(){ InitWallTorch(*this); }
+block_t WallTorch2::getID(){ return 251;}
+WallTorch3::WallTorch3():BaseBlock(){ InitWallTorch(*this); }
+block_t WallTorch3::getID(){ return 252;}
+WallTorch4::WallTorch4():BaseBlock(){ InitWallTorch(*this); }
+block_t WallTorch4::getID(){ return 253;}
+
 Door1::Door1():BaseBlock()
 {
     upPlane_x = 1;
@@ -3342,6 +3377,11 @@ ChestLock::ChestLock():BaseBlock()
 
     forPlane_x = 8;
     forPlane_y = 2;
+
+    // A locked chest is still a chest: it can be looked at, broken, and built against. `editable`
+    // defaults to false, and left there the outline passes straight through it and the pick ray never
+    // reports it -- nothing generates one today, but a save can hold the id.
+    editable = true;
 }
 block_t ChestLock::getID(){ return 98;}
 
@@ -5832,6 +5872,10 @@ WaterBlock4::WaterBlock4():BaseBlock()
 }
 
 block_t WaterBlock4::getID(){ return 172;}
+
+block_t WaterBlock5::getID(){ return kExtendedBlockBase + 0;}
+block_t WaterBlock6::getID(){ return kExtendedBlockBase + 1;}
+block_t WaterBlock7::getID(){ return kExtendedBlockBase + 2;}
 
 ItemFrame1::ItemFrame1():BaseBlock()
 {
@@ -9296,11 +9340,11 @@ block_t lit_redstone_lamp::getID(){ return -25; }*/
 
 Fire::Fire():BaseBlock()
 {
-    upPlane_x = 15;
-    upPlane_y = 1;
+    upPlane_x = 13;
+    upPlane_y = 15;
 
-    downPlane_x = 15;
-    downPlane_y = 1;
+    downPlane_x = 13;
+    downPlane_y = 15;
 
     leftPlane_x = 13;
     leftPlane_y = 15;
@@ -9328,6 +9372,81 @@ Fire::Fire():BaseBlock()
     name = "Fire";
 }
 block_t Fire::getID(){ return 247; }
+
+PortalBlock::PortalBlock():BaseBlock()
+{
+    // Tile (15,8): empty in every shipped texture pack, which is the reason it was picked. Water, lava
+    // and fire have their own tiles on the bottom row; this is the free one that does not collide with
+    // anything a pack already draws.
+    upPlane_x = 15;
+    upPlane_y = 8;
+
+    downPlane_x = 15;
+    downPlane_y = 8;
+
+    leftPlane_x = 15;
+    leftPlane_y = 8;
+
+    rightPlane_x = 15;
+    rightPlane_y = 8;
+
+    botPlane_x = 15;
+    botPlane_y = 8;
+
+    forPlane_x = 15;
+    forPlane_y = 8;
+
+    editable = false;   // the frame is the block you work with, never the portal itself
+    transparent = true;
+    allowLight = true;
+    solid = false;      // you walk into it, not onto it
+    lightSource = true;
+    animated = true;
+    blockModel = 30;    // the flat portal sheet, drawn in CraftWorld_MeshBlocks.cpp
+    loot = -1;          // breaking it yields nothing
+    refraction = 1;
+    material = 11;      // the same class as fire: walk-through, not a floor
+
+    name = "Nether Portal";
+}
+block_t PortalBlock::getID(){ return kExtendedBlockBase + 26; }
+
+// The same block in the other plane. Everything is identical to PortalBlock except the id, which is
+// the only thing that tells the mesher which way the sheet faces; see the comment in Blocks.h.
+PortalBlockZ::PortalBlockZ():BaseBlock()
+{
+    upPlane_x = 15;
+    upPlane_y = 8;
+
+    downPlane_x = 15;
+    downPlane_y = 8;
+
+    leftPlane_x = 15;
+    leftPlane_y = 8;
+
+    rightPlane_x = 15;
+    rightPlane_y = 8;
+
+    botPlane_x = 15;
+    botPlane_y = 8;
+
+    forPlane_x = 15;
+    forPlane_y = 8;
+
+    editable = false;
+    transparent = true;
+    allowLight = true;
+    solid = false;
+    lightSource = true;
+    animated = true;
+    blockModel = 30;
+    loot = -1;
+    refraction = 1;
+    material = 11;
+
+    name = "Nether Portal";
+}
+block_t PortalBlockZ::getID(){ return kExtendedBlockBase + 27; }
 GravitySandBlock::GravitySandBlock() :BaseBlock()
 {
 	upPlane_x = 2;
@@ -9363,3 +9482,425 @@ GravitySandBlock::GravitySandBlock() :BaseBlock()
 	name = "Sand";
 }
 block_t GravitySandBlock::getID() { return 248; }
+
+static void InitFlowingLava(BaseBlock* b)
+{
+	b->upPlane_x = 15;
+	b->upPlane_y = 15;
+	b->downPlane_x = 15;
+	b->downPlane_y = 15;
+	b->leftPlane_x = 15;
+	b->leftPlane_y = 15;
+	b->rightPlane_x = 15;
+	b->rightPlane_y = 15;
+	b->botPlane_x = 15;
+	b->botPlane_y = 15;
+	b->forPlane_x = 15;
+	b->forPlane_y = 15;
+	b->editable = false;
+	b->transparent = false;
+	b->lightSource = true;
+	b->allowLight = true;
+	b->solid = false;
+	b->animated = true;
+	b->blockModel = 5;
+	b->soundType = 2;
+	b->name = "Lava Block";
+}
+
+LavaBlock1::LavaBlock1():BaseBlock()
+{
+	InitFlowingLava(this);
+}
+block_t LavaBlock1::getID(){ return 249; }
+
+// Button. 1.7.3 shipped no button texture: a stone button was drawn with the stone tile and the wooden
+// button with the oak planks tile (buttons only got their own textures in 1.8), so no atlas work here.
+// Facing and the pressed flag are per-block state, not per-id, so one id covers all six mountings.
+static void InitButton(BaseBlock& b, bool wood)
+{
+	if(wood)
+	{
+		b.upPlane_x = 4;
+		b.upPlane_y = 0;
+	}
+	else
+	{
+		b.upPlane_x = 1;
+		b.upPlane_y = 0;
+	}
+	b.downPlane_x = b.upPlane_x;
+	b.downPlane_y = b.upPlane_y;
+	b.leftPlane_x = b.upPlane_x;
+	b.leftPlane_y = b.upPlane_y;
+	b.rightPlane_x = b.upPlane_x;
+	b.rightPlane_y = b.upPlane_y;
+	b.botPlane_x = b.upPlane_x;
+	b.botPlane_y = b.upPlane_y;
+	b.forPlane_x = b.upPlane_x;
+	b.forPlane_y = b.upPlane_y;
+
+	b.editable = true;
+	b.transparent = true;
+	b.allowLight = true;
+	b.solid = false;
+	b.blockModel = 14;
+	b.soundType = 2;
+	b.name = wood ? "Wooden Button" : "Stone Button";
+	// Fallback box only: a button's real box depends on the cell's facing and pressed state, and
+	// CraftWorld::GetBlockCollideBox() supplies it. This is the floor-mounted rest shape, centred.
+	b.collideBox = BoundingBox(Vector3(-3.0f/16.0f,-0.5f,-3.0f/16.0f),Vector3(3.0f/16.0f,-0.5f+2.0f/16.0f,3.0f/16.0f));
+}
+
+ButtonStone::ButtonStone():BaseBlock()
+{
+	InitButton(*this, false);
+	loot = ButtonStone::getID();
+}
+block_t ButtonStone::getID(){ return kExtendedBlockBase + 3; }
+
+ButtonWood::ButtonWood():BaseBlock()
+{
+	InitButton(*this, true);
+	loot = ButtonWood::getID();
+}
+block_t ButtonWood::getID(){ return kExtendedBlockBase + 4; }
+
+// Lever. 1.7.3 shipped no lever texture worth speaking of either: the lever *tile* is the handle only
+// (a 2 px strip down columns 7-8 of the sprite) and the base is drawn with the cobblestone tile, which
+// is exactly how the vanilla model is put together -- `base` = cobblestone, `lever` = lever.png. So the
+// atlas needs no new art: cobblestone is (0,1) and the handle is (0,6).
+//
+// Facing and the on/off latch live in the same state nibble the button uses, so a lever gets the wire,
+// torch, TNT and lamp wiring for free by answering IsSwitchBlock. blockModel 16 is its own mesh: the
+// button's uniform box cannot express a base with a handle leaning out of it.
+static void InitLever(BaseBlock& b)
+{
+	b.upPlane_x = 0;  b.upPlane_y = 6;   // the handle's tile; the base is drawn from cobblestone instead
+	b.downPlane_x = 0; b.downPlane_y = 6;
+	b.leftPlane_x = 0; b.leftPlane_y = 6;
+	b.rightPlane_x = 0; b.rightPlane_y = 6;
+	b.botPlane_x = 0; b.botPlane_y = 6;
+	b.forPlane_x = 0; b.forPlane_y = 6;
+
+	b.editable = true;
+	b.transparent = true;
+	b.allowLight = true;
+	b.solid = false;
+	b.blockModel = 16;
+	b.soundType = 2;          // Java plays the wood click for a lever, as it does for a torch
+	b.name = "Lever";
+
+	// Java BlockLever.setBlockBoundsBasedOnState for a floor-mounted lever: an 8x8 px footprint six
+	// pixels tall, which is the base *and* the room the leaning handle needs. CraftWorld::LeverCellBox
+	// derives the real box per mounting, and the pick ray and the outline share it.
+	b.collideBox = BoundingBox(Vector3(-4.0f/16.0f,-0.5f,-4.0f/16.0f),Vector3(4.0f/16.0f,-0.5f+6.0f/16.0f,4.0f/16.0f));
+}
+
+Lever::Lever():BaseBlock()
+{
+	InitLever(*this);
+	loot = Lever::getID();
+}
+block_t Lever::getID(){ return kExtendedBlockBase + 17; }
+
+// Redstone lamp. Vanilla atlas pair (4,12) off and (5,12) on: a plain opaque cube, so blockModel 0 and
+// the normal-cube mesher are exactly right. `solid` matters more than it looks: GetBlockRedstonePower
+// only answers for conductive blocks, and that is the function the lamp reads, so the lamp has to be a
+// normal cube to be powered by the dust on top of it or pointing into it.
+static void InitRedstoneLamp(BaseBlock& b, bool lit)
+{
+	b.upPlane_x = lit ? 5 : 4;   b.upPlane_y = 12;
+	b.downPlane_x = lit ? 5 : 4; b.downPlane_y = 12;
+	b.leftPlane_x = lit ? 5 : 4; b.leftPlane_y = 12;
+	b.rightPlane_x = lit ? 5 : 4; b.rightPlane_y = 12;
+	b.botPlane_x = lit ? 5 : 4;  b.botPlane_y = 12;
+	b.forPlane_x = lit ? 5 : 4;  b.forPlane_y = 12;
+
+	b.editable = true;
+	b.transparent = false;
+	b.allowLight = false;
+	b.solid = true;
+	b.lightSource = lit;         // the lit id is a light source, the dark one must not be
+	b.soundType = 2;
+
+	b.loot = RedstoneLampOff::getID();   // a lamp breaks back to the dark one, whatever state it is in
+	b.name = lit ? "Redstone Lamp (lit)" : "Redstone Lamp";
+
+	b.collideBox = BoundingBox(Vector3(-0.5f,-0.5f,-0.5f),Vector3(0.5f,0.5f,0.5f));
+}
+
+RedstoneLampOff::RedstoneLampOff():BaseBlock(){ InitRedstoneLamp(*this, false); }
+block_t RedstoneLampOff::getID(){ return kExtendedBlockBase + 18; }
+
+RedstoneLampOn::RedstoneLampOn():BaseBlock(){ InitRedstoneLamp(*this, true); }
+block_t RedstoneLampOn::getID(){ return kExtendedBlockBase + 19; }
+
+// Java BlockRedstoneRepeater. Tiles are the vanilla atlas pair at (3,8)/(3,9): a smooth-stone slab with
+// the torch row baked in, the lit variant of the same art. upPlane carries the top tile, so RepeaterOn
+// simply points at the lit one and the mesher needs no per-state texture switch.
+static void InitRepeater(BaseBlock& b, bool powered)
+{
+	b.upPlane_x = 3;
+	b.upPlane_y = powered ? 9 : 8;
+	// Sides and underside are the smooth stone slab; a repeater is only 2 px tall so they are a thin
+	// grey rim, matching the base baked into the top tile.
+	b.downPlane_x = 5;  b.downPlane_y = 0;
+	b.leftPlane_x = 5;  b.leftPlane_y = 0;
+	b.rightPlane_x = 5; b.rightPlane_y = 0;
+	b.botPlane_x = 5;   b.botPlane_y = 0;
+	b.forPlane_x = 5;   b.forPlane_y = 0;
+
+	b.editable = true;
+	b.transparent = true;
+	b.allowLight = true;
+	b.solid = false;
+	b.blockModel = 15;
+	b.soundType = 2;
+	b.name = powered ? "Redstone Repeater (on)" : "Redstone Repeater";
+
+	// Java BlockRedstoneRepeater.setBlockBounds: a 2 px slab, centred on the cell like every other box.
+	b.collideBox = BoundingBox(Vector3(-0.5f,-0.5f,-0.5f),Vector3(0.5f,-0.5f+2.0f/16.0f,0.5f));
+}
+
+RepeaterOff::RepeaterOff():BaseBlock()
+{
+	InitRepeater(*this, false);
+	// The item counterpart, not a block id: the inventory icons a repeater as a flat sprite, and only an
+	// item id reaches the flat-sprite draw path. Java drops the item form too. Written as the literal id
+	// because this file sees only Blocks.h, the same reason the torch above uses 408.
+	loot = 409;               // RepeaterItem
+}
+block_t RepeaterOff::getID(){ return kExtendedBlockBase + 5; }
+
+RepeaterOn::RepeaterOn():BaseBlock()
+{
+	InitRepeater(*this, true);
+	loot = 409;               // RepeaterItem
+}
+block_t RepeaterOn::getID(){ return kExtendedBlockBase + 6; }
+
+// Java BlockRedstoneTorch. Same geometry and tile layout as the plain torch, but the sprite carries a
+// redstone tip: terrain (3,6) lit, (3,7) unlit. The lit/unlit pair are block ids five apart so the
+// scheduler can flip a torch with an id add and the settings nibble stays free for block light.
+static void InitRedstoneTorch(BaseBlock& b, bool lit)
+{
+	b.upPlane_x = 3;
+	b.upPlane_y = lit ? 6 : 7;
+	b.downPlane_x = 3;
+	b.downPlane_y = lit ? 6 : 7;
+	b.leftPlane_x = 3;
+	b.leftPlane_y = lit ? 6 : 7;
+	b.rightPlane_x = 3;
+	b.rightPlane_y = lit ? 6 : 7;
+	b.botPlane_x = 3;
+	b.botPlane_y = lit ? 6 : 7;
+	b.forPlane_x = 3;
+	b.forPlane_y = lit ? 6 : 7;
+
+	b.editable = true;
+	b.transparent = true;
+	b.soundType = 2;          // Java plays the wood click for torches
+	b.lightSource = lit;      // an unlit torch must stop lighting its cell
+	b.blockModel = 5;         // the plain-torch mesher, reused unchanged
+	b.allowLight = true;
+	b.solid = false;
+
+	b.loot = 408;             // RedstoneTorchItem, the item counterpart of both the lit and unlit family
+	b.name = lit ? "Redstone Torch" : "Redstone Torch (off)";
+
+	b.collideBox = BoundingBox(Vector3(-0.06f,-0.5f,-0.06f),Vector3(0.06f,0.15f,0.06f));
+}
+
+RedstoneTorch::RedstoneTorch():BaseBlock(){ InitRedstoneTorch(*this, true); }
+block_t RedstoneTorch::getID(){ return kExtendedBlockBase + 7; }
+
+RedstoneWallTorch1::RedstoneWallTorch1():BaseBlock(){ InitRedstoneTorch(*this, true); }
+block_t RedstoneWallTorch1::getID(){ return kExtendedBlockBase + 8; }
+
+RedstoneWallTorch2::RedstoneWallTorch2():BaseBlock(){ InitRedstoneTorch(*this, true); }
+block_t RedstoneWallTorch2::getID(){ return kExtendedBlockBase + 9; }
+
+RedstoneWallTorch3::RedstoneWallTorch3():BaseBlock(){ InitRedstoneTorch(*this, true); }
+block_t RedstoneWallTorch3::getID(){ return kExtendedBlockBase + 10; }
+
+RedstoneWallTorch4::RedstoneWallTorch4():BaseBlock(){ InitRedstoneTorch(*this, true); }
+block_t RedstoneWallTorch4::getID(){ return kExtendedBlockBase + 11; }
+
+UnlitRedstoneTorch::UnlitRedstoneTorch():BaseBlock(){ InitRedstoneTorch(*this, false); }
+block_t UnlitRedstoneTorch::getID(){ return kExtendedBlockBase + 12; }
+
+UnlitRedstoneWallTorch1::UnlitRedstoneWallTorch1():BaseBlock(){ InitRedstoneTorch(*this, false); }
+block_t UnlitRedstoneWallTorch1::getID(){ return kExtendedBlockBase + 13; }
+
+UnlitRedstoneWallTorch2::UnlitRedstoneWallTorch2():BaseBlock(){ InitRedstoneTorch(*this, false); }
+block_t UnlitRedstoneWallTorch2::getID(){ return kExtendedBlockBase + 14; }
+
+UnlitRedstoneWallTorch3::UnlitRedstoneWallTorch3():BaseBlock(){ InitRedstoneTorch(*this, false); }
+block_t UnlitRedstoneWallTorch3::getID(){ return kExtendedBlockBase + 15; }
+
+UnlitRedstoneWallTorch4::UnlitRedstoneWallTorch4():BaseBlock(){ InitRedstoneTorch(*this, false); }
+block_t UnlitRedstoneWallTorch4::getID(){ return kExtendedBlockBase + 16; }
+
+// --- Piston (Java BlockPistonBase, plus BlockPistonExtension for the head) ------------------------
+//
+// Atlas: four new tiles, staged at (15,1) piston_top_normal, (15,2) piston_top_sticky, (15,3)
+// piston_side and (15,14) piston_inner, in every pack and in both terrain.png and terrain_mips.png.
+// The last of those is a *spare slot* -- one of the cells vanilla painted with flat grey filler and
+// never gave a texture to, the same pattern that sits at (8,2) -- so nothing loses art by it. The
+// first choice was (14,2), which is painted in all seven packs and is the classic dispenser front in
+// the two that carry vanilla's own art; the port has no dispenser yet, but changes.md has one listed,
+// so that cell belongs to it. See add-block-sprites.py's docstring.
+// There is no fifth cell to stage: vanilla's piston_bottom.png is byte for byte furnace_top.png in the
+// 1.7.3 assets (same md5), so the back of a piston reuses the furnace-top cell (14,3) that the furnace
+// already owns.
+//
+// piston_inner is the face at the bottom of the recess an extended base leaves open -- a stone face
+// with a bright ring and a 4x4 hole painted where the rod comes out. It is only ever seen 4 px behind
+// the rod, so for a while the mesher painted it with the head tile and nobody could tell; the recess
+// was being drawn 12 px too shallow at the time (see InitPistonBase's collideBox note), so the face
+// was in the dark between two plates. With the vanilla 12 px body it is the middle of the piston and
+// the one face the rod appears to come *out* of, which is what the ring is drawn for.
+//
+// Which field carries which tile matters, because the two models read them by *role* and not by
+// direction: forPlane is the head face -- the 16x16 end that pushes, which is what vanilla calls
+// piston_top -- and botPlane is the back. Naming them that way is deliberate even though forPlane is
+// geometrically +Z. A piston is hand-emitted from its state nibble (model 17 for the base, 18 for the
+// head, see CraftWorld_MeshBlocks.cpp), so the field names only have to line up with the roles the
+// mesher asks for; and with forPlane = +Z, a piston pushing +Z is also correct if anything ever renders
+// it down the plain cube path by mistake. The other four fields all hold the side tile.
+static void InitPistonBase(BaseBlock& b, bool sticky, bool extended)
+{
+	b.forPlane_x = 15; b.forPlane_y = sticky ? 2 : 1;
+	b.botPlane_x = 14; b.botPlane_y = 3;   // vanilla piston_bottom, the same art as furnace_top
+	b.innerPlane_x = 15; b.innerPlane_y = 14;   // vanilla piston_inner, in one of vanilla's spare slots
+
+	b.upPlane_x = 15;    b.upPlane_y = 3;
+	b.downPlane_x = 15;  b.downPlane_y = 3;
+	b.leftPlane_x = 15;  b.leftPlane_y = 3;
+	b.rightPlane_x = 15; b.rightPlane_y = 3;
+
+	b.editable = true;
+	b.blockModel = 17;
+	b.soundType = 2;        // stone, the sound vanilla's piston material reports
+	b.lightSource = false;
+
+	// The retracted base is a full opaque cube and so hides the faces of whatever it touches. The
+	// extended base is a 12 px stone body with a 4x4 rod standing out of the recess it leaves, and air
+	// around the rod, so it must not -- and `transparent` is the flag the mesher reads for that, which
+	// is the reason the two states cannot share one block type even though they share a model id.
+	// `solid` stays true in both: it is the *conductive* flag (IsRedstoneConductive reads exactly
+	// this), and an extended piston is still an opaque block to the redstone rules, exactly as it is in
+	// vanilla.
+	b.transparent = extended;
+	b.allowLight = extended;
+	b.solid = true;
+
+	if(extended)
+	{
+		// One axis-aligned box cannot describe "a 12 px body with the last 4 px open, plus a rod
+		// through the middle of the opening" in all six directions at once, and every collision caller
+		// goes through GetBlockCollideBox, which recomputes this from the state nibble. So what is
+		// stored here is only the reference orientation: a piston pushing +Z, body against the -Z wall
+		// of its cell -- the same 12 px the overridden PistonCellBox gives it in the other five.
+		//
+		// The box is the *body*, which is what makes it worth writing down: an earlier revision had it
+		// 4 px against the back wall, on the reading that the plate was all an extended base drew. That
+		// is the 4x4 rod's own cell, so the player could walk through eight twelfths of a solid piston
+		// body -- and it is what PistonCellBox says too, so the two agreed on the wrong number.
+		b.collideBox = BoundingBox(Vector3(-0.5f,-0.5f,-0.5f),Vector3(0.5f,0.5f,0.25f));
+	}
+	else
+	{
+		b.collideBox = BoundingBox(Vector3(-0.5f,-0.5f,-0.5f),Vector3(0.5f,0.5f,0.5f));
+	}
+
+	b.name = sticky ? (extended ? "Sticky Piston (extended)" : "Sticky Piston")
+	                : (extended ? "Piston (extended)" : "Piston");
+}
+
+PistonOff::PistonOff():BaseBlock()
+{
+	InitPistonBase(*this, false, false);
+	// Both states break back to the retracted id, the same way the lit lamp breaks back to the dark
+	// one: a piston is a piston however far out its head happens to be.
+	loot = PistonOff::getID();
+}
+block_t PistonOff::getID(){ return kExtendedBlockBase + 20; }
+
+PistonOn::PistonOn():BaseBlock()
+{
+	InitPistonBase(*this, false, true);
+	loot = PistonOff::getID();
+}
+block_t PistonOn::getID(){ return kExtendedBlockBase + 21; }
+
+StickyPistonOff::StickyPistonOff():BaseBlock()
+{
+	InitPistonBase(*this, true, false);
+	loot = StickyPistonOff::getID();
+}
+block_t StickyPistonOff::getID(){ return kExtendedBlockBase + 22; }
+
+StickyPistonOn::StickyPistonOn():BaseBlock()
+{
+	InitPistonBase(*this, true, true);
+	loot = StickyPistonOff::getID();
+}
+block_t StickyPistonOn::getID(){ return kExtendedBlockBase + 23; }
+
+// The moving half: a 4 px plate across the whole face of its cell, at the far end of it, plus the 4x4
+// rod that runs back through the other twelve. The base it left behind draws the rest of that rod --
+// 4 more px, in the recess its 12 px body leaves open -- so the two halves together are one 16 px rod
+// standing the full block a piston pushes, exactly the 16 px vanilla's piston_head model draws between
+// the plate's back and the base's recessed face. Splitting it across the two cells is what keeps every
+// chunk's mesh inside its own cell, which the per-chunk mesher needs and vanilla's renderer, drawing
+// one block at a time, never had to care about.
+//
+// Only two tiles are used. The plate takes the head tile on both of its 16x16 faces and the arm band
+// (the top four rows of piston_side) on its four 4 px flanks, as vanilla's extension does; the rod
+// takes the arm band too, and vanilla stretches all four of those rows down the rod's whole length
+// (its piston_head gives the rod's sides uv [0,0,16,4]). So the rod is the one box in this family whose
+// art is stretched, and both halves stretch it the same way -- 1 row per 4 px -- which is what keeps
+// the band continuous where the two cells meet.
+static void InitPistonHead(BaseBlock& b, bool sticky)
+{
+	b.forPlane_x = 15; b.forPlane_y = sticky ? 2 : 1;
+
+	b.upPlane_x = 15;    b.upPlane_y = 3;
+	b.downPlane_x = 15;  b.downPlane_y = 3;
+	b.leftPlane_x = 15;  b.leftPlane_y = 3;
+	b.rightPlane_x = 15; b.rightPlane_y = 3;
+
+	// The plate's back face -- the ring of it that would be left visible around the rod -- takes the
+	// same head tile as its front, which is what vanilla's extension does and what `botPlane` cannot
+	// mean for a model this one does not share with the base. The rod's own flanks come out of
+	// `piston_side`'s arm band, which is why the side fields above point at the same cell: the mesher
+	// reads one of them for the flanks and ignores the rest.
+	b.botPlane_x = 15;   b.botPlane_y = sticky ? 2 : 1;
+
+	b.editable = true;
+	b.blockModel = 18;
+	b.soundType = 2;
+	b.transparent = true;   // the cell is a rod standing in air
+	b.allowLight = true;
+	b.solid = false;        // nothing can be built on a rod, and nothing conducts through it
+	b.lightSource = false;
+
+	// Java gives BlockPistonExtension the default bounds, i.e. the whole cell, even though the plate
+	// only fills 4 px of it. Matching that keeps the player's collider and the pick ray agreeing with
+	// vanilla about a block that is mostly air, and it is the same box in all six directions.
+	b.collideBox = BoundingBox(Vector3(-0.5f,-0.5f,-0.5f),Vector3(0.5f,0.5f,0.5f));
+
+	// Java drops nothing for the extension, and a broken head must not hand out a free piston.
+	// DropThis ignores any id <= 0, so 0 is how "no drop" is spelled to it.
+	b.loot = 0;
+
+	b.name = sticky ? "Sticky Piston Head" : "Piston Head";
+}
+
+PistonHead::PistonHead():BaseBlock(){ InitPistonHead(*this, false); }
+block_t PistonHead::getID(){ return kExtendedBlockBase + 24; }
+
+StickyPistonHead::StickyPistonHead():BaseBlock(){ InitPistonHead(*this, true); }
+block_t StickyPistonHead::getID(){ return kExtendedBlockBase + 25; }

@@ -34,9 +34,9 @@
 #include <Aurora/Utils/pge.h>
 //#include "support/pgesupportprx.h"
 
+/* Game module info lives in Scripts.cpp. Defining it here too breaks the link. */
 #ifdef __PSP__
-	PSP_MODULE_INFO("Phoenix Game Engine", PSP_MODULE_USER, 1, PGE_VERSION);
-	PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER|PSP_THREAD_ATTR_VFPU);
+	/* PSP_MODULE_INFO / PSP_MAIN_THREAD_ATTR intentionally omitted */
 #endif
 
 static int running = 1;

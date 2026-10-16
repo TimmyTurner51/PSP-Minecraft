@@ -17,7 +17,7 @@ PSPPATH = $(shell psp-config --psp-prefix)
 
 INCDIR = $(PSPPATH)/include
 CFLAGS = -O2 -G0 -Wall
-CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
+CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti -fpermissive
 ASFLAGS = $(CFLAGS)
 
 include $(PSPSDK)/lib/build.mak

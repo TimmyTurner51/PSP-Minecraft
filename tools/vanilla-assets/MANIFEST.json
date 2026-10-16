@@ -1,0 +1,506 @@
+{
+  "jar": "C:\\Users\\minec\\AppData\\Roaming\\.minecraft\\versions\\1.7.3\\1.7.3.jar",
+  "note": "textures are copied byte-for-byte from the vanilla 1.7.3 client jar; model geometry is parsed from decompiled sources in tools/vanilla-models/. modelBounds is what the model measures, not vanilla's entity hitbox.",
+  "mobs": [
+    {
+      "mob": "bat",
+      "textures": [
+        {
+          "file": "bat.png",
+          "engine": "entity/bat/bat.png",
+          "bytes": 2935,
+          "sha256": "c465f1b47b784984"
+        }
+      ],
+      "models": []
+    },
+    {
+      "mob": "blaze",
+      "textures": [
+        {
+          "file": "blaze.png",
+          "engine": "entity/blaze/blaze.png",
+          "bytes": 3296,
+          "sha256": "d5c1b3185f250648"
+        }
+      ],
+      "models": []
+    },
+    {
+      "mob": "chicken",
+      "textures": [
+        {
+          "file": "chicken.png",
+          "engine": "entity/chicken/chicken.png",
+          "bytes": 455,
+          "sha256": "41d7b04625b1f6e5"
+        }
+      ],
+      "models": [
+        {
+          "modelClass": "ModelChicken",
+          "source": "tools/vanilla-models/ModelChicken.java",
+          "modelBounds": {
+            "lo": [
+              -4.0,
+              -8.0,
+              -4.0
+            ],
+            "hi": [
+              8.0,
+              7.0,
+              4.0
+            ],
+            "size": [
+              12.0,
+              15.0,
+              8.0
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "mob": "cow",
+      "textures": [
+        {
+          "file": "cow.png",
+          "engine": "entity/cow/cow.png",
+          "bytes": 1922,
+          "sha256": "55c4eb830e310c6c"
+        },
+        {
+          "file": "mooshroom.png",
+          "engine": "entity/cow/mooshroom.png",
+          "bytes": 1573,
+          "sha256": "0ea7b0136f3df215"
+        }
+      ],
+      "models": []
+    },
+    {
+      "mob": "creeper",
+      "textures": [
+        {
+          "file": "creeper.png",
+          "engine": "entity/creeper/creeper.png",
+          "bytes": 2964,
+          "sha256": "b11970ef11ad428f"
+        },
+        {
+          "file": "creeper_armor.png",
+          "engine": "entity/creeper/creeper_armor.png",
+          "bytes": 2118,
+          "sha256": "137fad5b13fb791b"
+        }
+      ],
+      "models": []
+    },
+    {
+      "mob": "enderdragon",
+      "textures": [
+        {
+          "file": "dragon.png",
+          "engine": "entity/enderdragon/dragon.png",
+          "bytes": 7919,
+          "sha256": "f673a21e0d77ccd7"
+        }
+      ],
+      "models": []
+    },
+    {
+      "mob": "enderman",
+      "textures": [
+        {
+          "file": "enderman.png",
+          "engine": "entity/enderman/enderman.png",
+          "bytes": 700,
+          "sha256": "de809767be0117af"
+        },
+        {
+          "file": "enderman_eyes.png",
+          "engine": "entity/enderman/enderman_eyes.png",
+          "bytes": 1205,
+          "sha256": "e8aba688cc27faee"
+        }
+      ],
+      "models": []
+    },
+    {
+      "mob": "ghast",
+      "textures": [
+        {
+          "file": "ghast.png",
+          "engine": "entity/ghast/ghast.png",
+          "bytes": 859,
+          "sha256": "b87a7c1e53a355a5"
+        },
+        {
+          "file": "ghast_shooting.png",
+          "engine": "entity/ghast/ghast_shooting.png",
+          "bytes": 906,
+          "sha256": "f74bf6eea63b0071"
+        }
+      ],
+      "models": []
+    },
+    {
+      "mob": "iron_golem",
+      "textures": [
+        {
+          "file": "iron_golem.png",
+          "engine": "entity/iron_golem/iron_golem.png",
+          "bytes": 7839,
+          "sha256": "7ab9fcc8573ac31a"
+        }
+      ],
+      "models": []
+    },
+    {
+      "mob": "magma_cube",
+      "textures": [
+        {
+          "file": "magmacube.png",
+          "engine": "entity/slime/magmacube.png",
+          "bytes": 1425,
+          "sha256": "6a8a6fb9fe8185c8"
+        }
+      ],
+      "models": []
+    },
+    {
+      "mob": "ocelot",
+      "textures": [
+        {
+          "file": "black.png",
+          "engine": "entity/cat/black.png",
+          "bytes": 1367,
+          "sha256": "4cac187aa0cf1bcc"
+        },
+        {
+          "file": "ocelot.png",
+          "engine": "entity/cat/ocelot.png",
+          "bytes": 3089,
+          "sha256": "e3245449ed838da1"
+        },
+        {
+          "file": "red.png",
+          "engine": "entity/cat/red.png",
+          "bytes": 2011,
+          "sha256": "a6fb1611ceb69a0f"
+        },
+        {
+          "file": "siamese.png",
+          "engine": "entity/cat/siamese.png",
+          "bytes": 2685,
+          "sha256": "bf39d73e4321b2e9"
+        }
+      ],
+      "models": []
+    },
+    {
+      "mob": "pig",
+      "textures": [
+        {
+          "file": "pig.png",
+          "engine": "entity/pig/pig.png",
+          "bytes": 3273,
+          "sha256": "c6bcc41d48803df2"
+        },
+        {
+          "file": "pig_saddle.png",
+          "engine": "entity/pig/pig_saddle.png",
+          "bytes": 342,
+          "sha256": "b24711122db2bfb1"
+        }
+      ],
+      "models": [
+        {
+          "modelClass": "ModelPig",
+          "source": "tools/vanilla-models/ModelPig.java",
+          "modelBounds": {
+            "lo": [
+              -9.0,
+              -10.0,
+              -5.0
+            ],
+            "hi": [
+              15.0,
+              6.0,
+              5.0
+            ],
+            "size": [
+              24.0,
+              16.0,
+              10.0
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "mob": "player",
+      "textures": [
+        {
+          "file": "steve.png",
+          "engine": "entity/steve/steve.png",
+          "bytes": 1324,
+          "sha256": "28f71997dfd841d8"
+        }
+      ],
+      "models": []
+    },
+    {
+      "mob": "sheep",
+      "textures": [
+        {
+          "file": "sheep.png",
+          "engine": "entity/sheep/sheep.png",
+          "bytes": 3087,
+          "sha256": "c8424e91f13c19f3"
+        },
+        {
+          "file": "sheep_fur.png",
+          "engine": "entity/sheep/sheep_fur.png",
+          "bytes": 1625,
+          "sha256": "77329d6f440d372d"
+        }
+      ],
+      "models": []
+    },
+    {
+      "mob": "silverfish",
+      "textures": [
+        {
+          "file": "silverfish.png",
+          "engine": "entity/silverfish/silverfish.png",
+          "bytes": 1750,
+          "sha256": "381709ce778b7976"
+        }
+      ],
+      "models": []
+    },
+    {
+      "mob": "skeleton",
+      "textures": [
+        {
+          "file": "skeleton.png",
+          "engine": "entity/skeleton/skeleton.png",
+          "bytes": 858,
+          "sha256": "4ca6d5128c1879d0"
+        },
+        {
+          "file": "wither_skeleton.png",
+          "engine": "entity/skeleton/wither_skeleton.png",
+          "bytes": 1403,
+          "sha256": "ac5b66af14589e68"
+        }
+      ],
+      "models": []
+    },
+    {
+      "mob": "slime",
+      "textures": [
+        {
+          "file": "slime.png",
+          "engine": "entity/slime/slime.png",
+          "bytes": 596,
+          "sha256": "a72dfd1efd7217a9"
+        }
+      ],
+      "models": []
+    },
+    {
+      "mob": "snowman",
+      "textures": [
+        {
+          "file": "snowman.png",
+          "engine": "entity/snowman/snowman.png",
+          "bytes": 1762,
+          "sha256": "1ff3a4c6ef89dbdf"
+        }
+      ],
+      "models": []
+    },
+    {
+      "mob": "spider",
+      "textures": [
+        {
+          "file": "cave_spider.png",
+          "engine": "entity/spider/cave_spider.png",
+          "bytes": 3364,
+          "sha256": "0e304d8df4e0b67e"
+        },
+        {
+          "file": "spider.png",
+          "engine": "entity/spider/spider.png",
+          "bytes": 2518,
+          "sha256": "57b4a05de4e31992"
+        },
+        {
+          "file": "spider_eyes.png",
+          "engine": "entity/spider_eyes.png",
+          "bytes": 218,
+          "sha256": "fb16879b0f5fde12"
+        }
+      ],
+      "models": []
+    },
+    {
+      "mob": "squid",
+      "textures": [
+        {
+          "file": "squid.png",
+          "engine": "entity/squid/squid.png",
+          "bytes": 905,
+          "sha256": "160c5e20cb884b47"
+        }
+      ],
+      "models": []
+    },
+    {
+      "mob": "villager",
+      "textures": [
+        {
+          "file": "butcher.png",
+          "engine": "entity/villager/butcher.png",
+          "bytes": 1840,
+          "sha256": "67c258af3307f583"
+        },
+        {
+          "file": "farmer.png",
+          "engine": "entity/villager/farmer.png",
+          "bytes": 1934,
+          "sha256": "e867d93c2d8c9297"
+        },
+        {
+          "file": "librarian.png",
+          "engine": "entity/villager/librarian.png",
+          "bytes": 2056,
+          "sha256": "2fc5e99a65399475"
+        },
+        {
+          "file": "priest.png",
+          "engine": "entity/villager/priest.png",
+          "bytes": 2056,
+          "sha256": "b855377870bf53e8"
+        },
+        {
+          "file": "smith.png",
+          "engine": "entity/villager/smith.png",
+          "bytes": 1840,
+          "sha256": "2010b21792a5ca97"
+        },
+        {
+          "file": "villager.png",
+          "engine": "entity/villager/villager.png",
+          "bytes": 2056,
+          "sha256": "17d03a7c841a9964"
+        }
+      ],
+      "models": []
+    },
+    {
+      "mob": "witch",
+      "textures": [
+        {
+          "file": "witch.png",
+          "engine": "entity/witch/witch.png",
+          "bytes": 2228,
+          "sha256": "cfcc63cfb7c1e0c5"
+        }
+      ],
+      "models": []
+    },
+    {
+      "mob": "wither",
+      "textures": [
+        {
+          "file": "wither.png",
+          "engine": "entity/wither/wither.png",
+          "bytes": 2702,
+          "sha256": "3aa224a6a9642269"
+        },
+        {
+          "file": "wither_armor.png",
+          "engine": "entity/wither/wither_armor.png",
+          "bytes": 3477,
+          "sha256": "3432b27855ad3467"
+        },
+        {
+          "file": "wither_invulnerable.png",
+          "engine": "entity/wither/wither_invulnerable.png",
+          "bytes": 3045,
+          "sha256": "eed9f4690c6f0e99"
+        }
+      ],
+      "models": []
+    },
+    {
+      "mob": "wolf",
+      "textures": [
+        {
+          "file": "wolf.png",
+          "engine": "entity/wolf/wolf.png",
+          "bytes": 4333,
+          "sha256": "53d7a333f011baba"
+        },
+        {
+          "file": "wolf_angry.png",
+          "engine": "entity/wolf/wolf_angry.png",
+          "bytes": 3191,
+          "sha256": "5ac24121cc1177d2"
+        },
+        {
+          "file": "wolf_collar.png",
+          "engine": "entity/wolf/wolf_collar.png",
+          "bytes": 4308,
+          "sha256": "28e0a677756f72b1"
+        },
+        {
+          "file": "wolf_tame.png",
+          "engine": "entity/wolf/wolf_tame.png",
+          "bytes": 4360,
+          "sha256": "01f2b4fef8c33b3d"
+        }
+      ],
+      "models": []
+    },
+    {
+      "mob": "zombie",
+      "textures": [
+        {
+          "file": "zombie.png",
+          "engine": "entity/zombie/zombie.png",
+          "bytes": 2388,
+          "sha256": "5e1b60687d0f33cb"
+        }
+      ],
+      "models": []
+    },
+    {
+      "mob": "zombie_pigman",
+      "textures": [
+        {
+          "file": "zombie_pigman.png",
+          "engine": "entity/zombie_pigman/zombie_pigman.png",
+          "bytes": 4495,
+          "sha256": "bbf2931aabf1f446"
+        }
+      ],
+      "models": []
+    },
+    {
+      "mob": "zombie_villager",
+      "textures": [
+        {
+          "file": "zombie_villager.png",
+          "engine": "entity/zombie/zombie_villager.png",
+          "bytes": 2377,
+          "sha256": "9b90ccdfc2a7db6e"
+        }
+      ],
+      "models": []
+    }
+  ]
+}

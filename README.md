@@ -1,26 +1,44 @@
-# PSP-Minecraft
-A Minecraft Clone for the PlayStation Portable.
-Not all code is by me.
-This is part of a team. It's me, Invisibros, and Iridescence (aka IridescentRose).
+# Minecraft PSP 4.0.0
 
-Invisibros' Website: https://invisibros.weebly.com/minecraft-playstation-portable-edition.html
+A Minecraft-style game for the PlayStation Portable.
 
-Invisibros' YouTube: https://www.youtube.com/channel/UCFv_A01KSUi2p5GIo8hv7WA
+This is a revival of the old PSP homebrew, kept free. It is not an official Minecraft product and is not affiliated with Mojang or Microsoft.
 
-Iridescence's Github: https://github.com/IridescentRose/
+## What's new in 4.0.0
 
-My YouTube: https://www.youtube.com/channel/UCt56sxHQUm0PWMtcLpe1WdA/
+- The Nether
+- Infinite world generation (limited by memory stick space)
+- Blended biomes
+- Player skins
+- Redstone, pistons, bows and arrows
+- Skeletons, spiders, and chickens
+- Third person, sprint, sneak, hunger, and creative flight
+- New lighting
+- A launcher that can install updates
+- Crash and performance fixes
 
-Upcoming release, a revival of Minecraft for PSP, huge progress is incoming but no spoilers yet.
+## Play
 
-V3.0.1, updated 9-23-2026 - built from source code obtained from Invisibros (not this repo).
+You need a PSP (or PPSSPP) and a copy of the 4.0.0 launcher pack.
 
-NOTE: This for now, is the same old source, new source is vibe-coded, in a way, for you to be aware. It has been tested, still in testing, many bugs and issues I found are being fixed.
-One thing I plan to do is try to make the source code and overall tree easier for you guys to play with in code if you want. It's already almost there.
-So, other than bug fixes and a few additions, the massive code files were split across separate files which they belong, so you're not scrolling through the whole StatePlay files, for example.
+1. Copy the launcher folder onto the memory stick at `PSP/GAME/`.
+2. Start it from the XMB.
+3. Pick **4.0.0** and press Play.
 
-Also, to note, Invisibros has as you know left the scene. However, after noticing paywalled Minecraft PSP betas out there, I am implementing features "myself" (not entirely as stated), for free.
-If at most, it'll only be donations for keeping AI running, if this even gets to that point. Up to now, I am paying myself towards this because I love the project, and like the quick work and bug checks it provides.
-Once it drops, I'd love to hear feedback but for now, stay tuned!
+On a real PSP, a Memory Stick with a few hundred megabytes free is enough for the game. Worlds keep growing until the stick fills up.
 
-Thanks for checking this out!!!
+## Updates
+
+The launcher checks [GitHub Releases](https://github.com/TimmyTurner51/PSP-Minecraft/releases) for a newer build and installs it beside the one you already have, so you can go back if something goes wrong.
+
+## Credits
+
+- **TimmyTurner51** — this revival
+- **Invisibros** — the original PSP Minecraft this is built from
+- **Iridescence (IridescentRose)** — earlier work on the project
+
+[Invisibros' site](https://invisibros.weebly.com/minecraft-playstation-portable-edition.html) · [Invisibros on YouTube](https://www.youtube.com/channel/UCFv_A01KSUi2p5GIo8hv7WA) · [Iridescence on GitHub](https://github.com/IridescentRose/)
+
+## License
+
+Homebrew. Minecraft is a trademark of Mojang Studios.

@@ -10,6 +10,9 @@
 
 Zombie::Zombie(Vector3 position1, int number1) : LameMob(position1, number1)
 {
+    ApplyProfile(MobProfiles::Zombie);
+    debugName = "Zombie";
+
     legs = Vector3(0,PIXEL*-6,0);
 
     SetCollideBox(Vector3(PIXEL*4,PIXEL*18,PIXEL*4),Vector3(PIXEL*4,PIXEL*12,PIXEL*4));
@@ -27,19 +30,10 @@ Zombie::Zombie(Vector3 position1, int number1) : LameMob(position1, number1)
     rLegAngle = PI;
     lLegAngle = PI;
 
-    SPD = 1.1f;
-    HP = 18.0f;
-
-    friendly = false;
-
-    sunTimer = (rand() % 14)/10.0f;
-
     helmetId = -1;
     chestplateId = -1;
     leggingsId = -1;
     bootsId = -1;
-
-    freezedTimerMax = 60.0f;
 
     bool armored = false;
     if(rand() % 100 <= 4) // 5 %
@@ -132,6 +126,11 @@ Zombie::Zombie(Vector3 position1, int number1) : LameMob(position1, number1)
     UpdateBBox();
 
     mainTexture = TextureHelper::Instance()->GetTexture(TextureHelper::zombieTexture);
+
+    headAngleY = 0.0f;
+    headAngleZ = 0.0f;
+    UpdateBBox();
+    myLight = 1.0f;
 }
 
 Zombie::~Zombie()
@@ -141,15 +140,14 @@ Zombie::~Zombie()
 
 void Zombie::BoxCollision()
 {
-    for(int x = 0; x < world->mZombies.size(); x++)
+    for(int x = 0; x < (int)world->mZombies.size(); x++)
     {
-        Zombie *TestZombie2 = world->mZombies[x];
-        if(TestZombie2->number != number && (TestZombie2->position.x != position.x || TestZombie2->position.z != position.z || TestZombie2->position.y != position.y))
+        Zombie *Other = world->mZombies[x];
+        if(Other->number != number && (Other->position.x != position.x || Other->position.z != position.z || Other->position.y != position.y))
         {
-            if(TestZombie2->bBox.intersect(bBox))
+            if(Other->bBox.intersect(bBox))
             {
-                float angle1 = ATAN2_fast(position.x-TestZombie2->position.x,position.z-TestZombie2->position.z); // super secret function
-
+                float angle1 = ATAN2_fast(position.x-Other->position.x,position.z-Other->position.z);
                 TryToMove(Vector3(sinf(angle1),0.0f,cosf(angle1)),SPD*0.05f);
             }
         }
@@ -158,589 +156,98 @@ void Zombie::BoxCollision()
 
 void Zombie::TakeDamage(float damage, float power, float dt)
 {
-    float AP = 2.0f;
-    AP = 2.0f + world->FetchArmorPoints(bootsId, leggingsId, chestplateId, helmetId);
-
-    HP -= damage*(1.0f-(AP/25.0f));
-
-    kicked = true;
-    damaged = true;
-    damagedTimer = power*0.6f+0.15;
-    velocity.y = (power+0.15f) * JUMPVELOCITY;
-    walkingOnGround = false;
-
-    position += velocity * dt;
-    playHurtSound = true;
-
-    lastKickType = 1; //by player
+    float AP = 2.0f + world->FetchArmorPoints(bootsId, leggingsId, chestplateId, helmetId);
+    ApplyKickDamage(damage*(1.0f-(AP/25.0f)), power, dt, 1, &animLegAngleT);
 }
 
 void Zombie::TakeDamageFromPointExplosion(float damage, float power, float dt, Vector3 point)
 {
     explosionPos = point;
-
-    float AP = 2.0f;
-    AP = 2.0f + world->FetchArmorPoints(bootsId, leggingsId, chestplateId, helmetId);
-
-    HP -= damage*(1.0f-(AP/25.0f));
-
-    kicked = true;
-    damaged = true;
-    damagedTimer = power*0.6f+0.15;
-    velocity.y = (power+0.25f) * JUMPVELOCITY;
-    walkingOnGround = false;
-
-    position += velocity * dt;
-    playHurtSound = true;
-
-    lastKickType = 2; //by explosion
+    float AP = 2.0f + world->FetchArmorPoints(bootsId, leggingsId, chestplateId, helmetId);
+    ApplyKickDamage(damage*(1.0f-(AP/25.0f)), power, dt, 2, NULL);
 }
 
 void Zombie::Update(CraftWorld *myWorld, Vector3 playerPos, float dt)
 {
-    world = myWorld;
-    BoundingBox playerHitBox = BoundingBox(Vector3(playerPos.x - 0.73f,playerPos.y - 1.65f,playerPos.z - 0.73f),Vector3(playerPos.x + 0.73f,playerPos.y + 0.2f,playerPos.z + 0.73f));
+    if(!BeginMobUpdate(myWorld, playerPos, dt))
+        return;
 
-    distanceToPlayer = DistanceToPlayer();
-    fastDistanceToPlayer = FastDistanceToPlayer();
-
-    if(killed == true)
-    {
-        if(deathAngle < PI/2)
-        {
-            deathAngle += (PI/2)*dt*1.7+((PI/2-deathAngle)/24);
-        }
-
-        if(deathAngle > PI/2)
-        {
-            deathAngle = PI/2;
-        }
-
-        deathTimer -= dt;
-    }
+    UpdateDeathPose(dt);
 
     if(toDestroy == false)
     {
-        relPlayerPos = playerPos;
+        BoundingBox playerHitBox = BoundingBox(Vector3(playerPos.x - 0.73f,playerPos.y - 1.65f,playerPos.z - 0.73f),Vector3(playerPos.x + 0.73f,playerPos.y + 0.2f,playerPos.z + 0.73f));
 
-        if(dt < 0.1f)
-        {
-            sunTimer += dt;
-            if(sunTimer > 1.5f)
-            {
-                if((world->worldDayTime > 6 && world->worldDayTime < 21 && world->GetShadowLevel(position.x,position.y-0.2f,position.z) == 0) && world->worldWeather->GetWeatherType() == 0)//clear weather, sun, zombie under clear sky
-                {
-                    HP -= 2.0f;
-                    damaged = true;
-                    damagedTimer = 0.9f;
-
-                    playHurtSound = true;
-                }
-                sunTimer = 0.0f;
-            }
-        }
-        if(fastDistanceToPlayer < world->mainOptions.horizontalViewDistance*14+5)
+        if(fastDistanceToPlayer < world->mainOptions.horizontalViewDistance*14)
         {
             freezedTimer = 0.0f;
-            if(HP <= 0.0f && killed == false)
+            if(CheckJustKilled())
             {
-                killed = true;
-                playDieSound = true;
                 SetCollideBox(Vector3(PIXEL*4,PIXEL*5,PIXEL*4),Vector3(PIXEL*4,PIXEL*12,PIXEL*4));
                 return;
             }
 
             UpdateBBox();
+            UpdateMobTimers(dt, playerHitBox);
 
+            bool wantAttack = false;
+            UpdateHostileAI(dt, &wantAttack);
 
-            /// TIMERS --- *
-            if(dt < 0.1f)
+            // Melee kick (survival only; UpdateHostileAI already gated creative).
+            if(wantAttack && killed == false)
             {
-                sayTimer -= dt;
-                if(sayTimer < 0.0f)
+                if(nearToPlayer == false)
+                    kickTimer = 0.95f;
+                nearToPlayer = true;
+                kickTimer += dt;
+                if(kickTimer >= profile.attackCooldown)
                 {
-                    playSaySound = true;
-                    sayTimer = 10.0f + (rand() % 160)/10.0f;
-                }
-			
-
-                jumpTimer += dt;
-                if(jumpTimer > 0.2f)
-                {
-                    jumpReady = true;
-                    jumpTimer = 0.0f;
-                }
-
-                if(damaged == true)
-                {
-                    if(damagedTimer > 0.0f)
+                    Vector3 checkPos = (playerPos-position)*0.5f;
+                    Vector3 checkPos2 = (playerPos-position)*0.75f;
+                    Vector3 checkPos3 = (playerPos-position)*0.25f;
+                    if(world->BlockSolid(position.x+checkPos.x,position.y+checkPos.y,position.z+checkPos.z) == false &&
+                       world->BlockSolid(position.x+checkPos2.x,position.y+checkPos2.y,position.z+checkPos2.z) == false &&
+                       world->BlockSolid(position.x+checkPos3.x,position.y+checkPos3.y,position.z+checkPos3.z) == false)
                     {
-                        damagedTimer -= dt;
-                    }
-                    else
-                    {
-                        damagedTimer = 0.0f;
-                        damaged = false;
+                        world->kickedStart = true;
+                        world->kickedAngle = ATAN2_fast(position.x-myWorld->playerPos.x,position.z-myWorld->playerPos.z);
+                        world->kickedBy = 1;
+                        world->kickedDamage = (int)profile.attackDamage;
+                        kickTimer = 0.0f;
                     }
                 }
-
-                if(distanceToPlayer <= 2.42f)
-                {
-                    if(nearToPlayer == false)
-                    {
-                        kickTimer = 0.95f;
-                    }
-                    nearToPlayer = true;
-                }
-                else
-                {
-                    nearToPlayer = false;
-                }
-
-                if(nearToPlayer == true)
-                {
-                    kickTimer += dt;
-                    if(kickTimer >= 1.0f)
-                    {
-                        Vector3 checkPos = (playerPos-position)*0.5f;
-                        Vector3 checkPos2 = (playerPos-position)*0.75f;
-                        Vector3 checkPos3 = (playerPos-position)*0.25f;
-                        if(world->BlockSolid(position.x+checkPos.x,position.y+checkPos.y,position.z+checkPos.z) == false && world->BlockSolid(position.x+checkPos2.x,position.y+checkPos2.y,position.z+checkPos2.z) == false && world->BlockSolid(position.x+checkPos3.x,position.y+checkPos3.y,position.z+checkPos3.z) == false)
-                        {
-                            if(world->HP > 0)
-                            {
-                                world->kickedStart = true;
-                                world->kickedAngle = ATAN2_fast(position.x-myWorld->playerPos.x,position.z-myWorld->playerPos.z);
-                                world->kickedBy = 1;
-                                world->kickedDamage = 3;
-                            }
-
-                            kickTimer = 0.0f;
-                        }
-                    }
-                }
-
-                /// * --- END
-
-
-
-                /// BECOME ANGRY --- *
-                if(killed == false)
-                {
-                    if(fastDistanceToPlayer < 11 && world->HP > 0) // it sees you
-                    {
-                        haunting = false;
-                        hauntingTimer = 0.0f;
-                        hauntingTimerMax = 0.0f;
-                        hauntingPos = Vector3(0,0,0);
-                        hauntingAngle = 0.0f;
-
-                        if(distanceToPlayer > 1.3f)
-                        {
-                            angred = true;
-                        }
-                        else
-                        {
-                            moving = false;
-                        }
-                    }
-                    else // it doesn't see the player
-                    {
-                        headAngleZ = 0.0f;
-                        headAngleY = 0.0f;
-                        moving = false;
-                        angred = false;
-                        haunting = true;
-
-                        if(hauntingTimerMax == 0.0f)
-                        {
-                            hauntingTimerMax = 5.0f + rand() % 6;
-                        }
-
-                        if(hauntingTimer < hauntingTimerMax)
-                        {
-                            hauntingTimer += dt;
-                        }
-                        if(hauntingTimer >= hauntingTimerMax)
-                        {
-                            hauntingTimer = 0.0f;
-                            if(rand()%100 < 80) // walk to some point nearby
-                            {
-
-                                hauntingTimerMax = 4.0f + (rand() % 27)/5.0f;
-                                if(rand() % 5 == 0)
-                                {
-                                    hauntingTimerMax = 1.0f+(rand() % 20)/10.0f;
-                                }
-
-                                hauntingPos.x = position.x - 6 + (rand() % 120)/10.0f;
-                                hauntingPos.z = position.z - 6 + (rand() % 120)/10.0f;
-
-                                if(hauntingPos.x > world->WORLD_SIZE-3)
-                                {
-                                    hauntingPos.x = world->WORLD_SIZE-3;
-                                }
-                                if(hauntingPos.x < 2)
-                                {
-                                    hauntingPos.x = 2;
-                                }
-
-                                if(hauntingPos.z > world->WORLD_SIZE-3)
-                                {
-                                    hauntingPos.z = world->WORLD_SIZE-3;
-                                }
-                                if(hauntingPos.z < 2)
-                                {
-                                    hauntingPos.z = 2;
-                                }
-
-                                hauntingAngle = ATAN2_fast(position.x-hauntingPos.x,position.z-hauntingPos.z)+PI;
-                            }
-                            else // just rotate about its own position
-                            {
-                                hauntingTimerMax = 2.0f+(rand()%13)/5.0f;
-                                hauntingAngle = (rand() % 360)/180.0f*PI;
-
-                                hauntingPos = Vector3(-1,-1,-1);
-                            }
-                        }
-                    }
-                    /// * --- END
-
-
-                    /// SWIMING --- *
-                    if(world->PlayerInWater(position) == true && jumpReady == true && killed == false)
-                    {
-                        TryToJump();
-                        jumpReady = false;
-                    }
-                    /// * --- END
-
-
-
-                    /// MOVING WHEN ANGRY ---- *
-                    if(angred == true && kicked == false)
-                    {
-                        checkCollisionTimer += dt;
-                        if(checkCollisionTimer >= 0.1f)
-                        {
-                            BoxCollision();
-                            checkCollisionTimer = 0.0f;
-                        }
-
-                        float playerAngle = ATAN2_fast(position.x-relPlayerPos.x,position.z-relPlayerPos.z)+PI;
-                        if(mainAngle != playerAngle)
-                        {
-                            mainAngle += sinf(playerAngle-mainAngle)*0.1f;
-                        }
-                        headAngleY = playerAngle-mainAngle;
-
-                        if(distanceToPlayer > 1.5f)
-                        {
-                            TryToMove(Vector3(sinf(mainAngle),0.0f,cosf(mainAngle)),SPD*dt);
-                        }
-
-                        headAngleZ = (relPlayerPos.y-position.y-0.315f)*0.25f;
-                        if(headAngleZ > PI/4.0f)
-                        {
-                            headAngleZ = PI/4.0f;
-                        }
-                        if(headAngleZ < -PI/4.0f)
-                        {
-                            headAngleZ = -PI/4.0f;
-                        }
-                    }
-                    /// * --- END
-
-
-                    /// HAUNTING --- *
-                    if(haunting == true)
-                    {
-                        if(hauntingPos.x != 0 && hauntingPos.z != 0)
-                        {
-                            if(DistanceToHauntingPos() > 0.5f)
-                            {
-                                if(hauntingPos != Vector3(-1,-1,-1))
-                                {
-                                    //mainAngle = hauntingAngle;
-
-                                    if(mainAngle != hauntingAngle)
-                                    {
-                                        mainAngle += sinf(hauntingAngle-mainAngle)*0.07f;
-                                    }
-
-                                    TryToMove(Vector3(sinf(mainAngle),0.0f,cosf(mainAngle)),SPD*dt);
-                                }
-                                else
-                                {
-                                    if(mainAngle != hauntingAngle)
-                                    {
-                                        mainAngle += sinf(hauntingAngle-mainAngle)*0.07f;
-                                    }
-
-                                    if(abs(mainAngle - hauntingAngle) < 0.02f)
-                                    {
-                                        mainAngle = hauntingAngle;
-                                    }
-                                }
-                            }
-                            else
-                            {
-                                hauntingPos.x = 0;
-                                hauntingPos.z = 0;
-                            }
-                        }
-                    }
-                }
-                /// * --- END
-
-
-                /// MOVING WHEN KICKED ---- *
-                if(kicked == true)
-                {
-                    mainAngle = ATAN2_fast(position.x-relPlayerPos.x,position.z-relPlayerPos.z)+PI; // super secret function
-                    float angle;
-                    if(lastKickType != 2)
-                    {
-                        angle = ATAN2_fast(position.x-relPlayerPos.x,position.z-relPlayerPos.z)+PI;
-                    }
-                    else
-                    {
-                        angle = ATAN2_fast(position.x-explosionPos.x,position.z-explosionPos.z)+PI;
-                    }
-                    TryToMoveWithoutJump(Vector3(sinf(angle+PI),0.0f,cosf(angle+PI)),(SPD+0.18f)*9.2f*(damagedTimer*damagedTimer)*dt);
-
-                    if((walkingOnGround == true || footInLava || footInWater) && damagedTimer <= 0.0f)
-                    {
-                        kicked = false;
-                    }
-
-                    float playerAngle = ATAN2_fast(position.x-relPlayerPos.x,position.z-relPlayerPos.z)+PI;
-                    headAngleY = playerAngle-mainAngle;
-
-                    headAngleZ = (relPlayerPos.y-position.y-0.315f)*0.25f;
-                    if(headAngleZ > PI/4.0f)
-                    {
-                        headAngleZ = PI/4.0f;
-                    }
-                    if(headAngleZ < -PI/4.0f)
-                    {
-                        headAngleZ = -PI/4.0f;
-                    }
-                }
-                /// * --- END
-
-
-
-                /// ANIMATIONS  --- *
-                if(killed == false)
-                {
-                    animHandAngleT += PI*dt*0.75;
-                    if(animHandAngleT >= PI*2)
-                    {
-                        animHandAngleT = 0.0f;
-                    }
-                    animHandAngle = sinf(animHandAngleT) * 0.09f;
-
-                    if(moving == true)
-                    {
-                        animLegAngleT += PI*dt*1.6;
-                        if(animLegAngleT >= PI*2)
-                        {
-                            animLegAngleT = 0.0f;
-                        }
-                    }
-                    else
-                    {
-                        if (animLegAngleT > 0 && animLegAngleT < PI/2)
-                        {
-                            animLegAngleT -= animLegAngleT * 0.3f;
-                            if (animLegAngleT < 0.05)
-                            {
-                                animLegAngleT = 0;
-                            }
-                        }
-                        if (animLegAngleT >= PI/2 && animLegAngleT < PI)
-                        {
-                            animLegAngleT += (PI-animLegAngleT) * 0.3f;
-                            if (animLegAngleT > PI - 0.05)
-                            {
-                                animLegAngleT = 0;
-                            }
-                        }
-                        if (animLegAngleT > PI && animLegAngleT < PI*1.5)
-                        {
-                            animLegAngleT -= (animLegAngleT-PI) * 0.3f;
-                            if (animLegAngleT < PI + 0.05)
-                            {
-                                animLegAngleT = 0;
-                            }
-                        }
-                        if (animLegAngleT >= PI*1.5 && animLegAngleT < PI*2)
-                        {
-                            animLegAngleT += (2*PI-animLegAngleT) * 0.3f;
-                            if (animLegAngleT > 2*PI - 0.05)
-                            {
-                                animLegAngleT = 0;
-                            }
-                        }
-                    }
-                    animLegAngle = sinf(animLegAngleT) * 0.7f;
-                }
-                /// * --- END
-
-
-                /// DAMAGE FACTORS --- *
-                if(touchingCactus)
-                {
-                    tickCactusDamage += dt;
-                }
-                else
-                {
-                    tickCactusDamage = 0.4f;
-                }
-                if(tickCactusDamage >= 0.5f)
-                {
-                    HP -= 1;
-                    damaged = true;
-                    damagedTimer = 0.55f;
-
-                    tickCactusDamage -= 0.5f;
-                }
-                /// * --- END
-
-
-                /// SIMEPLE MOB PHYSICS --- *
-
-                Vector3 footPosition = position + foot;
-                Vector3 legsPosition = position + legs;
-                Vector3 headPosition = position + head;
-
-                if(world->PlayerInWater(legsPosition))
-                    footInWater = true;
-                else
-                    footInWater = false;
-
-                if(world->PlayerInWater(headPosition))
-                {
-                    if (velocity.y > -3)
-                    {
-                        velocity.y += (GRAVITY/3.0f) * dt;
-                    }
-                    else
-                    {
-                        velocity.y = -3;
-                    }
-                    headInWater = true;
-                }
-                else
-                {
-                    headInWater = false;
-                    velocity.y += (GRAVITY*1.3 * dt) * 1.6f;
-                }
-
-                if(world->PlayerInLava(legsPosition))
-                {
-                    footInLava = true;
-                    HP -= 0.5f;
-                    damaged = true;
-                    damagedTimer = 0.55f;
-                }
-                else
-                {
-                    footInLava = false;
-                }
-
-                if(world->PlayerInLava(headPosition))
-                {
-                    velocity.y += (GRAVITY/3.0f) * dt;
-                    headInLava = true;
-                    HP -= 1;
-                    damaged = true;
-                    damagedTimer = 0.55f;
-                }
-                else
-                {
-                    headInLava = false;
-                    velocity.y += GRAVITY * dt;
-                }
-
-                touchingCactus = false;
-                if(world->PlayerCollisionWithCactus(headPosition) || world->PlayerCollisionWithCactus(legsPosition))
-                {
-                    touchingCactus = true;
-                }
-
-                if(world->SolidAtPointForEntity(footPosition,colliderD) || world->SolidAtPointForEntity(headPosition,colliderU))
-                {
-                    walkingOnGround = true;
-                    if (world->SolidAtPointForEntity(headPosition,colliderU))
-                    {
-                        int blockIn = (int)(headPosition.y);
-                        position.y = (float)(blockIn - colliderU.y - 0.05);
-                    }
-                    if (world->SolidAtPointForEntity(footPosition,colliderD))
-                    {
-                        int blockOn = (int)(footPosition.y);
-                        position.y = (float)(blockOn + 1 + colliderD.y - 0.05);
-
-                        if(world->GetBlock(footPosition.x,footPosition.y,footPosition.z) == CactusBlock::getID())
-                        {
-                            touchingCactus = true;
-                        }
-                    }
-
-                    if(velocity.y != 0.0f) /// FALL DAMAGE
-                    {
-                        if (!world->PlayerInWater(footPosition))
-                        {
-                            if(velocity.y < -12 && velocity.y > -19)
-                            {
-                                HP -= (int)((velocity.y*-1) - 11) / 1.4;
-
-                                damaged = true;
-                                damagedTimer = 0.75f;
-                                playHurtSound = true;
-                            }
-                            if(velocity.y < -19)
-                            {
-                                HP -= (int)((velocity.y*-1) - 11) * 1.3f;
-
-                                damaged = true;
-                                damagedTimer = 0.75f;
-                                playHurtSound = true;
-                            }
-                        }
-                    }
-                    velocity.y = 0.0f;
-
-                    if(jumping == true)
-                    {
-                        velocity.y = 1.55f * JUMPVELOCITY;
-                        jumping = false;
-                        walkingOnGround = false;
-                    }
-                }
-                else
-                {
-                    walkingOnGround = false;
-                }
-                position += velocity * dt;
             }
-            /// * --- END
 
+            // Look at player while chasing.
+            if(angred == true && kicked == false)
+            {
+                float playerAngle = ATAN2_fast(position.x-relPlayerPos.x,position.z-relPlayerPos.z)+PI;
+                headAngleY = playerAngle-mainAngle;
+                headAngleZ = (relPlayerPos.y-position.y-0.315f)*0.25f;
+                if(headAngleZ > PI/4.0f) headAngleZ = PI/4.0f;
+                if(headAngleZ < -PI/4.0f) headAngleZ = -PI/4.0f;
+            }
+            else if(kicked == false)
+            {
+                headAngleY = 0.0f;
+                headAngleZ = 0.0f;
+            }
 
+            UpdateKnockbackMove(dt);
+
+            // Hand idle anim (zombie-specific).
+            if(killed == false)
+            {
+                animHandAngleT += PI*dt*0.75f;
+                if(animHandAngleT >= PI*2) animHandAngleT = 0.0f;
+                animHandAngle = sinf(animHandAngleT) * 0.09f;
+            }
+            UpdateLegAnim(dt, &animLegAngleT, &animLegAngle);
+            UpdateMobPhysics(dt);
         }
         else
         {
-            if(dt < 0.1f)
-            {
-                freezedTimer += dt;
-                if(freezedTimer >= 60.0f)
-                {
-                    toDestroy = true;
-                }
-            }
+            UpdateOutOfRangeFreeze(dt);
         }
     }
 }
@@ -990,7 +497,6 @@ void Zombie::Render(Frustum &camFrustum, float dt)
 
             DrawSetCulling(false);
 
-
             sceGuDisable(GU_BLEND);
             //sceGuDisable(GU_ALPHA_TEST);
             sceGuDisable(GU_DEPTH_TEST);
@@ -998,6 +504,8 @@ void Zombie::Render(Frustum &camFrustum, float dt)
             sceGuColor(0xFFFFFFFF);
 
             sceGumPopMatrix();
+
+            RenderFire();
         }
     }
 }

@@ -27,6 +27,9 @@ public:
 
 	char itemType; // "D" - default, "T" - tool, "F" - food, "H" - helmet, "C" - chestplate, "L" - leggings, "B" - boots "Y" - dye
 
+	// Borrowed, never owned -- same contract as BaseBlock's meshes. CraftWorld allocates these in
+	// GetItemVerts() and releases them in FreeItemTypeMeshes(), and ~BaseItem frees nothing, so copying
+	// a BaseItem cannot free them twice. See FreeItemTypeMeshes().
 	TexturesPSPVertex *vertices;
 	TexturesPSPVertex *addVertices;
 	TexturesPSPVertex *add2Vertices;

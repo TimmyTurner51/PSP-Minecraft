@@ -1,5 +1,65 @@
 TARGET = Tutorial1
-OBJS = source/Aurora/Math/MathLib.o \
+# CONSTRUCTOR ORDER IS THE REVERSE OF THIS LIST. That is measured, not assumed.
+#
+# The runtime walks .ctors from its end back to its start, so the object listed LAST here is the one
+# whose constructor runs FIRST. Two marker objects, one at each end of this list, each writing a
+# sequence-numbered line to trace.txt (see Scripts/InitTrace.h), proved it: with
+# Scripts/BootMarkerLast.o first and Scripts/BootTrace.o last, the trace begins
+#
+#     boot: first constructor entered   fcr31 as handed over=00000e00
+#     boot: fcr31 after clear=00000000
+#     ...
+#     ctors: all global constructors complete
+#
+# Moving those two lines in this file moves those two groups of lines in the trace. The .ctors contents
+# are the same either way -- only the order at run time changes.
+#
+# This is why Scripts/BootTrace.o is LAST and not first. Its constructor clears the FPU exception
+# enables (see Scripts/FpuControl.h) and drops the boot.txt marker, and being last in this list is what
+# makes it run before every other constructor the game owns: TextureHelper, SoundManager, the Matrix and
+# Vector statics, TextureManager, Particle. Its original position, first in this list, meant it ran
+# *after* all of them -- which armed the FPU traps for the whole constructor phase, the one part of
+# startup that no in-game log can describe, because Log.txt does not exist until main().
+#
+# Scripts/LaunchDir.o now sits after it, and therefore runs before it. That is deliberate and it does
+# not disturb what the paragraph above is protecting: LaunchDir's constructor only chdirs and writes an
+# integer trace line (see Scripts/LaunchDir.c), so it executes no floating point and cannot trip traps
+# that have not been armed yet. What it has to beat is not BootTrace but the first FILE the program
+# opens -- BootTrace's constructor opens trace.txt, and main() resets Log.txt -- so a chdir that ran
+# after those would leave the run's only record outside the game folder, or nowhere. It has to be the
+# first thing that runs, and this is the position that makes it so.
+#
+# The trace reports whether this arrangement is still working. On the line "boot: fcr31 as handed over":
+#
+#     =00000e00   the clear ran before anything else, and this ordering is doing its job
+#     =00000000   something cleared the traps before it, so this ordering has silently stopped working
+#
+# Scripts/LaunchFile.o and Scripts/LaunchDir.o are the two halves of the launch handoff, and only ONE of
+# them is this program's. LaunchDir.o (the reader, and the object that must run first) is last for the
+# reason above; LaunchFile.o (the writer) is the launcher's and is linked here only because LaunchDir.c
+# shares the device list with it, so that the two halves cannot disagree about where the handoff lives.
+# See Scripts/LaunchDir.h.
+#
+# Scripts/Updater.o and Scripts/StateUpdate.o are no longer in OBJS, and that is the shape of the
+# Launcher change rather than a cleanup. The game used to update itself, which forced a second program
+# (UPDATER.PBP) and a one-way loadexec handoff, because a running game cannot replace its own
+# EBOOT.PBP. Updating is now the Launcher's job: it owns the install, so it can write the game binary
+# while nothing is running it. Both sources still exist and are still the single implementation of the
+# package protocol -- UpdaterApp compiles Updater.cpp as source, so the two binaries cannot drift.
+# What the game KEEPS is Aurora/System/NetworkManager and the Multiplayer entry in StateMenu.cpp,
+# which is where networking for the planned multiplayer work lives.
+#
+# Scripts/BootMarkerLast.o is first for the same reason, inverted: it marks the END of the constructor
+# phase, so it is the one that has to run last.
+#
+# Note also that neither constructor carries a priority. A priority looks like the obvious way to force
+# one early, but it does the opposite here: GCC emits a prioritised constructor into .ctors.<n>, and the
+# PSPSDK link script places .ctors.* after every plain .ctors entry. Given the reverse walk above, that
+# puts a prioritised constructor at the end of the array, which is to say first at run time -- a
+# different mechanism than this one, and not one to mix with it.
+OBJS = Scripts/BootMarkerLast.o \
+Scripts/InitTrace.o \
+source/Aurora/Math/MathLib.o \
 source/Aurora/Math/Matrix3.o \
 source/Aurora/Math/Matrix4.o \
 source/Aurora/Math/Quaternion.o \
@@ -33,6 +93,8 @@ Scripts/Blocks.o \
 Scripts/BaseItem.o \
 Scripts/Items.o \
 Scripts/SimpleMeshChunk2.o \
+Scripts/ChunkColumn.o \
+Scripts/ColumnSaver.o \
 Scripts/ChunkDataProvider.o \
 Scripts/BlockEntity.o \
 Scripts/NoteBlockEntity.o \
@@ -43,9 +105,20 @@ Scripts/Chest2.o \
 Scripts/DirectionBlock.o \
 Scripts/Furnace2.o \
 Scripts/CraftWorld2.o \
+Scripts/CraftWorld_InitTypes.o \
+Scripts/CraftWorld_Mobs.o \
+Scripts/CraftWorld_MobMeshes.o \
+Scripts/CraftWorld_SaveLoad.o \
+Scripts/CraftWorld_MeshBlocks.o \
+Scripts/CraftWorld_Fluids.o \
+Scripts/CraftWorld_BlockPlanes.o \
 Scripts/LameMob.o \
 Scripts/Zombie2.o \
 Scripts/Cow2.o \
+Scripts/Pig2.o \
+Scripts/Chicken2.o \
+Scripts/Spider2.o \
+Scripts/Skeleton2.o \
 Scripts/Creeper2.o \
 Scripts/Sheep2.o \
 Scripts/StateMenu.o \
@@ -55,13 +128,18 @@ Scripts/StatePlay.o \
 Scripts/LoadingScreen.o \
 Scripts/SplashScreen.o \
 Scripts/InputHelper.o \
+Scripts/ChatSystem.o \
+Scripts/DebugMenu.o \
 Scripts/TextureHelper.o \
 Scripts/sound_utils/pgeWav.o \
 Scripts/SoundManager.o \
+Scripts/DebugHeap.o \
+Scripts/PerfCounters.o \
 source/Aurora/Graphics/Effects/Drop.o \
 source/Aurora/Graphics/Effects/TNT.o \
 source/Aurora/Graphics/Effects/InventoryPlayer.o \
 source/Aurora/Graphics/Effects/SnowBall2.o \
+source/Aurora/Graphics/Effects/Arrow2.o \
 source/Aurora/Graphics/Effects/SkyLight.o \
 source/Aurora/Graphics/Effects/SkyBox.o \
 source/Aurora/Graphics/Effects/Destroyer.o \
@@ -77,26 +155,94 @@ Scripts/sound_utils/audio.o \
 Scripts/sound_utils/bgm.o \
 Scripts/sound_utils/media.o \
 Scripts/sound_utils/mod.o \
-Scripts.o
+Scripts/FstatFix.o \
+Scripts.o \
+Scripts/BootTrace.o \
+Scripts/LaunchFile.o \
+Scripts/LaunchDir.o
 
 INCDIR = $(PSPPATH)/include
-INCDIR += ./include ./source ./3libs
-CFLAGS = -O3 -G0 -Wall -mpreferred-stack-boundary=4 #-enable-newlib-hw-fp -ffast-math
-CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
+# ./Scripts is here so the init tracer (Scripts/InitTrace.h) can be included by name from the
+# Aurora sources under source/ without every call site spelling out a relative ../../.. path.
+INCDIR += ./include ./source ./3libs ./Scripts
+CFLAGS = -O3 -G0 -Wall -std=gnu99 -mpreferred-stack-boundary=4 -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration -Wno-error=int-conversion -MMD -MP
+CXXFLAGS = -O3 -G0 -Wall -std=gnu++11 -mpreferred-stack-boundary=4 -fno-exceptions -fno-rtti -fpermissive -MMD -MP
 ASFLAGS = $(CFLAGS)
+
+# One-off compile-time switches, so a special build does not need this file edited:
+#   make EXTRA_DEFS=-DMC_PERF_PROBE=1     the work-counter self-test (see Scripts/PerfCounters.h)
+EXTRA_DEFS ?=
+CFLAGS += $(EXTRA_DEFS)
+CXXFLAGS += $(EXTRA_DEFS)
 
 BUILD_PRX = 1
 PSP_FW_VERSION=371
+# PSP_LARGE_MEMORY = 1, and that number is the whole mechanism for "32 MB on a PSP-1000, 64 MB on a
+# 2000/3000". It is a REQUEST, not a demand: the firmware grants the extra 32 MB only on hardware that
+# has it and ignores the request on a PSP-1000, which stays at 32 MB. So MEMSIZE=1 is already dynamic,
+# and nothing has to detect the model to get that -- which is why it is set here rather than worked out
+# at runtime.
+#
+# The game's own detection is the other half and is already in place: it reports which partition it got
+# and sizes its mob caps to match ("memory: freeKB=... => BASE (32MB partition)" and the "mob caps
+# bigMemory=..." line beside it). With the request granted it reports the expanded partition instead.
+#
+# The SDK turns this into the EBOOT's MEMSIZE field, which the KERNEL reads at boot. build.mak maps it
+# like this:
+#
+#     EXPAND_MEMORY = 0
+#     ifeq ($(shell test $(PSP_FW_VERSION) -gt 390; echo $$?),0)
+#     EXPAND_MEMORY = 2                        # FW above 3.90: expanded is the default
+#       PSP_LARGE_MEMORY=1 -> 1                 # and the SDK warns this is no longer necessary
+#       PSP_LARGE_MEMORY=0 -> 0                 # opting OUT is how you ask for less
+#       PSP_LARGE_MEMORY=2 -> 2
+#     else
+#       PSP_LARGE_MEMORY=1 -> 1
+#       PSP_LARGE_MEMORY=2 -> 2                 # unset leaves it at 0
+#     endif
+#
+# This file sets PSP_FW_VERSION=371, which is NOT above 390, so it takes the second branch. Writing the
+# value out matters: deleting the line produces MEMSIZE=0, which asks for LESS memory.
+#
+# WHY IT WAS 2, AND WHY IT IS 1 AGAIN. It was changed to 2 while chasing a launch failure -- the game
+# installed correctly and then went down when loadexec was asked to run it, with the log stopping on the
+# launch line. That reading was wrong: the launch crash is fstat hanging in a process started by
+# loadexec, and it is fixed in Scripts/FstatFix.c. It was never a memory-partition problem, and the note
+# that used to sit here was wrong on the two things it leaned on -- MEMSIZE=2 is not "the larger of the
+# two" (it asks for nothing, so the game ran in the 32 MB partition on every console), and the handoff
+# boot failing is not explained by the request, because it failed with the Updater's MEMSIZE=2 EBOOT as
+# well. What that cost was visible in a world: "HEAP GUARD: OUT OF MEMORY allocating 98304 bytes", with
+# the heap guard reporting no leak, no overrun and no double free -- simply a full 16 MB heap.
 PSP_LARGE_MEMORY = 1
 
 LIBDIR += ./3libs/noisepp ./3libs/libpspmath
-LDFLAGS =
-LIBS=  -lNoisepp -lpspaudiolib -lpspaudio -lmikmod -lmmio -lpspaudiocodec -lpng -lz -lpspgum -lpspgu -lstdc++ -lpsprtc -lpspctrl -lm -lpspvfpu -lpspsdk -lpsppower -lpsphttp -lpspmath #-lpsp_req -lcurl -lTiny
+# -Map writes Tutorial1.map: it records where every input section landed, which is the only
+# way to name an address that has no symbol in the final .symtab (the generator/mesher code
+# ships as unnamed local code). tools/symbolize-crash.py falls back to it when needed.
+LDFLAGS = -Wl,-Map=Tutorial1.map
+LIBS=  -lNoisepp -lpspaudiolib -lpspaudio -lpspaudiocodec -lpng -lz -lpspgum -lpspgu -lstdc++ -lpsprtc -lpspctrl -lm -lpspvfpu -lpspsdk -lpsppower -lpsphttp -lpspssl -lpsputility -lpspmath #-lmikmod -lmmio -lpsp_req -lcurl -lTiny
+# -lpsphttp    the HTTP client the updater downloads through (see Scripts/Updater.cpp)
+# -lpspssl     HTTPS for the GitHub Releases channel (sceSsl / sceHttps, see Scripts/Updater.cpp)
+# -lpsputility sceUtilityLoadNetModule / sceUtilityNetconf* -- loading the net modules and showing
+#              the system's own access-point picker. build.mak adds -lpspnet and -lpspnet_apctl for
+#              us (see its USE_KERNEL_LIBS block), so those are deliberately not repeated here.
 
 EXTRA_TARGETS = EBOOT.PBP
 PSP_EBOOT_TITLE = Minecraft
-PSP_EBOOT_ICON = ICON0.PNG
-PSP_EBOOT_PIC1 = PIC1.PNG
+PSP_EBOOT_ICON = ICON0.png
+PSP_EBOOT_PIC1 = PIC1.png
 
 PSPSDK=$(shell psp-config --pspsdk-path)
 include $(PSPSDK)/lib/build.mak
+-include $(OBJS:.o=.d)
+
+# -lpspsystemctrl_user: sctrlKernelLoadExecVSHWithApitype, the CFW's own launcher, used by the updater
+# to hand off to the Updater EBOOT (see Scripts/Updater.cpp). Stub module SystemCtrlForUser -- a
+# *user-mode* stub, so a game can call it without a kernel addon.
+#
+# Appended after the include, not added to the LIBS line above, and that placement is deliberate.
+# build.mak prepends its own libraries to LIBS, so a lib named above would be linked ahead of them;
+# psp-fixup-imports then warns "stubs out of order ... your binary may or not work". This library is not
+# in the psp-gcc driver's own spec either, so unlike -lpspuser it genuinely has to be named -- and
+# naming it here links it last, alongside that spec's trailing entries, which is where it belongs.
+LIBS += -lpspsystemctrl_user

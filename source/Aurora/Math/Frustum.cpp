@@ -106,16 +106,18 @@ namespace Aurora
 
 		Frustum::PlaneIntersectionType Frustum::BoxInFrustum(BoundingBox &box)
 		{
-			int flag = 0;
+			// Only `Back` rules a box out; `Front` and `Intersecting` need no action. This used to carry a
+			// `flag` that recorded which case matched and was then never read, because the function has no
+			// `Inside` result path at all -- a box wholly inside comes back as `Intersects`, and callers
+			// only distinguish `Outside` from everything else. Dead variable removed rather than left to
+			// suggest a distinction that is not being made.
 			for (int i = 0; i < 6; ++i)
 			{
 				switch(box.intersect(planes[i]))
 				{
 					case BoundingBox::Front:
 					case BoundingBox::Intersecting:
-					{
-						flag = 1;
-					}break;
+					break;
 
 					case BoundingBox::Back:
 					return Outside;

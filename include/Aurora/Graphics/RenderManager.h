@@ -93,13 +93,28 @@ namespace Aurora
 			int GetFontLanguage();
 
 			void DebugPrint(int x,int y, const char *message, ...);
+
+			// Width of `message` in pixels at whatever SetFontStyle last set. Overlay labels are
+			// drawn centred, so anything that has to keep them on screen needs the real width rather
+			// than an estimate. Returns 0 if no font is loaded.
+			int GetTextWidth(const char *message);
 			void Start();
 			void CleanBuffers();
 			void DrawCube(float x, float y, float z);
 
 
 			void StartFrame(float a, float b, float c);
+			// Submits the frame's list and returns at once; the GE draws it while the game runs the
+			// next update. FinishPendingFrame (called by StartFrame, StartDialog, Start and the
+			// screenshot) waits for the GE, runs the frame-retired hook, waits for vblank and swaps.
 			void EndFrame();
+			void FinishPendingFrame();
+			// Waits for the GE only, without the vblank or swap. For code that must release memory
+			// the in-flight list might still read and cannot defer it any longer.
+			void WaitForGe();
+			// Runs inside FinishPendingFrame right after the GE is known idle, before the vblank wait:
+			// the place to free anything the last frame's list referred to.
+			void SetFrameRetiredHook(void (*hook)());
 
 			//dialogs rendering
 			void StartDialog();
@@ -121,6 +136,14 @@ namespace Aurora
 			void SetActiveCamera(Camera *camera);
 			void UpdateFrustumMatrix();
 
+			// World rendering is done relative to an origin near the camera so 32-bit
+			// float math stays precise far from 0,0 (large world coords made near
+			// geometry shimmer while turning). The model matrix starts as
+			// translate(-origin); anything that reloads GU_MODEL for world-space
+			// geometry must call LoadWorldModelMatrix() instead of sceGumLoadIdentity().
+			void LoadWorldModelMatrix();
+			ScePspFVector3 worldOrigin;
+
 			void SetClearColour(unsigned int color);
 
 			void TakeScreenshot(const char* filename);
@@ -129,6 +152,11 @@ namespace Aurora
 			int GetCpuUsage() {return g_cpu_load;}
 			int GetGpuUsage() {return g_gpu_load;}
 			void CollectPerformance(bool state){performanceCounter = state; }
+			// The last FinishPendingFrame's two waits, in microseconds: sceGuSync (what was left of
+			// the GE's list once the update that ran alongside it was over) and
+			// sceDisplayWaitVblankStart.
+			unsigned int lastGeWaitUs;
+			unsigned int lastVblankUs;
 
 
 			static RenderManager * InstancePtr();
@@ -171,6 +199,8 @@ namespace Aurora
 
 			int screenNumber;
 
+			void SetupCameraMatrices(bool flushMatrix);
+
 		private:
 
 			//cpu and gpu timing
@@ -181,6 +211,10 @@ namespace Aurora
 			int g_gpu_load;		// current gpu load
 			int g_frame_count;
 			bool performanceCounter;
+
+			bool framePending;
+			unsigned int frameSubmitTime;
+			void (*frameRetiredHook)();
 
 		};
 	}

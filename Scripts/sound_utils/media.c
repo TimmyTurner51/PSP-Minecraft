@@ -198,6 +198,9 @@ static int osl_mp3Init()		{
 static void osl_mp3DestroyInfo(MP3_INFO *info)		{
 
 	if (info)			{
+		if (info->getEDRAM && info->codecBuffer)
+			sceAudiocodecReleaseEDRAM(info->codecBuffer);
+
 		if (info->codecBuffer)
 			free(info->codecBuffer);
 
@@ -206,9 +209,6 @@ static void osl_mp3DestroyInfo(MP3_INFO *info)		{
 
 		if (info->handle)
 			VirtualFileClose(info->handle);
-
-		if (info->getEDRAM)
-			sceAudiocodecReleaseEDRAM(info->codecBuffer);
 
 		free(info);
 	}
@@ -242,8 +242,21 @@ static MP3_INFO *osl_mp3CreateInfo()		{
 }
 
 static void osl_at3DestroyInfo(AT3_INFO *info)		{
-	//Does the same
-	osl_mp3DestroyInfo((MP3_INFO*)info);
+	if (info)			{
+		if (info->at3_getEDRAM && info->codecBuffer)
+			sceAudiocodecReleaseEDRAM(info->codecBuffer);
+
+		if (info->codecBuffer)
+			free(info->codecBuffer);
+
+		if (info->dataBuffer)
+			free(info->dataBuffer);
+
+		if (info->handle)
+			VirtualFileClose(info->handle);
+
+		free(info);
+	}
 }
 
 
@@ -308,9 +321,9 @@ static int osl_at3Load(const char *fileName, AT3_INFO *info)		{
 	//Try to load the file
 	info->handle = VirtualFileOpen((void*)fileName, 0, VF_AUTO, VF_O_READ);
     info->data_start_init = GetID3TagSize((char*)fileName);
-    VirtualFileSeek(info->handle, info->data_start_init, PSP_SEEK_SET);
 
 	if (info->handle)			{
+    VirtualFileSeek(info->handle, info->data_start_init, PSP_SEEK_SET);
 		u32 riff_header[2];
 		if (VirtualFileRead(riff_header, 8, 1, info->handle) != 8)
 			goto end;
@@ -535,6 +548,11 @@ void oslAudioCallback_DeleteSound_ME(OSL_SOUND *s)		{
 	s->data = NULL;
 }
 
+void oslAudioCallback_DeleteSound_AT3(OSL_SOUND *s)		{
+	osl_at3DestroyInfo((AT3_INFO*)s->data);
+	s->data = NULL;
+}
+
 int oslAudioCallback_AudioCallback_AT3(unsigned int i, void* buf, unsigned int length)			{
 	AT3_INFO *info = (AT3_INFO*)osl_audioVoices[i].data;
 	int eof = 0;
@@ -582,8 +600,8 @@ end:
 }
 
 
-static void soundInit(const char *filename, OSL_SOUND *s, MP3_INFO *info)		{
-	s->data = (void*)info;
+static void soundInit(const char *filename, OSL_SOUND *s, void *info, u32 sample_per_frame)		{
+	s->data = info;
 
 	s->endCallback = NULL;
 	s->volumeLeft = s->volumeRight = OSL_VOLUME_MAX;
@@ -594,7 +612,7 @@ static void soundInit(const char *filename, OSL_SOUND *s, MP3_INFO *info)		{
 	s->divider = OSL_FMT_44K;
 	//MP3 files are always streamed for now
 	s->isStreamed = 1;
-	s->numSamples = info->sample_per_frame;
+	s->numSamples = sample_per_frame;
 
 	//Streaming special information
 	if (s->isStreamed)			{
@@ -630,7 +648,7 @@ OSL_SOUND *oslLoadSoundFileMP3(const char *filename, int stream)		{
 
 			if (info)	{
 				if (osl_mp3Load(filename, info))			{
-					soundInit(filename, s, info);
+					soundInit(filename, s, info, info->sample_per_frame);
 					s->audioCallback = oslAudioCallback_AudioCallback_MP3;
 					success = 1;
 				}
@@ -674,8 +692,9 @@ OSL_SOUND *oslLoadSoundFileAT3(const char *filename, int stream)		{
 
 			if (info)	{
 				if (osl_at3Load(filename, info))			{
-					soundInit(filename, s, (MP3_INFO*)info);
+					soundInit(filename, s, info, info->sample_per_frame);
 					s->audioCallback = oslAudioCallback_AudioCallback_AT3;
+					s->deleteSound = oslAudioCallback_DeleteSound_AT3;
 					success = 1;
 				}
 				else	{

@@ -8,7 +8,6 @@
 #include <Scripts/TextureHelper.h>
 #include <math.h>
 #include <psptypes.h>
-#include <string>
 
 namespace Aurora
 {
@@ -17,11 +16,36 @@ namespace Aurora
 		class Particle
 		{
 		public:
+			enum Kind
+			{
+				None = 0,
+				Smoke,
+				BlackSmoke,
+				Note,
+				Explosion,
+				Flame,
+				Bubble,
+				BlockCrack,
+				ItemCrack,
+				Heart
+			};
 
-			Particle(CraftWorld* world, std::string _name, Vector3 _position);
-			virtual ~Particle();
+			Particle();
+			~Particle();
 
-			void Update(CraftWorld* crtf, float dt);
+			// Never returns NULL: if the pool is full the particle closest to expiring is
+			// evicted to make room. The old NULL return was dereferenced unchecked by every
+			// caller (48 of them) and crashed as a write at address 0x10.
+			static Particle* Spawn(CraftWorld* world, const char* name, Vector3 position);
+			static void QueueBlockCrack(CraftWorld* world, Vector3 position, int blockId);
+			static void Release(Particle* p);
+			static int ActiveCount();
+			static void PrecacheTextures(CraftWorld* world);
+			static void UpdateAll(CraftWorld* world, float dt, Vector3 camRight, Vector3 camUp);
+			static void RenderAll(Frustum &camFrustum);
+
+			void Init(CraftWorld* world, int kind, Vector3 position);
+			void Update(CraftWorld* crtf, float dt, Vector3 camRight, Vector3 camUp);
 			void Render(Frustum &camFrustum);
 
 			bool CheckCollision(CraftWorld* crtf);
@@ -32,8 +56,8 @@ namespace Aurora
 			void SetScale(float minScale, float maxScale);
 
             void SetMaxLiveTime(int _maxLiveTime);
-            void SetLiveTime(int _liveTime); // in milisecs
-            void SetLiveTime(int minLiveTime, int maxLiveTime); // in milisecs
+            void SetLiveTime(int _liveTime);
+            void SetLiveTime(int minLiveTime, int maxLiveTime);
             void SetGravity(float _gravity);
             void SetColor(Vector3 _color);
             void SetBrightness(float brightness);
@@ -49,7 +73,6 @@ namespace Aurora
 			bool toDestroy;
             float friction;
 
-            // additional vars
             int var1;
             int var2;
             int var3;
@@ -59,7 +82,8 @@ namespace Aurora
 
 		private:
 
-		    TexturesPSPVertex *particleVertices;
+		    CraftPSPVertex *particleVertices;
+			int particleSlot;
 
 			float horizontalScale;
 			float verticalScale;
@@ -76,11 +100,15 @@ namespace Aurora
 			float myLight;
 			bool rederMe;
 
-			std::string name;
+			int kind;
+			bool inUse;
 			BoundingBox bBox;
+
+			Vector3 billboardRight;
+			Vector3 billboardUp;
+			bool vertsBuilt;
 		};
 	}
 }
 
 #endif
-

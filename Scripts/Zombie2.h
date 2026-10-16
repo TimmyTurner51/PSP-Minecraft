@@ -43,8 +43,6 @@ private:
 
     float animLegAngle;
     float animLegAngleT;
-
-    float sunTimer;
 };
 
 #endif

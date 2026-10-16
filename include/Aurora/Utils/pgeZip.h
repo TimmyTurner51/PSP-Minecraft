@@ -82,6 +82,47 @@ int pgeZipClose(pgeZip *zip);
 pgeZipFile* pgeZipFileRead(pgeZip *zip, const char *filename, const char *password);
 
 /**
+ * Begin reading one entry as a stream, holding only the decoder's own window in memory.
+ *
+ * WHY THIS EXISTS ALONGSIDE pgeZipFileRead
+ * ----------------------------------------
+ * pgeZipFileRead allocates the entry's ENTIRE uncompressed size in one malloc, so a caller's memory
+ * requirement is set by the largest single file in the archive. On a PSP that is a real ceiling: the
+ * launchable heap is around 15 MB, and a 12.7 MB asset cannot be extracted through that API at all,
+ * however much room the rest of the archive would leave. It fails as an allocation failure, which
+ * surfaces later as "the file is missing" rather than as anything mentioning memory.
+ *
+ * These three calls are the same decoder, driven a chunk at a time, so extracting a 12.7 MB file costs
+ * a 32 KB buffer instead of 12.7 MB. The entry is located by name exactly as pgeZipFileRead does.
+ *
+ * Usage: open, then read until it returns 0, then close. An entry may be reopened, and opening another
+ * implicitly abandons the previous one.
+ *
+ * @param zip       - A valid (previously opened) ::pgeZip
+ * @param filename  - The entry to read, by that exact name
+ * @param password  - The file's password, or NULL
+ * @param outSize   - Receives the entry's uncompressed size, if not NULL
+ *
+ * @returns PGE_ZIP_OK (0) on success, negative on error
+ */
+int pgeZipStreamOpen(pgeZip *zip, const char *filename, const char *password, unsigned int *outSize);
+
+/**
+ * Read the next chunk of the entry opened by pgeZipStreamOpen.
+ *
+ * @param buf - Where to put the bytes
+ * @param len - How many bytes to ask for; fewer may be returned
+ *
+ * @returns the number of bytes read, 0 at end of entry, negative on error
+ */
+int pgeZipStreamRead(pgeZip *zip, void *buf, unsigned int len);
+
+/**
+ * Finish the entry opened by pgeZipStreamOpen, releasing the decoder state for it.
+ */
+int pgeZipStreamClose(pgeZip *zip);
+
+/**
  * Extract all files from a zip
  *
  * @param zip - A valid (previously opened) ::pgeZip file
@@ -91,6 +132,25 @@ pgeZipFile* pgeZipFileRead(pgeZip *zip, const char *filename, const char *passwo
  * @returns 1 on success, 0 on error.
  */
 int pgeZipExtract(pgeZip *zip, const char *password);
+
+/**
+ * Extract all files from a zip, and report how many were written.
+ *
+ * Unlike pgeZipExtract, which returns a constant 1 and therefore cannot fail, this returns 1 only if
+ * every entry was written, and fills in the counts. Prefer it anywhere the result matters: an install
+ * that wrote 112 of 115 files must not be reported to the player as a success.
+ *
+ * @param zip - A valid (previously opened) ::pgeZip file
+ *
+ * @param password - The password of the file (pass NULL if no password)
+ *
+ * @param okCount - Optional; receives the number of entries written
+ *
+ * @param failCount - Optional; receives the number of entries that failed
+ *
+ * @returns 1 if every entry was written, 0 otherwise.
+ */
+int pgeZipExtractCounted(pgeZip *zip, const char *password, int *okCount, int *failCount);
 
 /**
  * Free the file data previously loaded from a zip

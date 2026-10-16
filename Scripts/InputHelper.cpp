@@ -1,5 +1,8 @@
 #include "InputHelper.h"
 
+#include <stdio.h>
+#include <Aurora/System/SystemManager.h>
+
 InputHelper::InputHelper()
 {
 
@@ -34,6 +37,8 @@ void InputHelper::Init()
 	actionNames[13] = std::string("Remove block");
 	actionNames[14] = std::string("Place block");
 	actionNames[15] = std::string("Menu");
+	actionNames[16] = std::string("Chat");
+	actionNames[17] = std::string("Sneak");
 
 	//button names
 	buttonNames[0] = std::string("Up");
@@ -73,6 +78,8 @@ void InputHelper::Init()
 	connections[13] = InputConection(13,13,8);
 	connections[14] = InputConection(14,14,9);
 	connections[15] = InputConection(15,15,15);
+	connections[16] = InputConection(16,16,0);
+	connections[17] = InputConection(17,17,1);
 
 	//default analog sensitivity
 	analogXright = analogYup = 0.4f;
@@ -81,7 +88,7 @@ void InputHelper::Init()
 
 std::string InputHelper::getActionName(int number)
 {
-	if(number < 0 || number > 15)
+	if(number < 0 || number >= ACTION_COUNT)
 		return "";
 
 	return actionNames[number];
@@ -89,7 +96,7 @@ std::string InputHelper::getActionName(int number)
 
 std::string InputHelper::getButtonName(int number)
 {
-	if(number < 0 || number > 15)
+	if(number < 0 || number >= BUTTON_COUNT)
 		return "";
 
 	return buttonNames[number];
@@ -97,12 +104,15 @@ std::string InputHelper::getButtonName(int number)
 
 InputConection InputHelper::getConnection(int number)
 {
+	if(number < 0 || number >= ACTION_COUNT)
+		return InputConection();
+
 	return connections[number];
 }
 
 void InputHelper::setButtonToAction(int action,int button)
 {
-	if(action < 0 || action > 15)
+	if(action < 0 || action >= ACTION_COUNT)
 		return;
 
 	connections[action].button = button;
@@ -110,7 +120,7 @@ void InputHelper::setButtonToAction(int action,int button)
 
 int InputHelper::getButtonToAction(int action)
 {
-	if(action < 0 || action > 15)
+	if(action < 0 || action >= ACTION_COUNT)
 		return -1;
 
 	return connections[action].button;
@@ -124,7 +134,7 @@ void InputHelper::Save()
 	if(pFile == NULL)
 		return;
 
-	for(int i = 0;i < 16;i++)
+	for(int i = 0;i < ACTION_COUNT;i++)
 	{
 		fwrite(&connections[i].key,sizeof(int),1,pFile);
 		fwrite(&connections[i].action,sizeof(int),1,pFile);
@@ -136,6 +146,21 @@ void InputHelper::Save()
 	fwrite(&analogYdown,sizeof(float),1,pFile);
 	fwrite(&analogXleft,sizeof(float),1,pFile);
 	fwrite(&analogXright,sizeof(float),1,pFile);
+
+	// Analog stick calibration. A fixed-size trailing block, and it must stay fixed-size or the length
+	// test Load makes would be lying. The values themselves live in SystemManager, because that is what
+	// applies them; this file owns the input configuration and so owns the file they are stored in.
+	bool calibrated = Aurora::System::SystemManager::Instance()->IsAnalogCalibrated();
+	float baseX = 0.0f, baseY = 0.0f, rangeX = 1.0f, rangeY = 1.0f;
+	if(calibrated)
+	{
+		Aurora::System::SystemManager::Instance()->GetAnalogCalibration(baseX, baseY, rangeX, rangeY);
+	}
+	fwrite(&calibrated,sizeof(bool),1,pFile);
+	fwrite(&baseX,sizeof(float),1,pFile);
+	fwrite(&baseY,sizeof(float),1,pFile);
+	fwrite(&rangeX,sizeof(float),1,pFile);
+	fwrite(&rangeY,sizeof(float),1,pFile);
 
 	//close file
 	fclose(pFile);
@@ -149,7 +174,30 @@ void InputHelper::Load()
 	if(pFile == NULL)
 		return;
 
-	for(int i = 0;i < 16;i++)
+	fseek(pFile, 0, SEEK_END);
+	long size = ftell(pFile);
+	fseek(pFile, 0, SEEK_SET);
+
+	const long analogBytes = (long)(4 * sizeof(float));
+	const long newSize = (long)(ACTION_COUNT * 3 * sizeof(int)) + analogBytes;
+	const long size17 = (long)(17 * 3 * sizeof(int)) + analogBytes;
+	const long size16 = (long)(16 * 3 * sizeof(int)) + analogBytes;
+
+	int count = ACTION_COUNT;
+	if(size < newSize)
+	{
+		if(size >= size17)
+			count = 17;
+		else if(size >= size16)
+			count = 16;
+		else
+		{
+			fclose(pFile);
+			return;
+		}
+	}
+
+	for(int i = 0;i < count;i++)
 	{
 		InputConection connection;
 
@@ -166,6 +214,25 @@ void InputHelper::Load()
 	fread(&analogXleft,sizeof(float),1,pFile);
 	fread(&analogXright,sizeof(float),1,pFile);
 
+	// Analog stick calibration, which only a file written since it was added carries. The length is the
+	// version number -- there is no byte in the format that could hold one without breaking every
+	// Config/input.cf already on a card, and the length test above is already how the 16- and
+	// 17-action formats are told apart, so this is the same trick applied once more.
+	const long calBytes = (long)(sizeof(bool) + 4 * sizeof(float));
+	if(size >= newSize + calBytes)
+	{
+		bool calibrated = false;
+		float baseX = 0.0f, baseY = 0.0f, rangeX = 1.0f, rangeY = 1.0f;
+		fread(&calibrated,sizeof(bool),1,pFile);
+		fread(&baseX,sizeof(float),1,pFile);
+		fread(&baseY,sizeof(float),1,pFile);
+		fread(&rangeX,sizeof(float),1,pFile);
+		fread(&rangeY,sizeof(float),1,pFile);
+		if(calibrated)
+		{
+			Aurora::System::SystemManager::Instance()->SetAnalogCalibration(baseX, baseY, rangeX, rangeY);
+		}
+	}
 
 	//close file
 	fclose(pFile);

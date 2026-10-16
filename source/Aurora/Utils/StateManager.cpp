@@ -8,6 +8,7 @@
 //gamestate/engine includes
 #include <Aurora/Utils/StateManager.h>
 #include <Aurora/Utils/GameState.h>
+#include <Aurora/Graphics/RenderManager.h>
 
 namespace Aurora
 {
@@ -31,6 +32,9 @@ namespace Aurora
 
 		void StateManager::ChangeState(CGameState* state)
 		{
+			// The outgoing state's last frame may still be drawing; its textures and buffers are
+			// about to be freed, and the incoming state's Enter/Init loads over them.
+			Graphics::RenderManager::InstancePtr()->FinishPendingFrame();
 			// cleanup the current state
 			if ( !states.empty() ) {
 				states.back()->CleanUp();
@@ -44,6 +48,7 @@ namespace Aurora
 
 		void StateManager::PushState(CGameState* state)
 		{
+			Graphics::RenderManager::InstancePtr()->FinishPendingFrame();
 			// pause current state
 			if ( !states.empty() ) {
 				states.back()->Pause();
@@ -56,6 +61,7 @@ namespace Aurora
 
 		void StateManager::PopState()
 		{
+			Graphics::RenderManager::InstancePtr()->FinishPendingFrame();
 			// cleanup the current state
 			if ( !states.empty() ) {
 				states.back()->CleanUp();

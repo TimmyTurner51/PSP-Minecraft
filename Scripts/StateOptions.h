@@ -70,6 +70,16 @@ private:
 	//analog stick
 	int currentAnalogPos;
 
+	//analog stick calibration. calBase is the resting reading the sweep is measured from, and the
+	//min/max pair is its envelope. All of it is the raw stick (before calibration is applied), because
+	//the screen has to measure the stick rather than its own correction.
+	int calState;
+	int calSamples;
+	bool calFailed;
+	float calSumX, calSumY;
+	float calMinX, calMinY, calMaxX, calMaxY;
+	float calBaseX, calBaseY;
+
 };
 
 #endif

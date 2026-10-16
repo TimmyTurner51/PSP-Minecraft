@@ -50,6 +50,10 @@ class WorldGenerator
 {
 	public:
 		void initRandompMap(int worldSize, int worldHeight, int chunkSize, CraftWorld *world, bool makeTrees,bool makeWater,bool makeCaves, unsigned int seedII, int worldType);
+		void GenerateColumn(CraftWorld *world, int cx, int cz);
+		// One slice of GenerateColumn. `step` is how far this column has already been built; a budget of
+		// 0 runs until the column is finished. Returns true when nothing is left.
+		bool GenerateColumnSlice(CraftWorld *world, int cx, int cz, int &step, unsigned int startUs, unsigned int budgetUs);
 		void initTrees(int WORLD_SIZE,  CraftWorld *world, PerlinModule* perlin, int seed);
 		void initRandomTrees(int WORLD_SIZE,  CraftWorld *world);
 
@@ -88,6 +92,36 @@ class WorldGenerator
         float InterpolateMoistureNoise(int wx, int wz);
         float InterpolateElevationNoise(int wx, int wz);
         float InterpolateRoughnessNoise(int wx, int wz);
+        // Filled for the column being generated. Elevation and roughness sample a coarse grid and
+        // interpolate; doing that per block repeated the same noise calls across the whole 16x16.
+        void PrepareColumnNoise(int x0, int z0, int chunkSize);
+        float SampleElevation(int ix, int iz);
+        float SampleRoughness(int ix, int iz);
+        int DefaultTerrainHeight(int x, int z, int worldHeight);
+        void PlaceDefaultTerrainColumn(CraftWorld *world, int x, int z, int worldType, int waterLevel, int worldHeight);
+        void PlaceTerrainColumn(CraftWorld *world, int x, int z, int Height, int biome, int waterLevel, int worldHeight);
+
+        // Biomes are picked per block from temperature / moisture noise, so spawn and
+        // streamed columns agree and biome edges are jagged instead of circles.
+        enum Biome { BIOME_PLAINS = 0, BIOME_FOREST = 1, BIOME_DESERT = 2, BIOME_SNOW = 3 };
+        int BiomeAt(int x, int z, int worldType);
+        // useCache: colHeights/colBiomes were just filled by GenerateColumn for this column
+        void DecorateColumn(CraftWorld *world, int cx, int cz, bool useCache = false);
+        void DecorateSpawnRegion(CraftWorld *world);
+        // The nether: one solid netherrack mass with caverns carved out of it, a lava sea at
+        // NETHER_LAVA_LEVEL, and bedrock floor and ceiling. Used both for a streamed column and for
+        // the spawn region, so the two cannot disagree.
+        void GenerateNetherColumn(CraftWorld *world, int cx, int cz);
+        // Nearest netherrack floor with headroom above it, above the lava sea. Returns false if
+        // there is none anywhere near the middle of the world.
+        bool FindNetherSpawn(CraftWorld *world, int &outX, int &outY, int &outZ);
+        int colHeights[16][16];
+        int colBiomes[16][16];
+        bool noiseGridOn;
+        int elevX0, elevZ0, elevNX, elevNZ;
+        float elevGrid[8][8];
+        int roughX0, roughZ0, roughNX, roughNZ;
+        float roughGrid[12][12];
 
         SimplexNoise func1,func2,func3;
 

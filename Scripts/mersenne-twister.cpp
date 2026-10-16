@@ -71,15 +71,19 @@ static inline void generate_numbers()
   register uint32_t y, i;
 
   // i = [0 ... 226]
+  //
+  // NOT unrolled, deliberately. The 2x unroll this used to carry processed 227 values two at a time, so
+  // its final iteration computed i=226 and then i=227. i=227 belongs to the loop below (which recomputes
+  // it correctly from MT[i-DIFF]), but the body here read MT[227+PERIOD] -- that is MT[624], one past the
+  // end of a 624-element array. The value was overwritten a moment later so the results stayed right, but
+  // the *read* is out of bounds: undefined behaviour, which is what -Waggressive-loop-optimizations was
+  // reporting, and which lets the optimizer assume the array is never overrun.
+  //
+  // The straight loop is the reference form, covers i=0..226, and its furthest reads are MT[227] and
+  // MT[623] -- both in bounds. Worth noting this file is currently dead code (nothing calls into `mt::`),
+  // so this corrupts nothing today; it is fixed because the next person to use it should not inherit a
+  // generator that reads outside its own state.
   for ( i=0; i<DIFF; ++i ) {
-    /*
-     * We're doing 226 = 113*2, an even number of steps, so we can
-     * safely unroll one more step here for speed:
-     */
-    y = M32(MT[i]) | L31(MT[i+1]);
-    MT[i] = MT[i+PERIOD] ^ (y>>1) ^ MATRIX[ODD(y)];
-
-    ++i;
     y = M32(MT[i]) | L31(MT[i+1]);
     MT[i] = MT[i+PERIOD] ^ (y>>1) ^ MATRIX[ODD(y)];
   }
@@ -105,7 +109,13 @@ static inline void generate_numbers()
   }
 
   // i = [623]
-  y = M32(MT[SIZE-1]) | L31(MT[SIZE]);
+  //
+  // MT[0], not MT[SIZE]. The standard twist step recombines the last word with the FIRST one
+  // (y = (MT[N-1] & UPPER) | (MT[0] & LOWER)); MT[SIZE] is index 624 of a 624-element array, one past the
+  // end. This one did corrupt state rather than merely reading OOB: whatever MT[624] happened to hold was
+  // folded into MT[623] by the line below, and nothing recomputes MT[623], so every number the generator
+  // went on to produce was derived partly from adjacent memory.
+  y = M32(MT[SIZE-1]) | L31(MT[0]);
   MT[SIZE-1] = MT[PERIOD-1] ^ (y>>1) ^ MATRIX[ODD(y)];
 }
 

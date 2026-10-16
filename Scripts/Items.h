@@ -246,6 +246,20 @@ public:
 	static item_t getID();
 };
 
+// The debug stick. It is deliberately the stick's sprite and shape -- there is no new artwork, only a
+// new name and a new id -- because its whole purpose is to be a testing handle, not an item a player
+// is meant to find. The id is appended at 421 rather than slotted next to Stick's 276 because
+// itemTypes is indexed by (id - 250), so any insertion but the end renumbers every later item and
+// changes ids that existing saves already store.
+class DebugStick : public BaseItem
+{
+public:
+
+	DebugStick();
+
+	static item_t getID();
+};
+
 class Coal : public BaseItem
 {
 public:
@@ -534,6 +548,32 @@ public:
 	static item_t getID();
 };
 
+/// Redstone torches ride the same terrain-atlas sprite path the plain torch does, so the item icon is
+/// just the lit tile at (3,6): plane 3, textureRow 15 - 6 (rows count up from the bottom of the atlas).
+class RedstoneTorchItem : public BaseItem
+{
+public:
+
+	RedstoneTorchItem();
+
+	static item_t getID();
+};
+
+/// The repeater's inventory icon is its own sprite, not a 3D render of the block it places. Java draws
+/// the item form as the flat top tile, so the icon is terrain (3,8) -- the dark repeater -- at plane 3,
+/// textureRow 15 - 8, rows counting up from the bottom of the atlas like every other terrain-backed
+/// item. This is also why the repeater needs an item at all: the inventory sends block ids through
+/// `drawHudCubes`, which renders the block's model under a tilted camera, and only an item id reaches
+/// `drawHudItems`, the flat-sprite path the redstone torch already uses.
+class RepeaterItem : public BaseItem
+{
+public:
+
+	RepeaterItem();
+
+	static item_t getID();
+};
+
 class SpruceSaplingItem : public BaseItem
 {
 public:
@@ -614,6 +654,148 @@ public:
 
 	static item_t getID();
 };
+
+class RawChicken : public BaseItem
+{
+public:
+
+	RawChicken();
+
+	static item_t getID();
+};
+
+class CookedChicken : public BaseItem
+{
+public:
+
+	CookedChicken();
+
+	static item_t getID();
+};
+
+class Feather : public BaseItem
+{
+public:
+
+	Feather();
+
+	static item_t getID();
+};
+
+class Egg : public BaseItem
+{
+public:
+
+	Egg();
+
+	static item_t getID();
+};
+
+// Spider drops (Java 1.7.3 EntitySpider.dropFewItems: 0-2 string, and 0-1 spider eye).
+class String : public BaseItem
+{
+public:
+
+	String();
+
+	static item_t getID();
+};
+
+class SpiderEye : public BaseItem
+{
+public:
+
+	SpiderEye();
+
+	static item_t getID();
+};
+
+
+// Arrow is a material like string or a feather -- it stacks -- and it is what a bow fires and what
+// a skeleton drops. Bow is a tool: it does not stack and it wears out, so it carries durability.
+class Arrow : public BaseItem
+{
+public:
+
+	Arrow();
+
+	static item_t getID();
+};
+
+
+class Bow : public BaseItem
+{
+public:
+
+	Bow();
+
+	static item_t getID();
+};
+
+// The bow's three draw frames. An item's atlas cell is baked into its mesh when the world builds its
+// meshes (CraftWorld::GetItemVerts), and there is no way to ask for a different cell at draw time, so
+// each frame the bow can be shown with has to exist as an item type of its own. They are appended
+// after the debug stick as ids 422..424 and nothing can obtain them: they are in no tab, no recipe and
+// no drop table, and only the drawing helpers below ever name them.
+//
+// Appended rather than slotted in beside the bow for the same reason as every other late arrival here:
+// itemTypes is indexed by (id - 250), so inserting anywhere but the end renumbers every later item.
+class BowPulling0 : public BaseItem
+{
+public:
+
+	BowPulling0();
+
+	static item_t getID();
+};
+
+class BowPulling1 : public BaseItem
+{
+public:
+
+	BowPulling1();
+
+	static item_t getID();
+};
+
+class BowPulling2 : public BaseItem
+{
+public:
+
+	BowPulling2();
+
+	static item_t getID();
+};
+
+// The mesh to draw a bow with at a given draw stage: 0 is at rest (bow_standby), 1, 2 and 3 are the
+// string pulled further and further back, which is vanilla's bow_pulling_0/1/2. Anything outside 0..3
+// is treated as 0, so a caller can hand this an unclamped value.
+int BowHeldMeshId(int stage);
+
+// A draw amount from 0 to 1 as one of those stages. Vanilla splits its 20-tick draw into three roughly
+// equal parts when it picks which icon to show, so thirds are the faithful split; a charge of exactly
+// 1 gives stage 3 rather than 4.
+	int BowDrawStage(float charge);
+
+// True for the bow itself and for any of its draw frames. While the string is pulled the bow is drawn
+// as a frame, so "is this a bow?" has to answer yes for them as well -- which is what the held-item
+// scale below is keyed on.
+bool IsBowItem(int itemId);
+
+// The scale a bow is drawn at when held. The generic held item is 0.42, which is sized for a 16x16
+// block face; a bow at that size reads as a toy next to the mob holding it. Every site that draws one
+// -- the skeleton, the player's first person and the player's third person -- reads this, so the three
+// cannot drift apart, and it is the one number to turn to make a held bow bigger or smaller.
+extern const float kHeldBowScale;
+
+// How far a held bow is tipped out of the vertical, in radians, counted towards whatever the holder
+// is facing: one number per hand, because the three hands are three different chains of rotations.
+// Each is derived, not tuned -- the artwork's own angle and one equation per chain, all in Items.cpp
+// and all reproducible with `python _tmp_atlas/solve_bow_parallel.py`, which measures the art off the
+// atlas and prints the angle each hand is off by. Applied by the hand that names it.
+extern const float kHeldBowAimTilt;             // third person (and the carried bow)
+extern const float kHeldBowFirstPersonTilt;     // the player's own hand, in view space
+extern const float kHeldBowSkeletonTilt;        // the skeleton's bow arm
 
 class LapisLazuli : public BaseItem
 {
@@ -1441,6 +1623,70 @@ class CookedPorkchop : public BaseItem
 public:
 
 	CookedPorkchop();
+	static item_t getID();
+};
+
+class CowSpawnEgg : public BaseItem
+{
+public:
+
+	CowSpawnEgg();
+	static item_t getID();
+};
+
+class SheepSpawnEgg : public BaseItem
+{
+public:
+
+	SheepSpawnEgg();
+	static item_t getID();
+};
+
+class ZombieSpawnEgg : public BaseItem
+{
+public:
+
+	ZombieSpawnEgg();
+	static item_t getID();
+};
+
+class CreeperSpawnEgg : public BaseItem
+{
+public:
+
+	CreeperSpawnEgg();
+	static item_t getID();
+};
+
+class PigSpawnEgg : public BaseItem
+{
+public:
+
+	PigSpawnEgg();
+	static item_t getID();
+};
+
+class ChickenSpawnEgg : public BaseItem
+{
+public:
+
+	ChickenSpawnEgg();
+	static item_t getID();
+};
+
+class SpiderSpawnEgg : public BaseItem
+{
+public:
+
+	SpiderSpawnEgg();
+	static item_t getID();
+};
+
+class SkeletonSpawnEgg : public BaseItem
+{
+public:
+
+	SkeletonSpawnEgg();
 	static item_t getID();
 };
 

@@ -11,7 +11,30 @@
 
 using namespace Aurora::Graphics;
 
-typedef unsigned char block_t;
+typedef unsigned short block_t;
+typedef unsigned char block_settings_t;
+
+// Items occupy 250 .. kExtendedBlockBase-1 (Items.cpp). That is about 1800 item
+// slots, enough for a Minecraft-sized item list. New block ids start at
+// kExtendedBlockBase and run to 65535 in the world. A block kept in an inventory
+// slot has to fit in a signed short, so the practical ceiling for a held block
+// is 32767. Register those with CraftWorld::AddBlockType, not push_back
+// (push_back would land on item ids 254+).
+enum
+{
+    kItemIdBase = 250,
+    kExtendedBlockBase = 2048
+};
+
+inline bool IsItemId(int id)
+{
+    return id >= kItemIdBase && id < kExtendedBlockBase;
+}
+
+inline bool IsBlockId(int id)
+{
+    return id < kItemIdBase || id >= kExtendedBlockBase;
+}
 
 class BaseBlock
 {
@@ -23,14 +46,24 @@ public:
     char botPlane_x, botPlane_y;
     char forPlane_x, forPlane_y;
 
+	// The one tile that is not one of the six cube faces. Only the piston has a use for it: the face
+	// at the bottom of the 4 px recess in an extended base, which vanilla paints with piston_inner.
+	// Every other block leaves it unset and nothing reads it -- the six above it are the ones the
+	// shared cube builders walk, and this one is named by the hand-emitted piston model alone.
+    char innerPlane_x, innerPlane_y;
+
+	// The three block meshes. Borrowed pointers, NOT owned: CraftWorld allocates them in
+	// buildblocksVerts() and releases them in FreeBlockTypeMeshes(), and ~BaseBlock deliberately frees
+	// nothing. That is what makes this class safe to copy -- and it must be safe, because it is held by
+	// value in a std::vector and copied on every reallocation. See FreeBlockTypeMeshes().
 	TexturesPSPVertex *verticesLeftRight;
-	char pointsLeftRight;
+	short pointsLeftRight;
 
     TexturesPSPVertex *verticesBackFront;
-	char pointsBackFront;
+	short pointsBackFront;
 
     TexturesPSPVertex *verticesBottomTop;
-	char pointsBottomTop;
+	short pointsBottomTop;
 
 	bool editable;
 	bool transparent; 
