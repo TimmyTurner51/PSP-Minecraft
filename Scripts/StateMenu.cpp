@@ -3803,9 +3803,9 @@ void StateMenu::Draw(StateManager* sManager)
             // every other selected button uses. It is the only cue that Up has lifted the cursor off
             // the buttons, so it has to read the same way as the rest of the menu does.
             if(aboutFocus >= 1)
-                DrawText(240,29,GU_COLOR(1,1,0.25,1) ,default_size,"UPDATE NEWS 3.0.0");
+                DrawText(240,29,GU_COLOR(1,1,0.25,1) ,default_size,"UPDATE NEWS " MC_VERSION_STRING);
             else
-                DrawText(240,29,GU_COLOR(1,1,1,1) ,default_size,"UPDATE NEWS 3.0.0");
+                DrawText(240,29,GU_COLOR(1,1,1,1) ,default_size,"UPDATE NEWS " MC_VERSION_STRING);
         }
     }
     break;
