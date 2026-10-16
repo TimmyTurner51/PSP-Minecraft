@@ -1,5 +1,7 @@
 #include "Items.h"
 
+#define PI 3.1415926535897f
+
 //items id begin from 250
 
 WoodenPickaxe::WoodenPickaxe():BaseItem()
@@ -350,6 +352,19 @@ Stick::Stick():BaseItem()
 }
 
 item_t Stick::getID(){ return 276;}
+
+DebugStick::DebugStick():BaseItem()
+{
+	// The stick's cell, in every texture pack. Its appearance is intentionally unchanged; only the
+	// name differs, which is what the hover label and the inventory read out.
+	textureRow = 12;
+
+	plane = 5;
+
+	name = "Debug Stick";
+}
+
+item_t DebugStick::getID(){ return 421;}
 
 Coal::Coal():BaseItem()
 {
@@ -712,6 +727,34 @@ TorchItem::TorchItem():BaseItem()
 
 item_t TorchItem::getID(){ return 308;}
 
+RedstoneTorchItem::RedstoneTorchItem():BaseItem()
+{
+	textureRow = 9;      // terrain row 6 = the lit redstone torch tile
+	plane = 3;
+
+	name = "Redstone Torch";
+	terrainTexture = true;
+}
+
+item_t RedstoneTorchItem::getID(){ return 408;}
+
+RepeaterItem::RepeaterItem():BaseItem()
+{
+	// Its own sprite off the item sheet, not the block's terrain tiles. `plane 9`, `textureRow 7` is
+	// items.png cell (9,8), which nothing else on the sheet uses. The art there is the authentic vanilla
+	// 16x16 sprite (`assets/minecraft/textures/items/repeater.png` out of the 1.7.3 client jar -- see the
+	// extracted reference set under `_mc173_extract/`), copied in at 1:1 so it matches the other icons'
+	// ~13x14 footprint instead of reading oversized. `terrainTexture = false` is what routes the inventory
+	// through the item sheet; the block's own terrain tiles are only used to draw it in the world.
+	textureRow = 7;
+	plane = 9;
+
+	name = "Redstone Repeater";
+	terrainTexture = false;
+}
+
+item_t RepeaterItem::getID(){ return 409;}
+
 SpruceSaplingItem::SpruceSaplingItem():BaseItem()
 {
 	textureRow = 15;
@@ -813,6 +856,221 @@ Steak::Steak():BaseItem()
 }
 
 item_t Steak::getID(){ return 317;}
+
+
+RawChicken::RawChicken():BaseItem()
+{
+	textureRow = 6;
+
+	plane = 10;
+	furnItem = 413; // CookedChicken
+
+	name = "Raw Chicken";
+}
+
+item_t RawChicken::getID(){ return 412;}
+
+CookedChicken::CookedChicken():BaseItem()
+{
+	textureRow = 6;
+
+	plane = 11;
+
+	name = "Cooked Chicken";
+}
+
+item_t CookedChicken::getID(){ return 413;}
+
+Feather::Feather():BaseItem()
+{
+	textureRow = 2;
+
+	plane = 7;
+
+	name = "Feather";
+}
+
+item_t Feather::getID(){ return 411;}
+
+Egg::Egg():BaseItem()
+{
+	textureRow = 2;
+
+	plane = 6;
+
+	name = "Egg";
+}
+
+item_t Egg::getID(){ return 414;}
+
+String::String():BaseItem()
+{
+	textureRow = 2;
+
+	plane = 5;
+
+	name = "String";
+}
+
+item_t String::getID(){ return 415;}
+
+SpiderEye::SpiderEye():BaseItem()
+{
+	textureRow = 2;
+
+	plane = 8;
+
+	name = "Spider Eye";
+}
+
+item_t SpiderEye::getID(){ return 416;}
+
+Arrow::Arrow():BaseItem()
+{
+	textureRow = 2;
+
+	plane = 3;
+
+	name = "Arrow";
+}
+
+item_t Arrow::getID(){ return 418;}
+
+Bow::Bow():BaseItem()
+{
+	textureRow = 2;
+
+	plane = 4;
+
+	// vanilla's bow is 384 uses and does not stack. The art is bow_standby, which is what vanilla
+	// shows in the inventory and in hand when the bow is not drawn.
+	durabilityPoints = 384;
+	stackable = false;
+
+	name = "Bow";
+}
+
+item_t Bow::getID(){ return 419;}
+
+// The draw frames. All three live in atlas column 5 and the row numbering here counts from the bottom
+// of the sheet (GetItemVerts: down = 1 - percent3 * (textureRow + 1)), so the sprite that is drawn
+// *least* -- bow_pulling_0, the first frame of the draw -- has the *highest* row number. They are
+// consecutive cells so the string reads as one continuous pull rather than three poses.
+BowPulling0::BowPulling0():BaseItem()
+{
+	textureRow = 9;
+	plane = 5;
+
+	// Carried over from the bow so the frames are exchangeable with it in the hand. Nothing can
+	// obtain one, so the only figure that matters is that they are not a tool and do not stack.
+	durabilityPoints = 384;
+	stackable = false;
+
+	name = "bow_pulling_0";
+}
+
+item_t BowPulling0::getID(){ return 422;}
+
+BowPulling1::BowPulling1():BaseItem()
+{
+	textureRow = 8;
+	plane = 5;
+
+	durabilityPoints = 384;
+	stackable = false;
+
+	name = "bow_pulling_1";
+}
+
+item_t BowPulling1::getID(){ return 423;}
+
+BowPulling2::BowPulling2():BaseItem()
+{
+	textureRow = 7;
+	plane = 5;
+
+	durabilityPoints = 384;
+	stackable = false;
+
+	name = "bow_pulling_2";
+}
+
+item_t BowPulling2::getID(){ return 424;}
+
+// 0.42 -- the scale every other held item uses -- is sized for a 16x16 block face held as a cube. A
+// bow's sprite fills its whole cell, so at 0.42 the drawn bow is about a third of a skeleton's height
+// and reads as a toy. This is vanilla-ish weapon proportions instead, and it is deliberately one
+// shared number: the skeleton, the first-person hand and the third-person player all draw from it.
+const float kHeldBowScale = 0.65f;
+
+// The nocked arrow inside every bow sprite, measured off bow_pulling_0/1/2 rather than estimated.
+//
+// In each of the three pulling frames the arrow is a straight run of ten opaque pixels at *exactly*
+// 45 degrees across the cell, its head at the upper-left end and its tail sitting in the string's
+// nock -- so in the quad's own frame the arrow points along 225 degrees, and an upright sprite has it
+// aimed a quarter turn above the horizon. `python _tmp_atlas/solve_bow_parallel.py` finds that run in
+// the atlas, prints the angle and fails loudly if it is not 45, so this is read off the art.
+const float kBowSpriteArrowAngle = PI / 4.0f;
+
+// The tilt each hand has to add to put that arrow on the arm. This used to be one number shared by
+// all three hands, which cannot be right: the hands do not apply the same rotations to the sprite, so
+// the same artwork needs a different correction in each. The shared number that shipped (-PI/4) was
+// solved below to be exactly right in the third person, and 22.5 degrees low on the skeleton and 18
+// degrees low in the first person -- which is the "the bow is tipped back, tip it up" report.
+//
+// Third person. The item's own RotZ is headPitch - armPitch (so the bow's lean is the camera's and
+// nothing else -- see kBowArmRaise) and the arm's RotZ multiplies *outside* it. Both are turns about
+// the same Z axis, so they add, and the arm's own rotation therefore cancels out of the comparison:
+//
+//      the arrow, in the world = 180 + kBowSpriteArrowAngle (its own direction) - PI/2 + tilt + armZ
+//      the arm,   in the world = 90 + armZ                  (the arm mesh is authored along +Y)
+//
+// Parallel is then 180 + art - PI/2 + tilt = 90, i.e. tilt = -art, with the quarter turns cancelling
+// out of both sides. That is the neat part of stating it this way: the third person's number is read
+// straight off the sprite, and it stays right if the artwork is ever redrawn.
+const float kHeldBowAimTilt = -kBowSpriteArrowAngle;                        // = -PI/4, -45 degrees
+
+// Skeleton. Its bow is drawn inside the arm's own RotZ (rHandAngle - animHandAngle + the draw terms),
+// so the arm's walk and draw swings rotate the bow with the arm and drop out of the difference exactly
+// as headPitch does above. The bow's own RotZ is 1.375*PI (the lean that leaves the artwork upright on
+// the arm -- see Skeleton2.cpp), and the arrow has to come out on the arm's axis, which for a skeleton
+// is rHandAngle = 1.5*PI turned by the artwork's angle. Solve 1.375PI + tilt = 1.5PI - art:
+const float kHeldBowSkeletonTilt = (1.5f * PI - 1.375f * PI) - kBowSpriteArrowAngle;  // = -PI/8, -22.5 deg
+
+// First person. No arm is drawn here -- the sprite is a flat quad held across the screen -- so
+// "parallel to the arm" is taken as the same thing it means in the other two hands, where the arm is
+// level at rest: the artwork's arrow ends up in the aim's own horizontal plane, so the bow points
+// where the shot goes instead of below it. StatePlay's chain is RotX(-0.33) RotY(-1.47 + PI) followed
+// by this RotZ, which is a three-dimensional chain and has no closed form as tidy as the two above, so
+// it is solved numerically by the script named above. The value it prints, for animDest 0:
+const float kHeldBowFirstPersonTilt = -0.46847f;                            // -26.85 degrees
+
+int BowHeldMeshId(int stage)
+{
+	switch(stage)
+	{
+		case 1: return BowPulling0::getID();
+		case 2: return BowPulling1::getID();
+		case 3: return BowPulling2::getID();
+		default: return Bow::getID();
+	}
+}
+
+int BowDrawStage(float charge)
+{
+	if(charge <= 0.0f)
+		return 0;
+	int stage = 1 + (int)(charge * 3.0f);
+	if(stage > 3)
+		stage = 3;
+	return stage;
+}
+
+bool IsBowItem(int itemId)
+{
+	return itemId == Bow::getID() || itemId == BowPulling0::getID() ||
+	       itemId == BowPulling1::getID() || itemId == BowPulling2::getID();
+}
 
 
 
@@ -1855,7 +2113,7 @@ item_t DPurpleGlassBlockPannelItem::getID(){ return 409;}*/
 RawPorkchop::RawPorkchop():BaseItem()
 {
     textureRow = 10;
-	furnItem = 411;
+	furnItem = 402; // CookedPorkchop
 	plane = 7;
 
     name = "Raw Porkchop";
@@ -1870,3 +2128,69 @@ CookedPorkchop::CookedPorkchop():BaseItem()
     name = "Cooked Porkchop";
 }
 item_t CookedPorkchop::getID(){ return 402;}
+
+CowSpawnEgg::CowSpawnEgg():BaseItem()
+{
+    textureRow = 6;
+    plane = 0;
+    name = "Spawn Cow";
+}
+item_t CowSpawnEgg::getID(){ return 403;}
+
+SheepSpawnEgg::SheepSpawnEgg():BaseItem()
+{
+    textureRow = 6;
+    plane = 1;
+    name = "Spawn Sheep";
+}
+item_t SheepSpawnEgg::getID(){ return 404;}
+
+ZombieSpawnEgg::ZombieSpawnEgg():BaseItem()
+{
+    textureRow = 6;
+    plane = 2;
+    name = "Spawn Zombie";
+}
+item_t ZombieSpawnEgg::getID(){ return 405;}
+
+CreeperSpawnEgg::CreeperSpawnEgg():BaseItem()
+{
+    textureRow = 6;
+    plane = 3;
+    name = "Spawn Creeper";
+}
+item_t CreeperSpawnEgg::getID(){ return 406;}
+PigSpawnEgg::PigSpawnEgg():BaseItem()
+{
+    textureRow = 6;
+    plane = 4;
+    name = "Spawn Pig";
+}
+item_t PigSpawnEgg::getID(){ return 407;}
+ChickenSpawnEgg::ChickenSpawnEgg():BaseItem()
+{
+    textureRow = 6;
+    plane = 9;   // row 6 is the spawn-egg row; planes 4..8 are taken, 9..12 were free
+    name = "Spawn Chicken";
+}
+item_t ChickenSpawnEgg::getID(){ return 410;}
+
+SpiderSpawnEgg::SpiderSpawnEgg():BaseItem()
+{
+    textureRow = 6;
+    plane = 12;   // row 6 is the spawn-egg row; 12 is the free cell after the chicken's 9
+    name = "Spawn Spider";
+}
+item_t SpiderSpawnEgg::getID(){ return 417;}
+
+SkeletonSpawnEgg::SkeletonSpawnEgg():BaseItem()
+{
+    textureRow = 6;
+    // Row 6 is the spawn-egg row and plane 5 was the one cell in it nothing else declared. It held ten
+    // stray pixels (teal 73,161,148) which _tmp_atlas/make_chicken_egg.py clears before drawing, and
+    // the art is generated the same way as the rest: the pack's own sheep tile recoloured with Java's
+    // EntityList pair for the skeleton, 0xC1C1C1 shell and 0x494949 spots (entity id 51).
+    plane = 5;
+    name = "Spawn Skeleton";
+}
+item_t SkeletonSpawnEgg::getID(){ return 420;}

@@ -1,4 +1,5 @@
 #include <Aurora/System/SystemManager.h>
+#include <math.h>
 
 namespace Aurora
 {
@@ -175,8 +176,13 @@ namespace Aurora
 			oskData.inputtype = PSP_UTILITY_OSK_INPUTTYPE_ALL; // Allow all input types
 			oskData.desc = descritpion;
 			//oskData.intext = intext[i];
-			oskData.outtextlength = maxtextinput;
-			oskData.outtextlimit = 32; // Limit input to 32 characters
+			int limit = maxtextinput;
+			if(limit < 1)
+				limit = 1;
+			if(limit > 128)
+				limit = 128;
+			oskData.outtextlength = limit;
+			oskData.outtextlimit = limit;
 			oskData.outtext = outtext;
 
 			//init osk dialog
@@ -304,47 +310,118 @@ namespace Aurora
 
 		float SystemManager::GetAnalogX()
 		{
-			return (((float)newPadData.Lx - 122.5f)/122.5f);
+			float x = GetAnalogRawX();
+			if(analogCalibrated == false)
+			{
+				return x;
+			}
+			x = (x - analogBaseX) / analogRangeX;
+			if(x > 1.0f)
+			{
+				x = 1.0f;
+			}
+			if(x < -1.0f)
+			{
+				x = -1.0f;
+			}
+			return x;
 		}
 
 		float SystemManager::GetAnalogY()
 		{
+			float y = GetAnalogRawY();
+			if(analogCalibrated == false)
+			{
+				return y;
+			}
+			y = (y - analogBaseY) / analogRangeY;
+			if(y > 1.0f)
+			{
+				y = 1.0f;
+			}
+			if(y < -1.0f)
+			{
+				y = -1.0f;
+			}
+			return y;
+		}
+
+		// The pad's nominal reading and half-range. The 122.5 is the constant this build has always used,
+		// and it is deliberately left alone: a healthy stick rests a little above 122.5, so this reads
+		// about +0.04 at rest, but the same number feeds every threshold in the game. Calibration is the
+		// place to correct that, because it corrects it per-console and it can be undone from Settings
+		// -- whereas changing the constant here would silently re-tune every menu in the game at once.
+		float SystemManager::GetAnalogRawX()
+		{
+			return (((float)newPadData.Lx - 122.5f)/122.5f);
+		}
+
+		float SystemManager::GetAnalogRawY()
+		{
 			return (((float)newPadData.Ly - 122.5f)/122.5f);
+		}
+
+		void SystemManager::SetAnalogCalibration(float baseX, float baseY, float rangeX, float rangeY)
+		{
+			// A range of zero would divide the axis to infinity, and a small one would amplify the noise
+			// instead of the travel. Both are what an aborted calibration collects, so they are rejected
+			// here rather than trusted from the caller.
+			if(rangeX < 0.25f || rangeY < 0.25f)
+			{
+				return;
+			}
+			analogBaseX = baseX;
+			analogBaseY = baseY;
+			analogRangeX = rangeX;
+			analogRangeY = rangeY;
+			analogCalibrated = true;
+		}
+
+		void SystemManager::ClearAnalogCalibration()
+		{
+			analogCalibrated = false;
+			analogBaseX = 0.0f;
+			analogBaseY = 0.0f;
+			analogRangeX = 1.0f;
+			analogRangeY = 1.0f;
+		}
+
+		bool SystemManager::IsAnalogCalibrated() const
+		{
+			return analogCalibrated;
+		}
+
+		void SystemManager::GetAnalogCalibration(float& baseX, float& baseY, float& rangeX, float& rangeY) const
+		{
+			baseX = analogBaseX;
+			baseY = analogBaseY;
+			rangeX = analogRangeX;
+			rangeY = analogRangeY;
+		}
+
+		void SystemManager::GetAnalogDeadzone(float dead, float& x, float& y)
+		{
+			x = GetAnalogX();
+			y = GetAnalogY();
+			float mag = sqrtf(x * x + y * y);
+			if(mag <= dead)
+			{
+				x = 0.0f;
+				y = 0.0f;
+				return;
+			}
+			float t = (mag - dead) / (1.0f - dead);
+			if(t > 1.0f)
+			{
+				t = 1.0f;
+			}
+			x = x / mag * t;
+			y = y / mag * t;
 		}
 
 		u32 SystemManager::ramAvailableLineareMax (void)
 		{
-			u32 size, sizeblock;
-			u8 *ram;
-
-
-			// Init variables
-			size = 0;
-			sizeblock = RAM_BLOCK;
-
-			// Check loop
-			while (sizeblock)
-			{
-				// Increment size
-				size += sizeblock;
-
-				// Allocate ram
-				ram = (u8*)malloc(size);
-
-				// Check allocate
-				if (!(ram))
-				{
-					// Restore old size
-					size -= sizeblock;
-
-					// Size block / 2
-					sizeblock >>= 1;
-				}
-				else
-					free(ram);
-			}
-
-			return size;
+			return sceKernelMaxFreeMemSize();
 		}
 
 		void SystemManager::Init()
@@ -354,51 +431,7 @@ namespace Aurora
 
 		u32 SystemManager::ramAvailable (void)
 		{
-			u8 **ram, **temp;
-			u32 size, count, x;
-
-
-			// Init variables
-			ram = NULL;
-			size = 0;
-			count = 0;
-
-			// Check loop
-			for (;;)
-			{
-				// Check size entries
-				if (!(count % 10))
-				{
-					// Allocate more entries if needed
-					temp = (u8**)realloc(ram,sizeof(u8*) * (count + 10));
-					if (!(temp)) break;
-
-					// Update entries and size (size contains also size of entries)
-					ram = temp;
-					size += (sizeof(u8 *) * 10);
-				}
-
-				// Find max lineare size available
-				x = ramAvailableLineareMax();
-				if (!(x)) break;
-
-				// Allocate ram
-				ram[count] = (u8*)malloc(x);
-				if (!(ram[count])) break;
-
-				// Update variables
-				size += x;
-				count++;
-			}
-
-			// Free ram
-			if (ram)
-			{
-				for (x=0;x<count;x++) free(ram[x]);
-				free(ram);
-			}
-
-			return size;
+			return sceKernelTotalFreeMemSize();
 		}
 	}
 }

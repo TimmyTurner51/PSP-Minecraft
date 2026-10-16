@@ -22,6 +22,11 @@ public:
     void SetPosition(Vector3 position2);
     void ActivateOtherTNTs();
     void HurtNearbyMobs(float dt);
+    // Fraction (0..1) of rays from the explosion point that reach the target box unblocked
+    float ExposureTo(Vector3 from, Vector3 center, float half);
+    // Axis separated collision helpers used by the per-step movement integration
+    bool BoxHitsSolid(const Vector3& p);
+    void MoveAxis(int axis, float delta);
 
     float timeToExplode;
     float explodeRadius;

@@ -5,6 +5,10 @@
 #include <pspgum.h>
 #include <pspdisplay.h>
 
+// This thread draws, so it is the heaviest user of the matrix maths in the game; it runs on its own
+// COP1 context. See Scripts/FpuControl.h.
+#include "FpuControl.h"
+
 #include <Aurora/Graphics/RenderManager.h>
 #include <Aurora/Graphics/Sprite.h>
 
@@ -46,6 +50,8 @@ void LoadingScreen::KillLoadingScreen()
 
 int LoadingScreen::RunLoadingScreen(SceSize args, void *argp)
 {
+	MC_DisableFpuExceptions();
+
 	// load up the images
 	backSprite = new Sprite(TextureHelper::Instance()->GetTexture(TextureHelper::Dirt),0,0,32,32);
 	backSprite->Scale(2,2);
@@ -174,9 +180,11 @@ int LoadingScreen::RunLoadingScreen(SceSize args, void *argp)
             }
         }
             RenderManager::InstancePtr()->SetFontStyle(default_size,GU_COLOR(0.45f,0.45f,0.45f,1.0f),0,0x00000200|0x00000000);
-            switch(tip)
-            
-        RenderManager::InstancePtr()->SetFontStyle(default_size,0xFFFFFFFF,0,0x00000200|0x00000000);
+            // The `switch(tip)` that used to sit on this line had no body, so it swallowed the SetFontStyle
+            // below: a switch with no case labels jumps straight past its body, which is why the compiler
+            // reported that statement as never executed. Removed so the white font is restored as intended.
+            // The tip text itself is drawn by the switch above, so nothing was lost visually beyond this.
+            RenderManager::InstancePtr()->SetFontStyle(default_size,0xFFFFFFFF,0,0x00000200|0x00000000);
 		RenderManager::InstancePtr()->EndFrame();
 	}
 	return 0;

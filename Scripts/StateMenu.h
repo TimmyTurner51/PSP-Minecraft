@@ -86,7 +86,17 @@ private:
 
 	void ScanSaveFiles(const char* dirName);
 	void ScanTexturePacks(const char* dirName);
+	void ScanSkins();
+	void BuildSkinIcons();
+	void OpenSkinImport();
+	void ScanSkinImport();
+	void ImportHighlightedSkin();
+	void DrawSkinStage();
+	void DrawSkinImport();
 	void DrawText(int x,int y, unsigned int color, float size, const char *message, ...);
+	// A centred prompt line. {X} {O} {S} {T} draw the launcher's button icons (title/buttons.png),
+	// {<} {>} the d-pad with that arm lit (title/dpad.png). A pack without the art gets the words.
+	void DrawPrompt(int cx, int y, unsigned int color, float size, const char* spec);
 	inline bool fileExists(const std::string& name);
 	int fileSize(const std::string& name);
 
@@ -168,6 +178,10 @@ private:
 	Sprite *rectEmptySprite;
 
 	Sprite *blackBackground;
+	// The d-pad hints in the News & Converter changelog box: the up cell and the down cell of the
+	// two-cell dpad.png atlas, in the box's top-right and bottom-right corners.
+	Sprite *dpadUpSprite;
+	Sprite *dpadDownSprite;
 	//Sprite *screen1Sprite;
 	//Sprite *screen2Sprite;
 	//Sprite *screen3Sprite;
@@ -201,6 +215,10 @@ private:
 	int loadSelectPos;
 	int loadSavePos;
 	int aboutPos;
+	// News & Converter focus ladder: 0 = the two buttons, 1 = the changelog box selected,
+	// 2 = scrolling inside the box. newsScroll is the first line shown.
+	int aboutFocus;
+	int newsScroll;
 	char worldName[32];
 
     float size_f;
@@ -225,6 +243,20 @@ private:
 
 	std::vector<SaveFile> saveFilesList;
 	std::vector<TP> texturePackList;
+	std::vector<std::string> skinList;
+	int skinPos;
+	int skinStart;
+	int skinReturnState;
+	float skinSpin;
+	// 0 = the skin grid, 1 = the preview (turns with the stick, Cross equips), 2 = the side tabs.
+	int skinFocus;
+	int skinTab;
+	std::string skinMessage;
+	std::string skinBrowsePath;
+	std::vector<std::string> skinBrowseNames;
+	std::vector<char> skinBrowseDir;
+	int skinBrowsePos;
+	int skinBrowseStart;
 	std::string newWorldName;
 	std::string newWorldSeed;
 	std::string newWorldNamestr;

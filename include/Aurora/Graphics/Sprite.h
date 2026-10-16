@@ -46,6 +46,13 @@ namespace Aurora
 			float scaleX,scaleY;
 			float posX,posY;
 			int width,height;
+
+			// 1.0 unless Alpha() says otherwise. Only the Draw paths consult it, and they do so by
+			// tinting the texel rather than by the vertex colour, because SetTexture leaves the
+			// texture function on REPLACE and that throws the vertex colour away; see Sprite.cpp.
+			float alpha = 1.0f;
+
+			void ApplyAlpha(bool tint);
 		};
 
 	}

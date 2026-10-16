@@ -1,0 +1,160 @@
+{
+  "obfuscatedClass": "bji",
+  "jar": "C:\\Users\\minec\\AppData\\Roaming\\.minecraft\\versions\\1.7.3\\1.7.3.jar",
+  "note": "extracted from 1.7.3 bytecode; bone names are not recoverable, so boxes are reported in declaration order",
+  "boxes": [
+    {
+      "uv": [
+        0,
+        16
+      ],
+      "origin": [
+        -10.0,
+        3.9,
+        -0.5
+      ],
+      "size": [
+        20,
+        3,
+        3
+      ],
+      "expand": 0.0
+    },
+    {
+      "uv": [
+        0,
+        16
+      ],
+      "origin": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "size": [
+        3,
+        10,
+        3
+      ],
+      "expand": 0.0
+    },
+    {
+      "uv": [
+        0,
+        16
+      ],
+      "origin": [
+        -4.0,
+        1.5,
+        0.5
+      ],
+      "size": [
+        11,
+        2,
+        2
+      ],
+      "expand": 0.0
+    },
+    {
+      "uv": [
+        0,
+        16
+      ],
+      "origin": [
+        -4.0,
+        4.0,
+        0.5
+      ],
+      "size": [
+        11,
+        2,
+        2
+      ],
+      "expand": 0.0
+    },
+    {
+      "uv": [
+        0,
+        16
+      ],
+      "origin": [
+        -4.0,
+        6.5,
+        0.5
+      ],
+      "size": [
+        11,
+        2,
+        2
+      ],
+      "expand": 0.0
+    },
+    {
+      "uv": [
+        12,
+        22
+      ],
+      "origin": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "size": [
+        3,
+        6,
+        3
+      ],
+      "expand": 0.0
+    },
+    {
+      "uv": [
+        0,
+        0
+      ],
+      "origin": [
+        -4.0,
+        -4.0,
+        -4.0
+      ],
+      "size": [
+        8,
+        8,
+        8
+      ],
+      "expand": 0.0
+    },
+    {
+      "uv": [
+        32,
+        0
+      ],
+      "origin": [
+        -4.0,
+        -4.0,
+        -4.0
+      ],
+      "size": [
+        6,
+        6,
+        6
+      ],
+      "expand": 0.0
+    },
+    {
+      "uv": [
+        32,
+        0
+      ],
+      "origin": [
+        -4.0,
+        -4.0,
+        -4.0
+      ],
+      "size": [
+        6,
+        6,
+        6
+      ],
+      "expand": 0.0
+    }
+  ]
+}

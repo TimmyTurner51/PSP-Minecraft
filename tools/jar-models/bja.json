@@ -1,0 +1,92 @@
+{
+  "obfuscatedClass": "bja",
+  "jar": "C:\\Users\\minec\\AppData\\Roaming\\.minecraft\\versions\\1.7.3\\1.7.3.jar",
+  "note": "extracted from 1.7.3 bytecode; bone names are not recoverable, so boxes are reported in declaration order",
+  "boxes": [
+    {
+      "uv": [
+        0,
+        0
+      ],
+      "origin": [
+        -4.0,
+        -8.0,
+        -4.0
+      ],
+      "size": [
+        8,
+        8,
+        8
+      ],
+      "expand": null
+    },
+    {
+      "uv": [
+        32,
+        0
+      ],
+      "origin": [
+        -1.0,
+        0.0,
+        -1.0
+      ],
+      "size": [
+        12,
+        2,
+        2
+      ],
+      "expand": null
+    },
+    {
+      "uv": [
+        32,
+        0
+      ],
+      "origin": [
+        -1.0,
+        0.0,
+        -1.0
+      ],
+      "size": [
+        12,
+        2,
+        2
+      ],
+      "expand": null
+    },
+    {
+      "uv": [
+        0,
+        16
+      ],
+      "origin": [
+        -5.0,
+        -10.0,
+        -5.0
+      ],
+      "size": [
+        10,
+        10,
+        10
+      ],
+      "expand": null
+    },
+    {
+      "uv": [
+        0,
+        36
+      ],
+      "origin": [
+        -6.0,
+        -12.0,
+        -6.0
+      ],
+      "size": [
+        12,
+        12,
+        12
+      ],
+      "expand": null
+    }
+  ]
+}

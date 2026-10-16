@@ -12,6 +12,9 @@ public:
 	bool chestSlotSt[27];
 
 	int chestAddress;
+	int chestX;
+	int chestY;
+	int chestZ;
 
 	short id;
 };

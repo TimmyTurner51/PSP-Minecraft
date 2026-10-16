@@ -61,7 +61,7 @@ void ItemFrameEntity::Render(CraftWorld *mWorld, Frustum &camFrustum, float dt)
 
         float x_offset = 0.0f;
         float z_offset = 0.0f;
-        float rotate_y_offset;
+        float rotate_y_offset = 0.0f;
 
         updateLightTimer += dt;
         if(updateLightTimer > 0.4f)
@@ -70,7 +70,7 @@ void ItemFrameEntity::Render(CraftWorld *mWorld, Frustum &camFrustum, float dt)
             light = mWorld->BlockFinalLight(GetX(),GetY(),GetZ());
         }
 
-        if(GetItem() < 250) // block
+        if(IsBlockId(GetItem())) // block
         {
             TextureManager::Instance()->SetTextureModeulate(mWorld->textureTerrainId);
 

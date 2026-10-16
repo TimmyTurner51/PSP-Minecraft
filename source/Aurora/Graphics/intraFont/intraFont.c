@@ -314,8 +314,9 @@ int intraFontPreCache(intraFont *font, unsigned int options) {
 		if (font->texY > y || font->texYSize < font->shadowGlyph[i].height) font->texYSize = font->shadowGlyph[i].height; //minimize ysize
 		if (font->texY < y) return 0;                               //char did not fit into cache -> abort precache (should reset cache and glyph.flags)
 	}
-	font->texHeight = ((font->texY) + (font->texYSize) + 7)&~7;
-	if (font->texHeight > font->texWidth) font->texHeight = font->texWidth;
+	// Activate() always uploads texWidth x texWidth. Shrinking here
+	// swizzles a short buffer and the GU reads the rest as garbage.
+	font->texHeight = font->texWidth;
 
 	//reduce fontdata
 	int index = 0, j;
@@ -460,6 +461,7 @@ intraFont* intraFontLoad(const char *filename, unsigned int options) {
 		intraFontUnload(font);
 		return NULL;
 	}
+	memset(font->texture, 0, font->texWidth*font->texHeight>>1);
 	strcpy(font->filename,filename);
 
 	//read in file (tables / fontdata) and populate font structure
@@ -894,10 +896,8 @@ float intraFontPrintColumnUCS2Ex(intraFont *font, float x, float y, float column
 					}
 
 					if (n_glyphs > last_n_glyphs) {
-						n_sglyphs++; //shadow
-						if (!(font->shadowGlyph[font->glyph[char_id].shadowID].flags & PGF_CACHED)) {
-							if (intraFontGetBMP(font,font->glyph[char_id].shadowID,PGF_SHADOWGLYPH)) changed = 1;
-						}
+						if ((shadowColor >> 24) & 0xFF)
+							n_sglyphs++;
 						last_n_glyphs = n_glyphs;
 					}
 
@@ -906,10 +906,8 @@ float intraFontPrintColumnUCS2Ex(intraFont *font, float x, float y, float column
 					if (!(font->glyphBW[char_id].flags & PGF_CACHED)) {
 						if (intraFontGetBMP(font,char_id,PGF_CHARGLYPH)) changed = 1;
 					}
-					n_sglyphs++; //shadow
-					if (!(font->shadowGlyph[0].flags & PGF_CACHED)) {
-						if (intraFontGetBMP(font,font->glyph[0].shadowID,PGF_SHADOWGLYPH)) changed = 1;
-					}
+					if ((shadowColor >> 24) & 0xFF)
+						n_sglyphs++;
 				}
 			}
 
@@ -1102,28 +1100,24 @@ float intraFontPrintColumnUCS2Ex(intraFont *font, float x, float y, float column
 				}
 			}
 
-			//add vertices for shadow
+			// Drop shadow is the same letter, offset 1px — PGF shadow
+			// glyphs in these fonts are "*" shapes.
 			if (c_index > last_c_index) {
-				Glyph *shadowGlyph = &(font->shadowGlyph[shadowGlyph_ptr]);
-
+			if ((shadowColor >> 24) & 0xFF) {
+				fontVertex *c0 = &v[((c_index-1)<<1) + 0];
+				fontVertex *c1 = &v[((c_index-1)<<1) + 1];
 				s0 = &v[(s_index<<1) + 0];
 				s1 = &v[(s_index<<1) + 1];
-
-				s0->u = shadowGlyph->x-0.25f;
-				s0->v = shadowGlyph->y-0.25f;
+				*s0 = *c0;
+				*s1 = *c1;
 				s0->c = shadowColor;
-				s0->x = left + width + shadowGlyph->left*glyphscale*64.0f/((float)font->shadowscale);
-				s0->y = top + height - shadowGlyph->top *glyphscale*64.0f/((float)font->shadowscale);
-				s0->z = 0.0f;
-
-				s1->u = (shadowGlyph->x + shadowGlyph->width)+0.25f;
-				s1->v = (shadowGlyph->y + shadowGlyph->height)+0.25f;
 				s1->c = shadowColor;
-				s1->x = left + width + (shadowGlyph->width+shadowGlyph->left)*glyphscale*64.0f/((float)font->shadowscale);
-				s1->y = top + height + (shadowGlyph->height-shadowGlyph->top)*glyphscale*64.0f/((float)font->shadowscale);
-				s1->z = 0.0f;
-
+				s0->x += 1.0f;
+				s0->y += 1.0f;
+				s1->x += 1.0f;
+				s1->y += 1.0f;
 				s_index++;
+			}
 				last_c_index = c_index;
 			}
 

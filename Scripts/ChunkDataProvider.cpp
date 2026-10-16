@@ -5,6 +5,9 @@
 #include <pspgum.h>
 #include <pspdisplay.h>
 
+// Runs on its own COP1 context; see Scripts/FpuControl.h.
+#include "FpuControl.h"
+
 bool ChunkDataProvider::writeChunk = true;
 bool ChunkDataProvider::busy = false;
 int ChunkDataProvider::so = 0;
@@ -27,6 +30,7 @@ void ChunkDataProvider::KillDealer()
 
 int ChunkDataProvider::ChunkDataDealer(SceSize args, void *argp)
 {
+	MC_DisableFpuExceptions();
 
     char *testChunkData;
     testChunkData = new  char[14 * 98 * 14];
@@ -38,10 +42,10 @@ int ChunkDataProvider::ChunkDataDealer(SceSize args, void *argp)
     std::ofstream outfile ("test3.txt",std::ofstream::binary);
 
     outfile << "edsdfsergredsfgsdgfdfdsgsrsge";
-    outfile.write (testChunkData,sizeof(char)*140*980*140);
+    outfile.write (testChunkData,sizeof(char)*14*98*14);
 
     outfile.close();
-    free(testChunkData);
+    delete[] testChunkData;
     busy = false;
 
 	return 0;

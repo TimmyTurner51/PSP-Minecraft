@@ -230,19 +230,17 @@ float SimplexNoise::sdnoise2( float x, float y, float *dnoise_dx, float *dnoise_
     float y2 = y0 - 1.0f + 2.0f * G2;
 
     /* Wrap the integer indices at 256, to avoid indexing perm[] out of bounds */
-    int ii = i % 256;
-    int jj = j % 256;
+    // & 0xff and not % 256. C++ % keeps the sign of the dividend, so a negative coordinate would give a
+    // negative index here and perm[] would be read *before* the array. & 0xff wraps to 0..255 instead,
+    // which is what the "wrap at 256" comment above always intended.
+    int ii = i & 0xff;
+    int jj = j & 0xff;
 
     /* Calculate the contribution from the three corners */
     float t0 = 0.5f - x0 * x0 - y0 * y0;
     float t20, t40;
     if( t0 < 0.0f ) t40 = t20 = t0 = n0 = gx0 = gy0 = 0.0f; /* No influence */
     else {
-		if(ii < 0 || jj < 0)
-		{
-			int aa = 1;
-		}
-
       grad2( perm[ii + perm[jj]], &gx0, &gy0 );
       t20 = t0 * t0;
       t40 = t20 * t20;
@@ -365,9 +363,12 @@ float SimplexNoise::sdnoise3( float x, float y, float z,float *dnoise_dx, float 
     float z3 = z0 - 1.0f + 3.0f * G3;
 
     /* Wrap the integer indices at 256, to avoid indexing perm[] out of bounds */
-    int ii = i % 256;
-    int jj = j % 256;
-    int kk = k % 256;
+    // & 0xff and not % 256. C++ % keeps the sign of the dividend, so a negative coordinate would give a
+    // negative index here and perm[] would be read *before* the array. & 0xff wraps to 0..255 instead,
+    // which is what the "wrap at 256" comment above always intended.
+    int ii = i & 0xff;
+    int jj = j & 0xff;
+    int kk = k & 0xff;
 
     /* Calculate the contribution from the four corners */
     float t0 = 0.6f - x0*x0 - y0*y0 - z0*z0;
@@ -555,6 +556,9 @@ float SimplexNoise::sdnoise4( float x, float y, float z, float w,	float *dnoise_
     float w4 = w0 - 1.0f + 4.0f * G4;
 
     // Wrap the integer indices at 256, to avoid indexing perm[] out of bounds
+    // & 0xff and not % 256. C++ % keeps the sign of the dividend, so a negative coordinate would give a
+    // negative index here and perm[] would be read *before* the array. & 0xff wraps to 0..255 instead,
+    // which is what the "wrap at 256" comment above always intended.
     int ii = i & 0xff;
     int jj = j & 0xff;
     int kk = k & 0xff;

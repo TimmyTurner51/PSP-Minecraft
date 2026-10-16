@@ -51,20 +51,13 @@ BaseBlock::BaseBlock()
 	name = " ";
 }
 
+// Deliberately frees nothing. The block meshes are owned by CraftWorld -- allocated in
+// buildblocksVerts(), released by FreeBlockTypeMeshes() -- precisely so that copying a BaseBlock cannot
+// free them twice. This class is held by value in a std::vector and is copied on every reallocation,
+// while the buffers are memalign'd and the compiler's copy is shallow, so freeing here made every copy a
+// double free waiting for the vector to grow. Keep this empty.
 BaseBlock::~BaseBlock()
 {
-	if(verticesLeftRight != NULL)
-	{
-		free(verticesLeftRight);
-	}
-	if(verticesBackFront != NULL)
-	{
-		free(verticesBackFront);
-	}
-	if(verticesBottomTop != NULL)
-	{
-		free(verticesBottomTop);
-	}
 }
 
 bool BaseBlock::MatchWithRecipe2x2(std::string recipe_string[2], int& return_id, int& return_am, bool& return_st) // may be in future

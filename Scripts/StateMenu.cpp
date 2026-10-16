@@ -1,15 +1,26 @@
 #include "StateMenu.h"
+#include <Aurora/Graphics/TextureManager.h>
+#include <pspgu.h>
+#include <pspgum.h>
+#include <pspiofilemgr.h>
+#include <malloc.h>
+#include <string.h>
 #include "StateOptions.h"
 #include "StatePlay.h"
 #include "StatePlayCreative.h"
 #include "LoadingScreen.h"
 #include "InputHelper.h"
 #include "TextureHelper.h"
+#include "Version.h"
+#include "BootTrace.h"
 #include <Aurora/System/NetworkManager.h>
 #include <zlib.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <sys/stat.h>
+#include <stdio.h>
+#include <stdarg.h>
 
 // font vars
 #define default_small_size 0.35
@@ -27,6 +38,70 @@ using namespace Aurora::Graphics;
 using namespace Aurora::Utils;
 using namespace Aurora::System;
 using namespace Aurora;
+
+/*
+ * The changelog on the News & Converter screen.
+ *
+ * Kept as data rather than a run of DebugPrint calls, because the box scrolls now and has to know how
+ * many lines there are to know how far it can scroll. The old run also drew "-Changed HUD Size" and
+ * "-Changed Block Count (Creative)" on the same row, so the first was hidden behind the second.
+ */
+static const char* kNewsLines[] =
+{
+	"-Added The Nether",
+	"-Infinite World Generation",
+	"-Biomes Blend Together",
+	"-Added Player Skins",
+	"-Added Redstone",
+	"-Added Pistons",
+	"-Added Bows And Arrows",
+	"-Added Skeletons",
+	"-Added Spiders And Chickens",
+	"-Added Third Person",
+	"-Added Sprint, Sneak And Hunger",
+	"-Added Creative Flight",
+	"-New Lighting",
+	"-Added Launcher Updates",
+	"-Crash And Performance Fixes",
+};
+static const int kNewsLineCount = (int)(sizeof(kNewsLines) / sizeof(kNewsLines[0]));
+
+// The box's text metrics. The panel is blackBackground scaled 60x22 -- 8x8 stretched to 480x176,
+// centred at (240,116) -- so the box covers x 0..480 and y 28..204, which was checked against a
+// screenshot by its flatness (the panel measures as a flat fill where the title background behind it is
+// noisy). The title sits at y 29 and the lines run from just below it.
+//
+// Nine lines at a pitch of 17 fill the panel to y 195, which is the most that reads cleanly: the box is
+// 176 tall, the title takes the first 18 of it, and a line of this font is 13 tall, so a tenth would
+// either collide with the title or with the panel's bottom edge. Nine also keeps the box scrolling --
+// there are more lines than fit, so Up and Down still have a page to move through -- where showing all of
+// them would leave the hints pointing at nothing.
+//
+// That is now ten lines at a pitch of 16, which is the tightest this layout takes: the tenth line starts
+// at y 190 and its 13px body ends at 203, just inside the panel's 204 edge. The pitch came down from 17
+// rather than the count staying at nine because ten lines at 17 would have put the last body at 212,
+// over the edge and onto the title background. Three pixels between lines is still a clear gap for a
+// font this size.
+static const float kNewsLineTop = 46.0f;
+static const float kNewsLineStep = 16.0f;
+static const int kNewsVisibleLines = 10;
+
+static int NewsMaxScroll()
+{
+	int maxScroll = kNewsLineCount - kNewsVisibleLines;
+	return (maxScroll > 0) ? maxScroll : 0;
+}
+
+// One line per key press inside the News & Converter screen, naming the rung the ladder is on. The
+// ladder is three states deep and two of them are indistinguishable on a screenshot (a focused box and
+// a scrolling box look the same until you press something), so without this the only way to check that
+// Up really hands over to the box and X really enters the scroll is to watch a person use it. It also
+// records a clamped scroll, which is what proves the box stops at the last line.
+static void LogNewsState(int focus, int scroll, int button)
+{
+	Aurora::Utils::Logger::Instance()->LogMessage("news: focus=%d (0=buttons 1=box 2=scrolling) scroll=%d button=%d\n",
+		focus, scroll, button);
+}
 
 StateMenu::StateMenu()
 {
@@ -166,16 +241,50 @@ void StateMenu::Init()
     blackBackground->SetPosition(240,116);
     blackBackground->Scale(60,22);
 
+    // The changelog's d-pad hints. Two 16x16 cells of title/dpad.png: up at (0,0), down at (16,0).
+    // Native scale, because a hint at 2x would shout louder than the changelog it is annotating.
+    //
+    // The number is checked before the sprite is built, not after: Sprite's constructor indexes
+    // TextureManager::Images[number], and a texture the chosen pack does not provide comes back as -1,
+    // so building one anyway reads Images[-1] and faults. A pack without the art therefore loses the
+    // hint instead of the session -- the box still scrolls, and only the picture is missing.
+    int dpadNumber = TextureHelper::Instance()->GetTexture(TextureHelper::dpadTexture);
+    dpadUpSprite = NULL;
+    dpadDownSprite = NULL;
+    if(dpadNumber >= 0)
+    {
+        dpadUpSprite = new Sprite(dpadNumber,0,0,16,16);
+        dpadUpSprite->SetPosition(458,44);
+        dpadUpSprite->Scale(1,1);
+
+        dpadDownSprite = new Sprite(dpadNumber,16,0,16,16);
+        dpadDownSprite->SetPosition(458,188);
+        dpadDownSprite->Scale(1,1);
+    }
+
     selectPos = 0;
 
     //load save info
+    BootTrace::Stage("StateMenu::Init reading Save/ and texture packs");
     ScanSaveFiles("Save/");
     ScanTexturePacks("Assets/Textures/");
+    BootTrace::Stage("StateMenu::Init content scanned");
 
     menuState = -1;
+    skinPos = 0;
+    skinStart = 0;
+    skinReturnState = 0;
+    skinSpin = 0.45f;
+    skinFocus = 0;
+    skinTab = 0;
+    skinMessage = "";
+    skinBrowsePos = 0;
+    skinBrowseStart = 0;
     loadSelectPos = 0;
     loadSavePos = 0;
     aboutPos = 0;
+    aboutFocus = 0;
+    newsScroll = 0;
 
     newWorldName = "New World";
     newWorldNamestr = "";
@@ -204,6 +313,7 @@ void StateMenu::Init()
     currentVersion = 140;
 
     //input helper
+    BootTrace::Stage("StateMenu::Init input helper");
     InputHelper::Instance()->Init();
     InputHelper::Instance()->Load();
 
@@ -228,6 +338,7 @@ void StateMenu::Init()
 
 void StateMenu::Enter()
 {
+    BootTrace::Stage("StateMenu::Enter");
     mRender->SetOrtho(0,0,0,0,0,0);
     selectPos = 0;
 }
@@ -249,6 +360,8 @@ void StateMenu::CleanUp()
 
     delete backgroundSprite;
     delete blackBackground;
+    delete dpadUpSprite;
+    delete dpadDownSprite;
 	/*delete screen1Sprite;
 	delete screen2Sprite;
 	delete screen3Sprite;
@@ -262,6 +375,11 @@ void StateMenu::Pause()
 
 void StateMenu::Resume()
 {
+    // A world was Pushed over this state and freed the title-screen art while it ran; this is the
+    // point where it comes back. Resume (not Init) because the menu is paused, never destroyed, so
+    // its sprites and their cached texture numbers are the ones built at boot.
+    TextureHelper::Instance()->EnsureMenuTextures();
+
     menuState = 0;
     loadSelectPos = 0;
     loadSavePos = 0;
@@ -382,14 +500,14 @@ void StateMenu::HandleEvents(StateManager* sManager)
         {
             selectPos--;
             if(selectPos < 0)
-                selectPos = 3;
+                selectPos = 4;
             mSoundMgr->PlayMenuSound();
         }
 
         if(mSystemMgr->KeyPressed(PSP_CTRL_DOWN))
         {
             selectPos++;
-            if(selectPos > 3)
+            if(selectPos > 4)
                 selectPos = 0;
 
             mSoundMgr->PlayMenuSound();
@@ -410,6 +528,10 @@ void StateMenu::HandleEvents(StateManager* sManager)
 				mSoundMgr->PlayMenuSound2();
             }
 			if(selectPos == 3)
+            {
+				mSoundMgr->PlayMenuSound2();
+            }
+			if(selectPos == 4)
             {
 				mSoundMgr->PlayMenuSound2();
             }
@@ -450,6 +572,8 @@ void StateMenu::HandleEvents(StateManager* sManager)
                 //about
                 menuState = 3;
                 aboutPos = 1;
+                aboutFocus = 0;
+                newsScroll = 0;
             }
             if(selectPos == 3)
             {
@@ -466,6 +590,25 @@ void StateMenu::HandleEvents(StateManager* sManager)
                 tpEnd = texturePackList.size();
                 tpMax = 3;
                 ScanTexturePacks("Assets/Textures/");
+            }
+            if(selectPos == 4)
+            {
+                ScanSkins();
+                skinPos = 0;
+                skinStart = 0;
+                const char* current = TextureHelper::Instance()->PlayerSkinName();
+                for(int i = 0; i < (int)skinList.size(); i++)
+                {
+                    if(skinList[i] == current)
+                        skinPos = i;
+                }
+                skinStart = 0;
+                skinFocus = 0;
+                skinTab = 0;
+                skinSpin = 0.45f;
+                skinMessage = "";
+                skinReturnState = menuState;
+                menuState = 13;
             }
         }
     }
@@ -496,7 +639,7 @@ void StateMenu::HandleEvents(StateManager* sManager)
         {
             selectPos--;
             if(selectPos < 0)
-                selectPos = 3;
+                selectPos = 4;
 
             mSoundMgr->PlayMenuSound();
         }
@@ -504,7 +647,7 @@ void StateMenu::HandleEvents(StateManager* sManager)
         if(mSystemMgr->KeyPressed(PSP_CTRL_DOWN))
         {
             selectPos++;
-            if(selectPos > 3)
+            if(selectPos > 4)
                 selectPos = 0;
 
             mSoundMgr->PlayMenuSound();
@@ -525,6 +668,10 @@ void StateMenu::HandleEvents(StateManager* sManager)
 				mSoundMgr->PlayMenuSound2();
             }
 			if(selectPos == 3)
+            {
+				mSoundMgr->PlayMenuSound2();
+            }
+			if(selectPos == 4)
             {
 				mSoundMgr->PlayMenuSound2();
             }
@@ -565,6 +712,8 @@ void StateMenu::HandleEvents(StateManager* sManager)
                 //about
                 menuState = 3;
                 aboutPos = 1;
+                aboutFocus = 0;
+                newsScroll = 0;
             }
             if(selectPos == 3)
             {
@@ -581,6 +730,227 @@ void StateMenu::HandleEvents(StateManager* sManager)
                 tpEnd = texturePackList.size();
                 tpMax = 3;
                 ScanTexturePacks("Assets/Textures/");
+            }
+            if(selectPos == 4)
+            {
+                ScanSkins();
+                skinPos = 0;
+                skinStart = 0;
+                const char* current = TextureHelper::Instance()->PlayerSkinName();
+                for(int i = 0; i < (int)skinList.size(); i++)
+                {
+                    if(skinList[i] == current)
+                        skinPos = i;
+                }
+                skinStart = 0;
+                skinFocus = 0;
+                skinTab = 0;
+                skinSpin = 0.45f;
+                skinMessage = "";
+                skinReturnState = menuState;
+                menuState = 13;
+            }
+        }
+    }
+    break;
+    case 13://skins
+    {
+        const int columns = 4;
+        const int rows = 3;
+        int count = (int)skinList.size();
+
+        if(skinFocus == 1)
+        {
+            // The preview: left and right (pad or stick) turn the figure, Cross equips, Circle
+            // hands the pad back to the grid.
+            float stickX = 0.0f;
+            float stickY = 0.0f;
+            mSystemMgr->GetAnalogDeadzone(0.25f, stickX, stickY);
+            if(mSystemMgr->KeyHold(PSP_CTRL_LEFT))
+                skinSpin -= 0.06f;
+            if(mSystemMgr->KeyHold(PSP_CTRL_RIGHT))
+                skinSpin += 0.06f;
+            skinSpin += stickX * 0.08f;
+            if(skinSpin > 2.0f * PI)
+                skinSpin -= 2.0f * PI;
+            if(skinSpin < 0.0f)
+                skinSpin += 2.0f * PI;
+
+            if(mSystemMgr->KeyPressed(PSP_CTRL_CIRCLE))
+            {
+                skinFocus = 0;
+                mSoundMgr->PlayMenuSound();
+            }
+            else if(mSystemMgr->KeyPressed(PSP_CTRL_CROSS))
+            {
+                mSoundMgr->PlayMenuSound2();
+                if(skinPos >= 0 && skinPos < count)
+                {
+                    const std::string& picked = skinList[skinPos];
+                    const char* file = (picked == "Steve") ? "Steve" : picked.c_str();
+                    if(TextureHelper::Instance()->SetPlayerSkin(file))
+                        skinMessage = "";
+                    else
+                        skinMessage = "Not a 64x32 or 64x64 skin";
+                }
+            }
+        }
+        else if(skinFocus == 2)
+        {
+            // The side tabs: the skin library and the memory stick import.
+            if(mSystemMgr->KeyPressed(PSP_CTRL_UP) && skinTab > 0)
+            {
+                skinTab--;
+                mSoundMgr->PlayMenuSound();
+            }
+            if(mSystemMgr->KeyPressed(PSP_CTRL_DOWN) && skinTab < 1)
+            {
+                skinTab++;
+                mSoundMgr->PlayMenuSound();
+            }
+            if(mSystemMgr->KeyPressed(PSP_CTRL_RIGHT))
+            {
+                skinFocus = 0;
+                mSoundMgr->PlayMenuSound();
+            }
+            if(mSystemMgr->KeyPressed(PSP_CTRL_CROSS))
+            {
+                mSoundMgr->PlayMenuSound2();
+                if(skinTab == 1)
+                {
+                    skinTab = 0;
+                    skinFocus = 0;
+                    OpenSkinImport();
+                }
+                else
+                {
+                    skinFocus = 0;
+                }
+            }
+            else if(mSystemMgr->KeyPressed(PSP_CTRL_CIRCLE))
+            {
+                menuState = skinReturnState;
+                mSoundMgr->PlayMenuSound();
+            }
+        }
+        else
+        {
+            int col = skinPos % columns;
+            if(mSystemMgr->KeyPressed(PSP_CTRL_LEFT))
+            {
+                if(col > 0)
+                    skinPos--;
+                else
+                {
+                    skinFocus = 2;
+                    skinTab = 0;
+                }
+                mSoundMgr->PlayMenuSound();
+            }
+            if(mSystemMgr->KeyPressed(PSP_CTRL_RIGHT))
+            {
+                if(col + 1 < columns && skinPos + 1 < count)
+                    skinPos++;
+                else
+                    skinFocus = 1;
+                mSoundMgr->PlayMenuSound();
+            }
+            if(mSystemMgr->KeyPressed(PSP_CTRL_UP) && skinPos - columns >= 0)
+            {
+                skinPos -= columns;
+                mSoundMgr->PlayMenuSound();
+            }
+            if(mSystemMgr->KeyPressed(PSP_CTRL_DOWN))
+            {
+                if(skinPos + columns < count)
+                    skinPos += columns;
+                else if(skinPos / columns < (count - 1) / columns)
+                    skinPos = count - 1;
+                mSoundMgr->PlayMenuSound();
+            }
+            if(mSystemMgr->KeyPressed(PSP_CTRL_SQUARE))
+            {
+                OpenSkinImport();
+                mSoundMgr->PlayMenuSound();
+            }
+            if(mSystemMgr->KeyPressed(PSP_CTRL_CROSS))
+            {
+                skinFocus = 1;
+                mSoundMgr->PlayMenuSound2();
+            }
+            else if(mSystemMgr->KeyPressed(PSP_CTRL_CIRCLE))
+            {
+                menuState = skinReturnState;
+                mSoundMgr->PlayMenuSound();
+            }
+        }
+
+        int row = skinPos / columns;
+        if(row < skinStart)
+            skinStart = row;
+        if(row >= skinStart + rows)
+            skinStart = row - rows + 1;
+    }
+    break;
+    case 14://import a skin from the memory stick
+    {
+        int count = (int)skinBrowseNames.size();
+        if(mSystemMgr->KeyPressed(PSP_CTRL_UP))
+        {
+            if(skinBrowsePos > 0)
+            {
+                skinBrowsePos--;
+                if(skinBrowsePos < skinBrowseStart)
+                    skinBrowseStart = skinBrowsePos;
+                mSoundMgr->PlayMenuSound();
+            }
+        }
+        if(mSystemMgr->KeyPressed(PSP_CTRL_DOWN))
+        {
+            if(skinBrowsePos + 1 < count)
+            {
+                skinBrowsePos++;
+                if(skinBrowsePos >= skinBrowseStart + 6)
+                    skinBrowseStart = skinBrowsePos - 5;
+                mSoundMgr->PlayMenuSound();
+            }
+        }
+        if(mSystemMgr->KeyPressed(PSP_CTRL_CIRCLE))
+        {
+            if(skinBrowsePath == "ms0:/" || skinBrowsePath == "ef0:/")
+            {
+                menuState = 13;
+            }
+            else
+            {
+                std::string path = skinBrowsePath;
+                if(path.size() > 1 && path[path.size() - 1] == '/')
+                    path.erase(path.size() - 1);
+                size_t slash = path.find_last_of('/');
+                if(slash == std::string::npos || slash < 4)
+                    skinBrowsePath = "ms0:/";
+                else
+                    skinBrowsePath = path.substr(0, slash + 1);
+                ScanSkinImport();
+            }
+            mSoundMgr->PlayMenuSound();
+        }
+        if(mSystemMgr->KeyPressed(PSP_CTRL_CROSS))
+        {
+            if(skinBrowsePos >= 0 && skinBrowsePos < count)
+            {
+                if(skinBrowseDir[skinBrowsePos])
+                {
+                    skinBrowsePath += skinBrowseNames[skinBrowsePos];
+                    skinBrowsePath += "/";
+                    ScanSkinImport();
+                    mSoundMgr->PlayMenuSound();
+                }
+                else
+                {
+                    ImportHighlightedSkin();
+                    mSoundMgr->PlayMenuSound2();
+                }
             }
         }
     }
@@ -618,6 +988,9 @@ void StateMenu::HandleEvents(StateManager* sManager)
                         {
                             //remove normal file
                             remove(saveFilesList[loadSavePos].fileName.c_str());
+
+                            //remove the streamed chunk folder Save/worldN.lmsd
+                            CraftWorld::RemoveChunkDir(saveFilesList[loadSavePos].fileName);
 
                             //remove compressed one
                             saveFilesList[loadSavePos].fileName += "c";
@@ -801,26 +1174,27 @@ void StateMenu::HandleEvents(StateManager* sManager)
 				mSoundMgr->PlayMenuSound3();
 				//checking for new update
                 NetworkManager::Instance()->Init();
-                //initialize connection
-                if(NetworkManager::Instance()->InitializeConnection())
+                // The stack first, then a connection to an access point through the system's own
+                // dialog. Both branches here used to be reported backwards -- the success path printed
+                // "Failed to connect to network" and the failure path printed "Connected to Network" --
+                // which is worth naming, because it is exactly the kind of bug that gets a working
+                // feature reported as broken and a broken one reported as working.
+                if(!NetworkManager::Instance()->InitializeConnection())
                 {
-                    //show network dialog and connect to ap
-                    if(SystemManager::Instance()->ShowNetworkDialog())
-                    {
-						SystemManager::Instance()->ShowMessage("Failed to connect to network.");
-                    }
-                    else
-                    {
-                        SystemManager::Instance()->ShowMessage("You must connect to an access point.");
-                    }
+                    SystemManager::Instance()->ShowMessage("Could not start networking.");
                 }
-                else
+                else if(SystemManager::Instance()->ShowNetworkDialog())
                 {
                     SystemManager::Instance()->ShowMessage("Connected to Network.");
                 }
+                else
+                {
+                    SystemManager::Instance()->ShowMessage("You must connect to an access point.");
+                }
 
-                //turn off connection
-                //NetworkManager::Instance()->ShutDownConnection();
+                // Deliberately left connected rather than torn down. The updater shares this stack and
+                // will not tear down what it did not bring up (see Update::NetShutdown), so a player
+                // who connects here is not asked to connect a second time in the update screen.
             }
 
             if(mSystemMgr->KeyPressed(PSP_CTRL_CIRCLE))
@@ -944,12 +1318,81 @@ void StateMenu::HandleEvents(StateManager* sManager)
     break;
     case 3://about
     {
+        // A three-rung ladder, the same shape the launcher's own changelog uses:
+        //   buttons  --Up-->  box selected  --X-->  scrolling
+        //      ^                  |                    |
+        //      +------ Down ------+------- O ---------+
+        //
+        // Up and Down still move between the two buttons; one more Up past the topmost leaves the
+        // buttons for the box above them. The scroll step is its own rung rather than something Up
+        // and Down do while standing on the box, and that separation is deliberate: if the same keys
+        // both stepped between rungs and scrolled the text, the changelog would slide every time the
+        // cursor left the box, and the only way back down to the buttons would be to scroll the whole
+        // thing to the bottom first.
+        if(aboutFocus == 2)
+        {
+            if(mSystemMgr->KeyPressed(PSP_CTRL_UP))
+            {
+                if(newsScroll > 0)
+                    newsScroll--;
+                LogNewsState(aboutFocus, newsScroll, aboutPos);
+                mSoundMgr->PlayMenuSound();
+            }
+
+            if(mSystemMgr->KeyPressed(PSP_CTRL_DOWN))
+            {
+                if(newsScroll < NewsMaxScroll())
+                    newsScroll++;
+                LogNewsState(aboutFocus, newsScroll, aboutPos);
+                mSoundMgr->PlayMenuSound();
+            }
+
+            // O leaves the scroll step and puts the box back to merely selected, so the changelog
+            // stays where it was scrolled to.
+            if(mSystemMgr->KeyPressed(PSP_CTRL_CIRCLE))
+            {
+                aboutFocus = 1;
+                LogNewsState(aboutFocus, newsScroll, aboutPos);
+                mSoundMgr->PlayMenuSound();
+            }
+            break;
+        }
+
+        if(aboutFocus == 1)
+        {
+            if(mSystemMgr->KeyPressed(PSP_CTRL_CROSS))
+            {
+                aboutFocus = 2;
+                LogNewsState(aboutFocus, newsScroll, aboutPos);
+                mSoundMgr->PlayMenuSound();
+            }
+
+            if(mSystemMgr->KeyPressed(PSP_CTRL_DOWN))
+            {
+                aboutFocus = 0;
+                LogNewsState(aboutFocus, newsScroll, aboutPos);
+                mSoundMgr->PlayMenuSound();
+            }
+
+            if(mSystemMgr->KeyPressed(PSP_CTRL_CIRCLE))
+            {
+                aboutFocus = 0;
+                LogNewsState(aboutFocus, newsScroll, aboutPos);
+                mSoundMgr->PlayMenuSound();
+            }
+            break;
+        }
+
         if(mSystemMgr->KeyPressed(PSP_CTRL_UP))
         {
-            aboutPos--;
-            if(aboutPos < 0)
-                aboutPos = 1;
+            // Cancelling out of the box can land the cursor on either button, so only the topmost one
+            // hands over to the changelog; from the lower one, Up just moves up to the top.
+            if(aboutPos == 0)
+                aboutFocus = 1;
+            else
+                aboutPos = 0;
 
+            LogNewsState(aboutFocus, newsScroll, aboutPos);
             mSoundMgr->PlayMenuSound();
         }
 
@@ -959,6 +1402,7 @@ void StateMenu::HandleEvents(StateManager* sManager)
             if(aboutPos > 1)
                 aboutPos = 0;
 
+            LogNewsState(aboutFocus, newsScroll, aboutPos);
             mSoundMgr->PlayMenuSound();
         }
 
@@ -1087,7 +1531,10 @@ void StateMenu::HandleEvents(StateManager* sManager)
             if(generateSelectPose == 3)
             {
                 worldType += 1;
-                if(worldType > 8)
+                // The Nether is no longer a world you can create -- it is somewhere you travel to --
+                // so the cycle stops at Flat Ocean (7). World type 8 still loads a world that has it
+                // saved; it is only the create screen that no longer offers it.
+                if(worldType > 7)
                 {
                     worldType = 0;
                 }
@@ -1148,7 +1595,6 @@ void StateMenu::HandleEvents(StateManager* sManager)
                 errorType = 0;
                 if(schematicExists)
                 {
-                    char buffer[40];
                     char empty;
                     gzFile saveFile;
 
@@ -1219,10 +1665,10 @@ void StateMenu::HandleEvents(StateManager* sManager)
 
                     //blocks
                     unsigned char* m_Array1;
-                    m_Array1 = new block_t[252 * 112 * 252];
+                    m_Array1 = new unsigned char[252 * 112 * 252];
                     memset(m_Array1, 0, sizeof(unsigned char) * 252 * 252 * 112);
 
-                    char need[6];
+                    char need[6] = {0};
                     bool again = false;
                     for(int i = 0; i < 100000000; i++)
                     {
@@ -1265,9 +1711,9 @@ void StateMenu::HandleEvents(StateManager* sManager)
                     if(again)
                     {
                         memset(m_Array1, 0, sizeof(unsigned char) * 252 * 252 * 112);
-                        for(int j = 0; j <= 6; j++)
+                        for(int j = 0; j < 6; j++) //need[6] has 6 bytes
                         {
-                            need[j] = '/0';
+                            need[j] = '\0';
                         }
 
                         for(int i = 0; i < 100000000; i++)
@@ -1432,7 +1878,7 @@ void StateMenu::HandleEvents(StateManager* sManager)
 
 
                     unsigned char* m_Array2;
-                    m_Array2 = new block_t[252 * 112 * 252];
+                    m_Array2 = new unsigned char[252 * 112 * 252];
                     memset(m_Array2, 0, sizeof(unsigned char) * 252 * 252 * 112);
 
                     for(int x = 0; x < 252; x++)
@@ -1459,7 +1905,7 @@ void StateMenu::HandleEvents(StateManager* sManager)
 
                     // creating height map
                     unsigned char* m_Heightmap;
-                    m_Heightmap = new block_t[252 * 252];
+                    m_Heightmap = new unsigned char[252 * 252];
                     memset(m_Heightmap, 0, sizeof(unsigned char) * 252 * 252);
 
                     for(int x = 0; x < 252; x++)
@@ -1512,7 +1958,7 @@ void StateMenu::HandleEvents(StateManager* sManager)
                             }
                         }
                     }
-                    free(m_Heightmap);
+                    delete[] m_Heightmap;
 
 
                     /// (2) FETCH SCHEMATIC DATA
@@ -1520,9 +1966,9 @@ void StateMenu::HandleEvents(StateManager* sManager)
                     if(saveFile == 0)
                         return;
 
-                    for(int j = 0; j <= 6; j++)
+                    for(int j = 0; j < 6; j++) //need[6] has 6 bytes
                     {
-                        need[j] = '/0';
+                        need[j] = '\0';
                     }
 
                     //data
@@ -1569,9 +2015,9 @@ void StateMenu::HandleEvents(StateManager* sManager)
                     if(again)
                     {
                         memset(m_Array1, 0, sizeof(unsigned char) * 252 * 252 * 112);
-                        for(int j = 0; j <= 6; j++)
+                        for(int j = 0; j < 6; j++) //need[6] has 6 bytes
                         {
-                            need[j] = '/0';
+                            need[j] = '\0';
                         }
 
                         for(int i = 0; i < 100000000; i++)
@@ -1799,7 +2245,7 @@ void StateMenu::HandleEvents(StateManager* sManager)
                                     }
                                     if(data == 10)
                                     {
-                                        block == VioletWoolBlock::getID();
+                                        block = VioletWoolBlock::getID();
                                     }
                                     if(data == 11)
                                     {
@@ -1827,7 +2273,7 @@ void StateMenu::HandleEvents(StateManager* sManager)
                         }
                     }
 
-                    free(m_Array1);
+                    delete[] m_Array1;
                     saveFile=0;
 
                     /// (2.1) SET SUITABLE PLAYER POSITION
@@ -2044,18 +2490,22 @@ void StateMenu::HandleEvents(StateManager* sManager)
                     gzclose(saveFile);
                     saveFile=0;
 
-                    free(m_Array2);
+                    delete[] m_Array2;
                 }
             }
             if(converterPos == 2)
             {
                 menuState = 3;
+                aboutFocus = 0;
+                newsScroll = 0;
             }
         }
 
         if(mSystemMgr->KeyPressed(PSP_CTRL_CIRCLE))
         {
             menuState = 3;
+            aboutFocus = 0;
+            newsScroll = 0;
 			mSoundMgr->PlayMenuSound3();
         }
     }
@@ -2095,7 +2545,7 @@ void StateMenu::HandleEvents(StateManager* sManager)
         if(mSystemMgr->KeyPressed(PSP_CTRL_CROSS))
         {
             char worldNameTemp[50];
-            for(char i = 0; i <= 49; i++)
+            for(int i = 0; i <= 49; i++)
             {
                 worldNameTemp[i] = saveFilesList[loadSavePos].worldName[i];
             }
@@ -2262,6 +2712,9 @@ void StateMenu::HandleEvents(StateManager* sManager)
                         {
                             //remove normal file
                             remove(saveFilesList[loadSavePos].fileName.c_str());
+
+                            //remove the streamed chunk folder Save/worldN.lmsd
+                            CraftWorld::RemoveChunkDir(saveFilesList[loadSavePos].fileName);
 
                             //remove compressed one
                             saveFilesList[loadSavePos].fileName += "c";
@@ -2569,12 +3022,20 @@ void StateMenu::HandleEvents(StateManager* sManager)
 }
 void StateMenu::Update(StateManager* sManager)
 {
-
+    if(mSoundMgr)
+    {
+        mSoundMgr->AudioSync();
+    }
 }
 
 void StateMenu::Draw(StateManager* sManager)
 {
+    // One line in Log.txt, on the first frame only: BootTrace::Stage ignores a name that is already
+    // current. This is what separates "stopped while setting the menu up" from "stopped drawing it".
+    BootTrace::Stage("menu drawing its first frame");
+
     //start rendering
+    mRender->SetOrtho(0,0,0,0,0,0);
     mRender->StartFrame(1,1,1);
 
     switch(menuState)
@@ -2773,6 +3234,10 @@ void StateMenu::Draw(StateManager* sManager)
         buttonSprite->SetPosition(240,180);
         buttonSprite->Draw();
 
+        //Skins
+        buttonSprite->SetPosition(240,210);
+        buttonSprite->Draw();
+
         //selected button
         sbuttonSprite->SetPosition(240,(selectPos * 30) + 90);
         sbuttonSprite->Draw();
@@ -2792,8 +3257,9 @@ void StateMenu::Draw(StateManager* sManager)
             selectPos == 1 ? DrawText(240,129,GU_COLOR(1,1,0.25,1) ,default_size,"Help & Options") : DrawText(240,129,GU_COLOR(1,1,1,1) ,default_size,"Help & Options");
 			selectPos == 2 ? DrawText(240,159,GU_COLOR(1,1,0.25,1) ,default_size,"News & Converter") : DrawText(240,159,GU_COLOR(1,1,1,1) ,default_size,"News & Converter");
             selectPos == 3 ? DrawText(240,189,GU_COLOR(1,1,0.25,1) ,default_size,"Texture Packs") : DrawText(240,189,GU_COLOR(1,1,1,1) ,default_size,"Texture Packs");
-			selectPos == 4 ? DrawText(50,260,GU_COLOR(1,1,0.25,1) ,default_small_size,"Minecraft v3.0.0") : DrawText(50,260,GU_COLOR(1,1,1,1) ,default_small_size,"Minecraft v3.0.0");
-			selectPos == 5 ? DrawText(350,260,GU_COLOR(1,1,0.25,1) ,default_small_size,"Copyright Mojang AB. Do not distribute!") : DrawText(350,260,GU_COLOR(1,1,1,1) ,default_small_size,"Copyright Mojang AB. Do not distribute!");
+            selectPos == 4 ? DrawText(240,219,GU_COLOR(1,1,0.25,1) ,default_size,"Skins") : DrawText(240,219,GU_COLOR(1,1,1,1) ,default_size,"Skins");
+			DrawText(50,260,GU_COLOR(1,1,1,1) ,default_small_size,MC_VERSION_TITLE);
+			DrawText(350,260,GU_COLOR(1,1,1,1) ,default_small_size,"Copyright Mojang AB. Do not distribute!");
 
             switch(SplashNumber)
             {
@@ -2931,6 +3397,10 @@ void StateMenu::Draw(StateManager* sManager)
         buttonSprite->SetPosition(240,180);
         buttonSprite->Draw();
 
+        //Skins
+        buttonSprite->SetPosition(240,210);
+        buttonSprite->Draw();
+
         //selected button
         sbuttonSprite->SetPosition(240,(selectPos * 30) + 90);
         sbuttonSprite->Draw();
@@ -2950,8 +3420,9 @@ void StateMenu::Draw(StateManager* sManager)
 			selectPos == 1 ? DrawText(240, 129, GU_COLOR(1, 1, 0.25, 1), default_size, "Help & Options") : DrawText(240, 129, GU_COLOR(1, 1, 1, 1), default_size, "Help & Options");
 			selectPos == 2 ? DrawText(240, 159, GU_COLOR(1, 1, 0.25, 1), default_size, "News & Converter") : DrawText(240, 159, GU_COLOR(1, 1, 1, 1), default_size, "News & Converter");
 			selectPos == 3 ? DrawText(240, 189, GU_COLOR(1, 1, 0.25, 1), default_size, "Texture Packs") : DrawText(240, 189, GU_COLOR(1, 1, 1, 1), default_size, "Texture Packs");
-			selectPos == 4 ? DrawText(50, 260, GU_COLOR(1, 1, 0.25, 1), default_small_size, "Minecraft v3.0.0") : DrawText(50, 260, GU_COLOR(1, 1, 1, 1), default_small_size, "Minecraft v3.0.0");
-			selectPos == 5 ? DrawText(350, 260, GU_COLOR(1, 1, 0.25, 1), default_small_size, "Copyright Mojang AB. Do not distribute!") : DrawText(350, 260, GU_COLOR(1, 1, 1, 1), default_small_size, "Copyright Mojang AB. Do not distribute!");
+			selectPos == 4 ? DrawText(240, 219, GU_COLOR(1, 1, 0.25, 1), default_size, "Skins") : DrawText(240, 219, GU_COLOR(1, 1, 1, 1), default_size, "Skins");
+			DrawText(50, 260, GU_COLOR(1, 1, 1, 1), default_small_size, MC_VERSION_TITLE);
+			DrawText(350, 260, GU_COLOR(1, 1, 1, 1), default_small_size, "Copyright Mojang AB. Do not distribute!");
 
 
             switch(SplashNumber)
@@ -3019,6 +3490,16 @@ void StateMenu::Draw(StateManager* sManager)
 				case 60: DrawText(328,60,GU_COLOR(1,1,0,1) ,0.6+sinf(splashSize)*0.04f,"Holy cow, man!"); break;
             }
         }
+    }
+    break;
+    case 13://skins
+    {
+        DrawSkinStage();
+    }
+    break;
+    case 14://import
+    {
+        DrawSkinImport();
     }
     break;
     case 1://select world
@@ -3256,49 +3737,75 @@ void StateMenu::Draw(StateManager* sManager)
         buttonSprite->Draw();
 
         //back
-        sbuttonSprite->SetPosition(240,(aboutPos * 30) + 225);
-        sbuttonSprite->Draw();
+        //
+        // Only while the cursor is actually on the buttons. The blue selection sprite stays on the
+        // Converter button otherwise, which reads as "still selected" while the cursor is up in the
+        // changelog -- the same thing the yellow label used to do, and it made the Up out of the buttons
+        // look like it had not taken effect. Clearing it is what leaves the box as the only highlighted
+        // thing on the screen once the cursor is up there.
+        if(aboutFocus == 0)
+        {
+            sbuttonSprite->SetPosition(240,(aboutPos * 30) + 225);
+            sbuttonSprite->Draw();
+        }
 
         blackBackground->Draw();
+
+        // The d-pad hints, in the changelog box's top-right and bottom-right corners. Drawn after the
+        // panel so they sit on top of it, and before blend is switched off so they keep their alpha.
+        // NULL when the pack has no title/dpad.png; see Init.
+        //
+        // They light up with the box, which is what makes them read as an instruction rather than as
+        // decoration: while the cursor is still on the buttons the text is dim and the hints are faint,
+        // and the Up that lifts the cursor onto the box brightens both at once. Unselected they are
+        // dimmed rather than hidden, so it is clear that the box scrolls before the cursor gets there.
+        const float hintAlpha = (aboutFocus >= 1) ? 1.0f : 0.4f;
+        if(dpadUpSprite != NULL)
+        {
+            dpadUpSprite->Alpha(hintAlpha);
+            dpadUpSprite->Draw();
+        }
+        if(dpadDownSprite != NULL)
+        {
+            dpadDownSprite->Alpha(hintAlpha);
+            dpadDownSprite->Draw();
+        }
 
         sceGuDisable(GU_BLEND);
         sceGuEnable(GU_DEPTH_TEST);
 
         if(mRender->GetFontLanguage() == ENGLISH)
         {
-			mRender->SetFontStyle(0.5, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
-			mRender->DebugPrint(40, 90 - 40, "-Performance Upgrade");
+            // The changelog, kNewsVisibleLines lines at a time from newsScroll. The loop replaced a
+            // run of DebugPrint calls, two of which shared a row and so hid one another.
+            //
+            // The shading is the "there is more above and below" cue: dim while the cursor is on the
+            // buttons, full white once Up has lifted it onto the box, matching the hints in the corners.
+            const float textShade = (aboutFocus >= 1) ? 1.0f : 0.58f;
+            for(int i = 0; i < kNewsVisibleLines; i++)
+            {
+                int line = newsScroll + i;
+                if(line >= kNewsLineCount)
+                    break;
 
-			mRender->SetFontStyle(0.5, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
-			mRender->DebugPrint(40, 105 - 40, "-Fixed Incorrect Grammar");
+                mRender->SetFontStyle(0.687, GU_COLOR(textShade, textShade, textShade, 1), 2, 0x00000000);
+                mRender->DebugPrint(40, (int)(kNewsLineTop + i * kNewsLineStep), kNewsLines[line]);
+            }
 
-			mRender->SetFontStyle(0.5, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
-			mRender->DebugPrint(40, 120 - 40, "-Fixed Headbob");
+            // The yellow label marks the focused button, and it has to go with the blue sprite above:
+            // both are cleared while the cursor is up in the changelog, so no button is left looking
+            // selected. aboutPos is deliberately kept, so Down returns to the same button that Up left.
+            const bool onButtons = (aboutFocus == 0);
+            (onButtons && aboutPos == 0) ? DrawText(240,234,GU_COLOR(1,1,0.25,1) ,default_size,"Converter") : DrawText(240,234,GU_COLOR(1,1,1,1) ,default_size,"Converter");
+            (onButtons && aboutPos == 1) ? DrawText(240,264,GU_COLOR(1,1,0.25,1) ,default_size,"Cancel") : DrawText(240,264,GU_COLOR(1,1,1,1) ,default_size,"Cancel");
 
-			mRender->SetFontStyle(0.5, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
-			mRender->DebugPrint(40, 135 - 40, "-Fixed Loading Crash");
-
-			mRender->SetFontStyle(0.5, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
-			mRender->DebugPrint(40, 150 - 40, "-Fixed Fancy Graphics");
-
-			mRender->SetFontStyle(0.5, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
-			mRender->DebugPrint(40, 165 - 40, "-Changed Render Distance");
-
-			mRender->SetFontStyle(0.5, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
-			mRender->DebugPrint(40, 180 - 40, "-Changed Crop Breaking Time");
-
-			mRender->SetFontStyle(0.5, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
-			mRender->DebugPrint(40, 195 - 40, "-Changed Fog");
-
-			mRender->SetFontStyle(0.5, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
-			mRender->DebugPrint(40, 210 - 40, "-Changed HUD Size");
-
-			mRender->SetFontStyle(0.5, GU_COLOR(1, 1, 1, 1), 2, 0x00000000);
-			mRender->DebugPrint(40, 225 - 40, "-Changed Block Count (Creative)");
-
-            aboutPos == 0 ? DrawText(240,234,GU_COLOR(1,1,0.25,1) ,default_size,"Converter") : DrawText(240,234,GU_COLOR(1,1,1,1) ,default_size,"Converter");
-            aboutPos == 1 ? DrawText(240,264,GU_COLOR(1,1,0.25,1) ,default_size,"Cancel") : DrawText(240,264,GU_COLOR(1,1,1,1) ,default_size,"Cancel");
-            DrawText(240,29,GU_COLOR(1,1,1,1) ,default_size,"UPDATE NEWS 3.0.0");
+            // Selecting the box uses the menu's own idiom for "this is the selected thing": the yellow
+            // every other selected button uses. It is the only cue that Up has lifted the cursor off
+            // the buttons, so it has to read the same way as the rest of the menu does.
+            if(aboutFocus >= 1)
+                DrawText(240,29,GU_COLOR(1,1,0.25,1) ,default_size,"UPDATE NEWS 3.0.0");
+            else
+                DrawText(240,29,GU_COLOR(1,1,1,1) ,default_size,"UPDATE NEWS 3.0.0");
         }
     }
     break;
@@ -3399,10 +3906,6 @@ void StateMenu::Draw(StateManager* sManager)
 			if (worldType == 7)
 			{
 				generateSelectPose == 3 ? DrawText(240, 189, GU_COLOR(1, 1, 0.25, 1), default_size, "Biome: Flat Ocean") : DrawText(240, 189, GU_COLOR(1, 1, 1, 1), default_size, "Biome: Flat Ocean");
-			}
-			if (worldType == 8)
-			{
-				generateSelectPose == 3 ? DrawText(240, 189, GU_COLOR(1, 1, 0.25, 1), default_size, "Biome: Flat Nether") : DrawText(240, 189, GU_COLOR(1, 1, 1, 1), default_size, "Biome: Flat Nether");
 			}
 
             generateSelectPose == 4 ? DrawText(240,219,GU_COLOR(1,1,0.25,1) ,default_size,"Create New World") : DrawText(240,219,GU_COLOR(1,1,1,1) ,default_size,"Create New World");
@@ -3856,25 +4359,28 @@ void StateMenu::ScanSaveFiles(const char* dirName)
     //clear list with save files
     saveFilesList.clear();
 
-    DIR *Dir;
-    struct dirent *DirEntry;
-    Dir = opendir(dirName);
+    DIR *Dir = opendir(dirName);
+    if (Dir == NULL)
+        return;
 
+    struct dirent *DirEntry;
     while((DirEntry = readdir(Dir)) != NULL)
     {
-        if ( DirEntry->d_stat.st_attr & FIO_SO_IFREG) // we found file
+        SaveFile newSaveFile;
+        std::string plik = dirName;
+        plik += DirEntry->d_name;
+
+        struct stat st;
+        if (stat(plik.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+            continue;
+
+        //dont load lmsc files
+        size_t found = plik.find(".lmsc");
+        size_t found2 = plik.find(".LMSc");
+        if(found==std::string::npos && found2==std::string::npos)
         {
-            SaveFile newSaveFile;
-            std::string plik = dirName;
-            plik += DirEntry->d_name;
-            //dont load lmsc files
-            size_t found = plik.find(".lmsc");
-            size_t found2 = plik.find(".LMSc");
-            if(found==std::string::npos && found2==std::string::npos)
-            {
-                newSaveFile.fileName = plik;
-                saveFilesList.push_back(newSaveFile);
-            }
+            newSaveFile.fileName = plik;
+            saveFilesList.push_back(newSaveFile);
         }
     }
 
@@ -3934,6 +4440,736 @@ void StateMenu::ScanSaveFiles(const char* dirName)
     }
 }
 
+static bool SkinFileName(const char* name);
+
+struct SkinVert
+{
+    float u, v, x, y, z;
+};
+
+struct SkinMeshVert
+{
+    float u, v;
+    unsigned int color;
+    float x, y, z;
+};
+
+struct SkinColorVert
+{
+    unsigned int color;
+    float x, y, z;
+};
+
+static std::vector<Aurora::Graphics::Image*> sSkinIcons;
+static Aurora::Graphics::Image* sSkinPreview = NULL;
+static int sSkinPreviewFor = -2;
+static SkinMeshVert* sPlayerMesh = NULL;
+static int sPlayerMeshCount = 0;
+
+static void FreeSkinImage(Aurora::Graphics::Image* image)
+{
+    if(image == NULL)
+        return;
+    if(image->ImageData != NULL && image->vRam == 0)
+        free(image->ImageData);
+    delete image;
+}
+
+static void ClearSkinPreviews()
+{
+    for(size_t i = 0; i < sSkinIcons.size(); i++)
+        FreeSkinImage(sSkinIcons[i]);
+    sSkinIcons.clear();
+    FreeSkinImage(sSkinPreview);
+    sSkinPreview = NULL;
+    sSkinPreviewFor = -2;
+}
+
+// A front view of the whole figure, 16x32, the way the grid tiles show it. Classic sheets have one
+// arm and one leg; the character's left side is that strip mirrored.
+static Aurora::Graphics::Image* MakeBodyIcon(Aurora::Graphics::Image* sheet)
+{
+    if(sheet == NULL || sheet->Swizzle != 0 || sheet->ImageData == NULL)
+        return NULL;
+    const int w = 16;
+    const int h = 32;
+    unsigned int* src = (unsigned int*)sheet->ImageData;
+    int stride = sheet->power2Width;
+    unsigned int* dst = (unsigned int*)memalign(16, w * h * 4);
+    if(dst == NULL)
+        return NULL;
+    memset(dst, 0, w * h * 4);
+
+    // sx, sy, width, height, dx, dy, mirrored
+    const int part[6][7] = {
+        {8,  8,  8, 8,  4,  0,  0},
+        {20, 20, 8, 12, 4,  8,  0},
+        {44, 20, 4, 12, 0,  8,  0},
+        {44, 20, 4, 12, 12, 8,  1},
+        {4,  20, 4, 12, 4,  20, 0},
+        {4,  20, 4, 12, 8,  20, 1}
+    };
+    for(int p = 0; p < 6; p++)
+    {
+        for(int y = 0; y < part[p][3]; y++)
+        {
+            for(int x = 0; x < part[p][2]; x++)
+            {
+                int sx = part[p][6] ? (part[p][0] + part[p][2] - 1 - x) : (part[p][0] + x);
+                dst[(part[p][5] + y) * w + part[p][4] + x] = src[(part[p][1] + y) * stride + sx];
+            }
+        }
+    }
+    sceKernelDcacheWritebackInvalidateRange(dst, w * h * 4);
+    Aurora::Graphics::Image* icon = new Aurora::Graphics::Image();
+    icon->Width = w;
+    icon->Height = h;
+    icon->power2Width = w;
+    icon->power2Height = h;
+    icon->vRam = 0;
+    icon->ColorMode = GU_PSM_8888;
+    icon->Swizzle = 0;
+    icon->ImageData = (unsigned short*)dst;
+    return icon;
+}
+
+static unsigned int SkinShade(float level)
+{
+    int c = (int)(level * 255.0f);
+    return 0xFF000000u | ((unsigned int)c << 16) | ((unsigned int)c << 8) | (unsigned int)c;
+}
+
+// Four corners in the order bottom-left, bottom-right, top-right, top-left as seen from outside
+// the face, so the texture is never mirrored by the corner order.
+static void AddSkinFace(std::vector<SkinMeshVert>& verts, float u, float v, float uw, float vh, unsigned int color,
+    float x0, float y0, float z0, float x1, float y1, float z1,
+    float x2, float y2, float z2, float x3, float y3, float z3)
+{
+    float u0 = u / 64.0f;
+    float v0 = v / 32.0f;
+    float u1 = (u + uw) / 64.0f;
+    float v1 = (v + vh) / 32.0f;
+    SkinMeshVert corner[4];
+    corner[0].u = u0; corner[0].v = v1; corner[0].x = x0; corner[0].y = y0; corner[0].z = z0;
+    corner[1].u = u1; corner[1].v = v1; corner[1].x = x1; corner[1].y = y1; corner[1].z = z1;
+    corner[2].u = u1; corner[2].v = v0; corner[2].x = x2; corner[2].y = y2; corner[2].z = z2;
+    corner[3].u = u0; corner[3].v = v0; corner[3].x = x3; corner[3].y = y3; corner[3].z = z3;
+    for(int i = 0; i < 4; i++)
+        corner[i].color = color;
+    int order[6] = {0, 1, 2, 0, 2, 3};
+    for(int i = 0; i < 6; i++)
+        verts.push_back(corner[order[i]]);
+}
+
+// The figure faces +Z. Its right side is -X. The sheet is laid out right side, front, left side,
+// back, so each face's left texture edge is the edge it shares with the face before it.
+static void AddSkinBox(std::vector<SkinMeshVert>& verts, float u, float v, float x, float y, float z,
+    float w, float h, float d, bool mirrored)
+{
+    const float s = 1.0f / 16.0f;
+    float x0 = x * s, y0 = y * s, z0 = z * s;
+    float x1 = (x + w) * s, y1 = (y + h) * s, z1 = (z + d) * s;
+    size_t first = verts.size();
+
+    AddSkinFace(verts, u + d, v + d, w, h, SkinShade(0.9f),
+        x0, y0, z1,  x1, y0, z1,  x1, y1, z1,  x0, y1, z1);
+    AddSkinFace(verts, u + d + w + d, v + d, w, h, SkinShade(0.9f),
+        x1, y0, z0,  x0, y0, z0,  x0, y1, z0,  x1, y1, z0);
+    AddSkinFace(verts, u, v + d, d, h, SkinShade(0.72f),
+        x0, y0, z0,  x0, y0, z1,  x0, y1, z1,  x0, y1, z0);
+    AddSkinFace(verts, u + d + w, v + d, d, h, SkinShade(0.72f),
+        x1, y0, z1,  x1, y0, z0,  x1, y1, z0,  x1, y1, z1);
+    AddSkinFace(verts, u + d, v, w, d, SkinShade(1.0f),
+        x0, y1, z1,  x1, y1, z1,  x1, y1, z0,  x0, y1, z0);
+    AddSkinFace(verts, u + d + w, v, w, d, SkinShade(0.55f),
+        x0, y0, z0,  x1, y0, z0,  x1, y0, z1,  x0, y0, z1);
+
+    if(mirrored)
+    {
+        float centre = x0 + x1;
+        for(size_t i = first; i < verts.size(); i++)
+            verts[i].x = centre - verts[i].x;
+    }
+}
+
+static void BuildPlayerMesh()
+{
+    if(sPlayerMesh != NULL)
+        return;
+    std::vector<SkinMeshVert> verts;
+    AddSkinBox(verts, 0, 0, -4, 24, -4, 8, 8, 8, false);
+    AddSkinBox(verts, 16, 16, -4, 12, -2, 8, 12, 4, false);
+    AddSkinBox(verts, 40, 16, -8, 12, -2, 4, 12, 4, false);
+    AddSkinBox(verts, 40, 16, 4, 12, -2, 4, 12, 4, true);
+    AddSkinBox(verts, 0, 16, -4, 0, -2, 4, 12, 4, false);
+    AddSkinBox(verts, 0, 16, 0, 0, -2, 4, 12, 4, true);
+    sPlayerMeshCount = (int)verts.size();
+    sPlayerMesh = (SkinMeshVert*)memalign(16, verts.size() * sizeof(SkinMeshVert));
+    if(sPlayerMesh == NULL)
+    {
+        sPlayerMeshCount = 0;
+        return;
+    }
+    memcpy(sPlayerMesh, &verts[0], verts.size() * sizeof(SkinMeshVert));
+    sceKernelDcacheWritebackInvalidateRange(sPlayerMesh, verts.size() * sizeof(SkinMeshVert));
+}
+
+// The GE reads vertices after the call returns, so they come from the display list, never the stack.
+static void DrawScreenRect(float x, float y, float w, float h, unsigned int color)
+{
+    SkinColorVert* v = (SkinColorVert*)sceGuGetMemory(2 * sizeof(SkinColorVert));
+    v[0].color = color; v[0].x = x;     v[0].y = y;     v[0].z = 0;
+    v[1].color = color; v[1].x = x + w; v[1].y = y + h; v[1].z = 0;
+    sceGuDisable(GU_TEXTURE_2D);
+    sceGuDrawArray(GU_SPRITES, GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D, 2, 0, v);
+    sceGuEnable(GU_TEXTURE_2D);
+}
+
+static void BindSheet(Aurora::Graphics::Image* sheet)
+{
+    sceGuEnable(GU_TEXTURE_2D);
+    sceGuTexMode(sheet->ColorMode, 0, 0, sheet->Swizzle);
+    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
+    sceGuTexFilter(GU_NEAREST, GU_NEAREST);
+    sceGuTexWrap(GU_CLAMP, GU_CLAMP);
+    sceGuTexImage(0, sheet->power2Width, sheet->power2Height, sheet->power2Width, sheet->ImageData);
+}
+
+static void DrawIconQuad(Aurora::Graphics::Image* icon, float x, float y, float w, float h)
+{
+    if(icon == NULL || icon->ImageData == NULL)
+        return;
+    BindSheet(icon);
+    SkinVert* v = (SkinVert*)sceGuGetMemory(2 * sizeof(SkinVert));
+    v[0].u = 0;                  v[0].v = 0;                   v[0].x = x;     v[0].y = y;     v[0].z = 0;
+    v[1].u = (float)icon->Width; v[1].v = (float)icon->Height; v[1].x = x + w; v[1].y = y + h; v[1].z = 0;
+    sceGuDrawArray(GU_SPRITES, GU_TEXTURE_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_2D, 2, 0, v);
+    TextureManager::Instance()->InvalidateCurrentTexture();
+}
+
+// One 16x16 cell of a texture-manager sheet, centred on whole pixels (the cells are 1:1 pixel art),
+// turned clockwise by quarterTurns.
+static void DrawSheetCell(int texture, int cellU, int cellV, float cx, float cy, int quarterTurns)
+{
+    TextureManager* tm = TextureManager::Instance();
+    if(texture < 0 || texture >= (int)tm->Images.size())
+        return;
+    Aurora::Graphics::Image* sheet = tm->Images[texture];
+    if(sheet == NULL || sheet->ImageData == NULL)
+        return;
+    BindSheet(sheet);
+
+    float x0 = floorf(cx + 0.5f) - 8.0f;
+    float y0 = floorf(cy + 0.5f) - 8.0f;
+    float sx[4] = {x0, x0 + 16, x0 + 16, x0};
+    float sy[4] = {y0, y0, y0 + 16, y0 + 16};
+    float su[4] = {(float)cellU, (float)cellU + 16, (float)cellU + 16, (float)cellU};
+    float sv[4] = {(float)cellV, (float)cellV, (float)cellV + 16, (float)cellV + 16};
+    int order[6] = {0, 1, 2, 0, 2, 3};
+    SkinVert* v = (SkinVert*)sceGuGetMemory(6 * sizeof(SkinVert));
+    for(int i = 0; i < 6; i++)
+    {
+        int corner = order[i];
+        int from = (corner - quarterTurns + 8) % 4;
+        v[i].u = su[from]; v[i].v = sv[from];
+        v[i].x = sx[corner]; v[i].y = sy[corner]; v[i].z = 0;
+    }
+    sceGuEnable(GU_BLEND);
+    sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
+    sceGuDisable(GU_CULL_FACE);
+    sceGuDrawArray(GU_TRIANGLES, GU_TEXTURE_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_2D, 6, 0, v);
+    sceGuEnable(GU_CULL_FACE);
+    sceGuDisable(GU_BLEND);
+    TextureManager::Instance()->InvalidateCurrentTexture();
+}
+
+static std::string SkinShortName(const std::string& name, size_t longest, bool upper)
+{
+    std::string label = name;
+    if(label.size() > 4)
+    {
+        std::string ext = label.substr(label.size() - 4);
+        if(ext == ".png" || ext == ".PNG")
+            label = label.substr(0, label.size() - 4);
+    }
+    if(label.size() > longest)
+        label = label.substr(0, longest);
+    if(upper)
+    {
+        for(size_t i = 0; i < label.size(); i++)
+        {
+            if(label[i] >= 'a' && label[i] <= 'z')
+                label[i] = (char)(label[i] - 'a' + 'A');
+        }
+    }
+    return label;
+}
+
+static void DrawFrame(float x, float y, float w, float h, float t, unsigned int color)
+{
+    DrawScreenRect(x, y, w, t, color);
+    DrawScreenRect(x, y + h - t, w, t, color);
+    DrawScreenRect(x, y + t, t, h - 2 * t, color);
+    DrawScreenRect(x + w - t, y + t, t, h - 2 * t, color);
+}
+
+void StateMenu::BuildSkinIcons()
+{
+    ClearSkinPreviews();
+    for(int i = 0; i < (int)skinList.size(); i++)
+    {
+        const char* name = (skinList[i] == "Steve") ? "Steve" : skinList[i].c_str();
+        Aurora::Graphics::Image* sheet = TextureHelper::Instance()->LoadPlayerSkinImage(name, 0);
+        sSkinIcons.push_back(MakeBodyIcon(sheet));
+        FreeSkinImage(sheet);
+    }
+}
+
+void StateMenu::DrawSkinStage()
+{
+    const int columns = 4;
+    const int rows = 3;
+    const float gridX = 42.0f;
+    const float gridY = 36.0f;
+    const float tileW = 52.0f;
+    const float tileH = 72.0f;
+    const float stepX = 56.0f;
+    const float stepY = 76.0f;
+    const float viewX = 276.0f;
+    const float viewY = 32.0f;
+    const float viewW = 196.0f;
+    const float viewH = 162.0f;
+    const unsigned int accent = GU_RGBA(96, 214, 72, 255);
+
+    sceGuDisable(GU_DEPTH_TEST);
+    sceGuEnable(GU_BLEND);
+    sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
+    sceGuColor(GU_COLOR(1, 1, 1, 1.0f));
+
+    for(int x = 0; x < 8; x++)
+    {
+        for(int y = 0; y < 5; y++)
+        {
+            backSprite->SetPosition(x * 64, y * 64);
+            backSprite->Draw();
+        }
+    }
+
+    sceGumMatrixMode(GU_MODEL);
+    sceGumLoadIdentity();
+    sceGumMatrixMode(GU_VIEW);
+    sceGumLoadIdentity();
+
+    int count = (int)skinList.size();
+    const char* equipped = TextureHelper::Instance()->PlayerSkinName();
+
+    // Title bar, body, side tabs, grid well, preview stage, info panel.
+    DrawScreenRect(4, 4, 472, 22, GU_RGBA(198, 198, 198, 255));
+    DrawScreenRect(4, 24, 472, 2, GU_RGBA(120, 120, 120, 255));
+    DrawScreenRect(396, 8, 76, 14, GU_RGBA(70, 70, 74, 255));
+    DrawScreenRect(4, 26, 472, 242, GU_RGBA(44, 44, 48, 240));
+    DrawScreenRect(8, 32, 28, 232, GU_RGBA(58, 58, 64, 255));
+    DrawScreenRect(40, 32, 232, 232, GU_RGBA(26, 26, 30, 255));
+    DrawScreenRect(viewX, viewY, viewW, viewH, GU_RGBA(14, 16, 14, 255));
+    DrawScreenRect(viewX, 198, viewW, 66, GU_RGBA(30, 30, 34, 255));
+    DrawFrame(viewX, 198, viewW, 66, 1, GU_RGBA(80, 80, 86, 255));
+
+    for(int tab = 0; tab < 2; tab++)
+    {
+        float ty = 38.0f + tab * 30.0f;
+        unsigned int fill = (tab == 0) ? GU_RGBA(96, 96, 104, 255) : GU_RGBA(72, 72, 78, 255);
+        DrawScreenRect(10, ty, 24, 24, fill);
+        if(skinFocus == 2 && skinTab == tab)
+            DrawFrame(9, ty - 1, 26, 26, 2, accent);
+    }
+    int equippedIndex = 0;
+    for(int i = 0; i < count; i++)
+    {
+        if(equipped != NULL && skinList[i] == equipped)
+            equippedIndex = i;
+    }
+    if(equippedIndex < (int)sSkinIcons.size())
+        DrawIconQuad(sSkinIcons[equippedIndex], 16, 40, 10, 20);
+
+    for(int shown = 0; shown < columns * rows; shown++)
+    {
+        int index = skinStart * columns + shown;
+        if(index >= count)
+            break;
+        float x = gridX + (shown % columns) * stepX;
+        float y = gridY + (shown / columns) * stepY;
+        DrawScreenRect(x, y, tileW, tileH, GU_RGBA(72, 72, 78, 255));
+        DrawScreenRect(x + 2, y + 2, tileW - 4, tileH - 4, GU_RGBA(92, 92, 98, 255));
+        if(index < (int)sSkinIcons.size())
+            DrawIconQuad(sSkinIcons[index], x + 10, y + 4, 32, 64);
+        if(index == equippedIndex)
+            DrawScreenRect(x + tileW - 9, y + 3, 6, 6, accent);
+        if(index == skinPos)
+        {
+            unsigned int ring = (skinFocus == 0) ? accent : GU_RGBA(60, 130, 50, 255);
+            DrawFrame(x - 1, y - 1, tileW + 2, tileH + 2, 3, ring);
+        }
+    }
+
+    if(skinFocus == 1)
+        DrawFrame(viewX, viewY, viewW, viewH, 2, accent);
+
+    unsigned int equipFill = (skinFocus == 1) ? accent : GU_RGBA(70, 70, 76, 255);
+    DrawScreenRect(viewX + 4, 238, 94, 22, equipFill);
+    DrawScreenRect(viewX + 102, 238, 90, 22, GU_RGBA(200, 200, 200, 255));
+
+    if(skinPos != sSkinPreviewFor)
+    {
+        FreeSkinImage(sSkinPreview);
+        sSkinPreview = NULL;
+        sSkinPreviewFor = skinPos;
+        if(skinPos >= 0 && skinPos < count)
+        {
+            const char* name = (skinList[skinPos] == "Steve") ? "Steve" : skinList[skinPos].c_str();
+            sSkinPreview = TextureHelper::Instance()->LoadPlayerSkinImage(name, 1);
+        }
+    }
+
+    if(sSkinPreview != NULL && sSkinPreview->ImageData != NULL)
+    {
+        BuildPlayerMesh();
+        if(sPlayerMesh != NULL)
+        {
+            // Depth decides which face is in front, so the faces can be submitted in any order and
+            // with culling off. Writes have to be on for that; the menu does not promise either.
+            sceGuEnable(GU_DEPTH_TEST);
+            sceGuDepthFunc(GU_GEQUAL);
+            sceGuDepthMask(0);
+            sceGuDisable(GU_CULL_FACE);
+            sceGuDisable(GU_BLEND);
+            sceGuEnable(GU_ALPHA_TEST);
+            sceGuAlphaFunc(GU_GREATER, 0x10, 0xff);
+            sceGuEnable(GU_TEXTURE_2D);
+            sceGuTexMode(sSkinPreview->ColorMode, 0, 0, sSkinPreview->Swizzle);
+            sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGBA);
+            sceGuTexFilter(GU_NEAREST, GU_NEAREST);
+            sceGuTexWrap(GU_CLAMP, GU_CLAMP);
+            sceGuTexImage(0, sSkinPreview->power2Width, sSkinPreview->power2Height, sSkinPreview->power2Width, sSkinPreview->ImageData);
+            sceGuColor(0xFFFFFFFF);
+            sceGuScissor((int)viewX + 2, (int)viewY + 2, (int)(viewX + viewW) - 2, (int)(viewY + viewH) - 2);
+
+            // About 125 px tall, raised clear of the hint line, looking slightly down at it.
+            sceGumMatrixMode(GU_PROJECTION);
+            sceGumLoadIdentity();
+            sceGumPerspective(28.0f, 480.0f / 272.0f, 0.5f, 30.0f);
+            sceGumMatrixMode(GU_VIEW);
+            sceGumLoadIdentity();
+            sceGumMatrixMode(GU_MODEL);
+            sceGumLoadIdentity();
+            ScePspFVector3 place = {2.2f, 0.49f, -9.0f};
+            sceGumTranslate(&place);
+            sceGumRotateX(0.14f);
+            sceGumRotateY(skinSpin);
+            ScePspFVector3 centre = {0.0f, -1.0f, 0.0f};
+            sceGumTranslate(&centre);
+            sceGumDrawArray(GU_TRIANGLES, GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D, sPlayerMeshCount, 0, sPlayerMesh);
+
+            sceGuScissor(0, 0, 480, 272);
+            sceGuDisable(GU_ALPHA_TEST);
+            sceGuEnable(GU_CULL_FACE);
+            mRender->SetOrtho(0, 0, 0, 0, 0, 0);
+            TextureManager::Instance()->InvalidateCurrentTexture();
+            sceGuDisable(GU_DEPTH_TEST);
+            sceGuEnable(GU_BLEND);
+            sceGuColor(GU_COLOR(1, 1, 1, 1));
+        }
+    }
+
+    // Text over the stage would fail the depth test against the figure.
+    sceGuDisable(GU_BLEND);
+    sceGuDisable(GU_DEPTH_TEST);
+
+    // Each label's y is its box's centre plus 9 (0.5 text) or 7 (0.35 text); see DrawPrompt.
+    const int stageX = (int)(viewX + viewW / 2);
+    DrawText(64, 24, GU_COLOR(0.2f, 0.2f, 0.2f, 1), default_size, "Skins");
+    DrawText(434, 22, GU_COLOR(1, 1, 1, 1), default_small_size, "%d skin%s", count, count == 1 ? "" : "s");
+    DrawText(22, 88, GU_COLOR(1, 1, 1, 1), default_size, "+");
+
+    int totalRows = (count + columns - 1) / columns;
+    if(totalRows > rows)
+        DrawText(240, 22, GU_COLOR(0.25f, 0.25f, 0.25f, 1), default_small_size, "row %d of %d", skinStart + 1, totalRows - rows + 1);
+
+    if(skinPos >= 0 && skinPos < count)
+    {
+        std::string name = SkinShortName(skinList[skinPos], 16, true);
+        DrawText(stageX, 217, GU_COLOR(1, 1, 1, 1), default_size, "%s", name.c_str());
+        if(skinMessage.size() > 0)
+            DrawText(stageX, 231, GU_COLOR(1, 0.8f, 0.4f, 1), default_small_size, "%s", skinMessage.c_str());
+        else if(equipped != NULL && skinList[skinPos] == equipped)
+            DrawText(stageX, 231, GU_COLOR(0.45f, 0.9f, 0.35f, 1), default_small_size, "Equipped");
+        else if(skinList[skinPos] == "Steve")
+            DrawText(stageX, 231, GU_COLOR(0.8f, 0.8f, 0.8f, 1), default_small_size, "Built in");
+        else
+            DrawText(stageX, 231, GU_COLOR(0.8f, 0.8f, 0.8f, 1), default_small_size, "From your Skins folder");
+    }
+    DrawPrompt((int)viewX + 51, 258, GU_COLOR(1, 1, 1, 1), default_size, "{X} Equip");
+    DrawPrompt((int)viewX + 147, 258, GU_COLOR(0.2f, 0.2f, 0.2f, 1), default_size, "{S} Import");
+
+    if(skinFocus == 1)
+        DrawPrompt(stageX, (int)(viewY + viewH) - 3, GU_COLOR(0.85f, 0.85f, 0.85f, 1), default_size, "{<}{>} Turn      {O} Back");
+    else if(skinFocus == 0)
+        DrawPrompt(stageX, (int)(viewY + viewH) - 3, GU_COLOR(0.7f, 0.7f, 0.7f, 1), default_size, "{X} View");
+
+    sceGuEnable(GU_DEPTH_TEST);
+}
+
+void StateMenu::OpenSkinImport()
+{
+    skinBrowsePath = "ms0:/";
+    ScanSkinImport();
+    if(skinBrowseNames.empty())
+    {
+        skinBrowsePath = "ef0:/";
+        ScanSkinImport();
+        if(skinBrowseNames.empty())
+        {
+            skinBrowsePath = "ms0:/";
+            skinMessage = "Nothing to import on the memory stick";
+        }
+    }
+    skinBrowsePos = 0;
+    skinBrowseStart = 0;
+    menuState = 14;
+}
+
+void StateMenu::ScanSkinImport()
+{
+    skinBrowseNames.clear();
+    skinBrowseDir.clear();
+    skinBrowsePos = 0;
+    skinBrowseStart = 0;
+
+    SceUID dir = sceIoDopen(skinBrowsePath.c_str());
+    if(dir < 0)
+        return;
+
+    SceIoDirent ent;
+    int kept = 0;
+    while(kept < 180)
+    {
+        memset(&ent, 0, sizeof(ent));
+        if(sceIoDread(dir, &ent) <= 0)
+            break;
+        if(ent.d_name[0] == '.')
+            continue;
+        std::string child = skinBrowsePath + ent.d_name;
+        SceUID sub = sceIoDopen(child.c_str());
+        if(sub >= 0)
+        {
+            sceIoDclose(sub);
+            skinBrowseNames.push_back(ent.d_name);
+            skinBrowseDir.push_back(1);
+            kept++;
+            continue;
+        }
+        if(SkinFileName(ent.d_name))
+        {
+            skinBrowseNames.push_back(ent.d_name);
+            skinBrowseDir.push_back(0);
+            kept++;
+        }
+    }
+    sceIoDclose(dir);
+}
+
+void StateMenu::ImportHighlightedSkin()
+{
+    if(skinBrowsePos < 0 || skinBrowsePos >= (int)skinBrowseNames.size())
+        return;
+    if(skinBrowseDir[skinBrowsePos])
+        return;
+
+    const std::string& base = skinBrowseNames[skinBrowsePos];
+    std::string src = skinBrowsePath + base;
+    std::string dst = std::string("Skins/") + base;
+
+    SceUID in = sceIoOpen(src.c_str(), PSP_O_RDONLY, 0);
+    if(in < 0)
+    {
+        skinMessage = "Could not read that file";
+        menuState = 13;
+        return;
+    }
+    SceUID out = sceIoOpen(dst.c_str(), PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    if(out < 0)
+    {
+        sceIoClose(in);
+        skinMessage = "Could not copy into Skins";
+        menuState = 13;
+        return;
+    }
+
+    char block[4096];
+    int total = 0;
+    bool tooBig = false;
+    while(1)
+    {
+        int got = sceIoRead(in, block, sizeof(block));
+        if(got < 0)
+        {
+            tooBig = true;
+            break;
+        }
+        if(got == 0)
+            break;
+        total += got;
+        if(total > 256 * 1024)
+        {
+            tooBig = true;
+            break;
+        }
+        if(sceIoWrite(out, block, got) != got)
+        {
+            tooBig = true;
+            break;
+        }
+    }
+    sceIoClose(in);
+    sceIoClose(out);
+
+    if(tooBig)
+    {
+        sceIoRemove(dst.c_str());
+        skinMessage = "That file is not a skin";
+        menuState = 13;
+        return;
+    }
+
+    if(TextureHelper::Instance()->SetPlayerSkin(base.c_str()) == false)
+    {
+        sceIoRemove(dst.c_str());
+        skinMessage = "That file is not a 64x32 or 64x64 skin";
+        menuState = 13;
+        return;
+    }
+
+    ScanSkins();
+    skinPos = 0;
+    for(int i = 0; i < (int)skinList.size(); i++)
+    {
+        if(skinList[i] == base)
+            skinPos = i;
+    }
+    skinMessage = std::string("Imported ") + base;
+    menuState = 13;
+}
+
+void StateMenu::DrawSkinImport()
+{
+    sceGuDisable(GU_DEPTH_TEST);
+    sceGuEnable(GU_BLEND);
+    sceGuColor(GU_COLOR(1, 1, 1, 1.0f));
+
+    for(int x = 0; x < 8; x++)
+    {
+        for(int y = 0; y < 5; y++)
+        {
+            backSprite->SetPosition(x * 64, y * 64);
+            backSprite->Draw();
+        }
+    }
+
+    sceGumMatrixMode(GU_MODEL);
+    sceGumLoadIdentity();
+    sceGumMatrixMode(GU_VIEW);
+    sceGumLoadIdentity();
+
+    const unsigned int accent = GU_RGBA(96, 214, 72, 255);
+    DrawScreenRect(4, 4, 472, 22, GU_RGBA(198, 198, 198, 255));
+    DrawScreenRect(4, 24, 472, 2, GU_RGBA(120, 120, 120, 255));
+    DrawScreenRect(4, 26, 472, 242, GU_RGBA(44, 44, 48, 240));
+    DrawScreenRect(12, 32, 456, 18, GU_RGBA(26, 26, 30, 255));
+    DrawScreenRect(12, 54, 456, 186, GU_RGBA(26, 26, 30, 255));
+
+    int shown = 0;
+    for(int i = skinBrowseStart; i < (int)skinBrowseNames.size() && shown < 6; i++, shown++)
+    {
+        float rowY = 58.0f + shown * 30.0f;
+        DrawScreenRect(16, rowY, 448, 26, (i == skinBrowsePos) ? GU_RGBA(92, 92, 98, 255) : GU_RGBA(60, 60, 66, 255));
+        if(i == skinBrowsePos)
+            DrawFrame(15, rowY - 1, 450, 28, 2, accent);
+    }
+
+    sceGuDisable(GU_BLEND);
+
+    DrawText(120, 24, GU_COLOR(0.2f, 0.2f, 0.2f, 1), default_size, "Import from memory stick");
+    const char* path = skinBrowsePath.c_str();
+    if(skinBrowsePath.size() > 60)
+        path = skinBrowsePath.c_str() + skinBrowsePath.size() - 60;
+    DrawText(240, 48, GU_COLOR(0.8f, 0.8f, 0.8f, 1), default_small_size, "%s", path);
+
+    shown = 0;
+    for(int i = skinBrowseStart; i < (int)skinBrowseNames.size() && shown < 6; i++, shown++)
+    {
+        int rowY = 80 + shown * 30;
+        unsigned int color = (i == skinBrowsePos) ? GU_COLOR(1, 1, 1, 1) : GU_COLOR(0.8f, 0.8f, 0.8f, 1);
+        std::string label = skinBrowseNames[i];
+        if(skinBrowseDir[i])
+            label += "/";
+        if(label.size() > 40)
+            label = label.substr(0, 40);
+        DrawText(240, rowY, color, default_size, "%s", label.c_str());
+    }
+    if(skinBrowseNames.empty())
+        DrawText(240, 140, GU_COLOR(1, 1, 1, 1), default_size, "No skins in this folder");
+    DrawPrompt(240, 263, GU_COLOR(1, 1, 1, 1), default_size, "{X} Open or import      {O} Up a folder");
+
+    sceGuEnable(GU_DEPTH_TEST);
+}
+
+static bool SkinFileName(const char* name)
+{
+    int n = 0;
+    while(name[n] != 0)
+        n++;
+    if(n < 5)
+        return false;
+    const char* e = name + n - 4;
+    if(e[0] != '.')
+        return false;
+    char a = e[1];
+    char b = e[2];
+    char c = e[3];
+    if(a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+    if(b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+    if(c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+    return a == 'p' && b == 'n' && c == 'g';
+}
+
+void StateMenu::ScanSkins()
+{
+    skinList.clear();
+    skinList.push_back("Steve");
+
+    DIR* dir = opendir("Skins");
+    if(dir == NULL)
+    {
+        BuildSkinIcons();
+        return;
+    }
+
+    struct dirent* entry;
+    while((entry = readdir(dir)) != NULL)
+    {
+        if(entry->d_name[0] == '.')
+            continue;
+        if(SkinFileName(entry->d_name) == false)
+            continue;
+        std::string full = std::string("Skins/") + entry->d_name;
+        struct stat st;
+        if(stat(full.c_str(), &st) != 0 || S_ISDIR(st.st_mode))
+            continue;
+        skinList.push_back(entry->d_name);
+    }
+    closedir(dir);
+    BuildSkinIcons();
+}
+
 void StateMenu::ScanTexturePacks(const char* dirName)
 {
     if(texturePackList.empty() != false)
@@ -3955,20 +5191,24 @@ void StateMenu::ScanTexturePacks(const char* dirName)
     int TPcheck = 0;
 
     DIR *dir = opendir(dirName);
-    struct dirent *entry;
+    if (dir == NULL)
+        return;
 
+    struct dirent *entry;
     while((entry = readdir(dir)) != NULL)
     {
-        if (FIO_SO_ISDIR(entry->d_stat.st_attr))
+        std::string plik = entry->d_name;
+        std::string fullPath = std::string(dirName) + plik;
+
+        struct stat st;
+        if (stat(fullPath.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
         {
-            std::string plik = "";
-            plik += entry->d_name;
 
             size_t found = plik.find(".");
             size_t found2 = plik.find("..");
             size_t found3 = plik.find(".svn");
 
-            if(found==std::string::npos && found2==std::string::npos && found3==std::string::npos)//�� �������
+            if(found==std::string::npos && found2==std::string::npos && found3==std::string::npos)//ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ­ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ¥ ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ­ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ©ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ¤ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ¥ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ­ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ®
             {
                 TP newTP;
 
@@ -4048,8 +5288,106 @@ int StateMenu::fileSize (const std::string& name)
     return rc == 0 ? (int)stat_buf.st_size : -1;
 }
 
+void StateMenu::DrawPrompt(int cx, int y, unsigned int color, float size, const char* spec)
+{
+    struct PromptPart
+    {
+        char icon;
+        std::string text;
+        float width;
+    };
+    int buttons = TextureHelper::Instance()->GetTexture(TextureHelper::buttonIconsTexture);
+    int dpad = TextureHelper::Instance()->GetTexture(TextureHelper::dpadTexture);
+
+    std::vector<PromptPart> parts;
+    PromptPart run;
+    run.icon = 0;
+    run.width = 0;
+    for(const char* c = spec; *c != 0; c++)
+    {
+        if(c[0] == '{' && c[1] != 0 && c[2] == '}')
+        {
+            char code = c[1];
+            c += 2;
+            bool face = (code == 'X' || code == 'O' || code == 'S' || code == 'T');
+            bool arrow = (code == '<' || code == '>');
+            if((face && buttons >= 0) || (arrow && dpad >= 0))
+            {
+                if(!run.text.empty())
+                    parts.push_back(run);
+                run.text.clear();
+                if(!parts.empty() && parts.back().icon != 0)
+                {
+                    PromptPart gap;
+                    gap.icon = ' ';
+                    gap.width = 4.0f;
+                    parts.push_back(gap);
+                }
+                PromptPart icon;
+                icon.icon = code;
+                icon.width = face ? 12.0f : 16.0f;
+                parts.push_back(icon);
+            }
+            else if(code == 'S')
+                run.text += "[]";
+            else if(code == 'T')
+                run.text += "/\\";
+            else
+                run.text += code;
+            continue;
+        }
+        run.text += *c;
+    }
+    if(!run.text.empty())
+        parts.push_back(run);
+
+    // Measured at the size it is drawn; GetTextWidth measures at the current font style.
+    mRender->SetFontStyle(size, color, 0, 0x00000000);
+    float total = 0;
+    for(size_t i = 0; i < parts.size(); i++)
+    {
+        if(parts[i].icon == 0)
+            parts[i].width = (float)mRender->GetTextWidth(parts[i].text.c_str());
+        total += parts[i].width;
+    }
+
+    // Where a line of this font sits relative to y, measured on the menu: 9 px up at 0.5, 7 at 0.35.
+    float iconY = (float)y - ((size >= 0.45f) ? 9.0f : 7.0f);
+    float x = (float)cx - total * 0.5f;
+    for(size_t i = 0; i < parts.size(); i++)
+    {
+        const PromptPart& part = parts[i];
+        float mid = x + part.width * 0.5f;
+        switch(part.icon)
+        {
+            case 'T': DrawSheetCell(buttons, 0, 0, mid, iconY, 0); break;
+            case 'O': DrawSheetCell(buttons, 16, 0, mid, iconY, 0); break;
+            case 'X': DrawSheetCell(buttons, 32, 0, mid, iconY, 0); break;
+            case 'S': DrawSheetCell(buttons, 48, 0, mid, iconY, 0); break;
+            case '>': DrawSheetCell(dpad, 0, 0, mid, iconY, 1); break;
+            case '<': DrawSheetCell(dpad, 0, 0, mid, iconY, 3); break;
+            case ' ': break;
+            default:
+                mRender->SetFontStyle(size, GU_COLOR(0.1f, 0.1f, 0.1f, 1), 0, 0x00000000);
+                mRender->DebugPrint((int)x + 1, y + 1, "%s", part.text.c_str());
+                mRender->SetFontStyle(size, color, 0, 0x00000000);
+                mRender->DebugPrint((int)x, y, "%s", part.text.c_str());
+                break;
+        }
+        x += part.width;
+    }
+}
+
 void StateMenu::DrawText(int x,int y, unsigned int color, float size, const char *message, ...)
 {
+    va_list argList;
+    char cbuffer[512];
+    va_start(argList, message);
+    vsnprintf(cbuffer, 512, message, argList);
+    va_end(argList);
+
+    mRender->SetFontStyle(size,GU_COLOR(0.1f,0.1f,0.1f,1),0,0x00000200|0x00000000);
+    mRender->DebugPrint(x+1,y+1,"%s",cbuffer);
     mRender->SetFontStyle(size,color,0,0x00000200|0x00000000);
-    mRender->DebugPrint(x,y,message);
+    mRender->DebugPrint(x,y,"%s",cbuffer);
 }

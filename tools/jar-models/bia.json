@@ -1,0 +1,126 @@
+{
+  "obfuscatedClass": "bia",
+  "jar": "C:\\Users\\minec\\AppData\\Roaming\\.minecraft\\versions\\1.7.3\\1.7.3.jar",
+  "note": "extracted from 1.7.3 bytecode; bone names are not recoverable, so boxes are reported in declaration order",
+  "boxes": [
+    {
+      "uv": [
+        0,
+        0
+      ],
+      "origin": [
+        -6.0,
+        -5.0,
+        0.0
+      ],
+      "size": [
+        6,
+        10,
+        0
+      ],
+      "expand": 0.0
+    },
+    {
+      "uv": [
+        0,
+        0
+      ],
+      "origin": [
+        0.0,
+        -5.0,
+        0.0
+      ],
+      "size": [
+        6,
+        10,
+        0
+      ],
+      "expand": 0.0
+    },
+    {
+      "uv": [
+        0,
+        0
+      ],
+      "origin": [
+        -1.0,
+        -5.0,
+        0.0
+      ],
+      "size": [
+        2,
+        10,
+        0
+      ],
+      "expand": 0.0
+    },
+    {
+      "uv": [
+        0,
+        0
+      ],
+      "origin": [
+        0.0,
+        -4.0,
+        -0.99
+      ],
+      "size": [
+        5,
+        8,
+        1
+      ],
+      "expand": 0.0
+    },
+    {
+      "uv": [
+        0,
+        0
+      ],
+      "origin": [
+        0.0,
+        -4.0,
+        -0.01
+      ],
+      "size": [
+        5,
+        8,
+        1
+      ],
+      "expand": 0.0
+    },
+    {
+      "uv": [
+        0,
+        0
+      ],
+      "origin": [
+        0.0,
+        -4.0,
+        0.0
+      ],
+      "size": [
+        5,
+        8,
+        0
+      ],
+      "expand": 0.0
+    },
+    {
+      "uv": [
+        0,
+        0
+      ],
+      "origin": [
+        0.0,
+        -4.0,
+        0.0
+      ],
+      "size": [
+        5,
+        8,
+        0
+      ],
+      "expand": 0.0
+    }
+  ]
+}

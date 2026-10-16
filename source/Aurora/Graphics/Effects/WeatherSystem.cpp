@@ -1,7 +1,7 @@
 #include <Aurora/Graphics/Effects/WeatherSystem.h>
 #include <Aurora/Graphics/TextureManager.h>
 #include <Scripts/CraftWorld2.h>
-#include <Aurora/Graphics/TextureManager.h>
+#include <Scripts/WorldGenerator.h>
 
 #define PI 3.1415926535897f
 #define DEG_TO_RAD (PI / 180.0f)
@@ -197,7 +197,12 @@ void WeatherSystem::Render(CraftWorld* mWorld, Frustum &camFrustum, float camera
         sceGuEnable(GU_ALPHA_TEST);
         sceGuEnable(GU_BLEND);
 
-        if(mWorld->snowBiomeRadius != -1 && (mWorld->FastDistance2d(abs(playerPosition.x-mWorld->snowBiomePosition.x), abs(playerPosition.z-mWorld->snowBiomePosition.z)) <= mWorld->snowBiomeRadius))
+        bool inSnow = false;
+        if(mWorld->worldGen)
+            inSnow = mWorld->worldGen->BiomeAt((int)playerPosition.x, (int)playerPosition.z, mWorld->worldType) == WorldGenerator::BIOME_SNOW;
+        else if(mWorld->snowBiomeRadius != -1)
+            inSnow = mWorld->FastDistance2d(abs(playerPosition.x-mWorld->snowBiomePosition.x), abs(playerPosition.z-mWorld->snowBiomePosition.z)) <= mWorld->snowBiomeRadius;
+        if(inSnow)
         {
             raindrop = itIsRaining = false;
             snowflake = itIsSnowing = true;
@@ -282,21 +287,15 @@ void WeatherSystem::Render(CraftWorld* mWorld, Frustum &camFrustum, float camera
                     float light = mWorld->BlockFinalLight(x,y+2,z);
                     MatrixColor(GU_COLOR(light,light,light,textureAlpha));
 
-                    if(camera_angle < 1.35)
-                    {
-                        MatrixPush();
-                        MatrixTranslation(Vector3(x,y,z));
-                        RenderPlane(shiftX, shiftY, shiftZ);
-                        MatrixPop();
-                    }
+                    MatrixPush();
+                    MatrixTranslation(Vector3(x,y,z));
+                    RenderPlane(shiftX, shiftY, shiftZ);
+                    MatrixPop();
 
-                    if(camera_angle > 0.9 || y+4 < playerPosition.y)
-                    {
-                        MatrixPush();
-                        MatrixTranslation(Vector3(x,y+4.0f,z));
-                        RenderPlane(shiftX, shiftY, shiftZ);
-                        MatrixPop();
-                    }
+                    MatrixPush();
+                    MatrixTranslation(Vector3(x,y+4.0f,z));
+                    RenderPlane(shiftX, shiftY, shiftZ);
+                    MatrixPop();
 
                     sceGuTexOffset(0.0f,0.0f);
                     sceGuTexWrap(GU_CLAMP,GU_CLAMP);

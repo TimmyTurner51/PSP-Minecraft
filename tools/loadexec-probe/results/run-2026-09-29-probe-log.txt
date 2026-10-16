@@ -1,0 +1,29 @@
+
+
+================ run 1 ================
+cwd                : "ms0:/PSP/GAME/MCPSP LoadExec Probe"
+resuming from case : 0 of 8 (fresh start)
+payload ctor marker: absent
+payload main marker: absent
+
+--- case 0: control: sceKernelLoadExec, param=NULL
+    target="PAYLOAD.PBP"  key=(null)  param=NULL  argv=(null)  apitype=0x0  absolute=no
+    returned 0x80020149 (-2147352247)
+
+--- case 1: control: sceKernelLoadExec, key=NULL
+    target="PAYLOAD.PBP"  key=(null)  param=filled  argv=(null)  apitype=0x0  absolute=no
+    returned 0x80020149 (-2147352247)
+
+--- case 2: sctrl apitype=0x141 (MS2), abs TARGET/EBOOT.PBP, key="game"
+    target="ms0:/PSP/GAME/MCPSP LoadExec Probe/TARGET/EBOOT.PBP"  key=game  param=filled  argv=(null)  apitype=0x141  absolute=yes
+
+
+================ run 2 ================
+cwd                : "ms0:/PSP/GAME/MCPSP LoadExec Probe"
+resuming from case : 3 of 8 (state file found)
+payload ctor marker: PRESENT
+payload main marker: PRESENT
+*** the PREVIOUS run launched the payload: the handoff works. See ms0:/loadexec-payload.txt
+
+--- case 3: sctrl apitype=0x141 (MS2), abs TARGET/EBOOT.PBP, key=NULL
+    target="ms0:/PSP/GAME/MCPSP LoadExec Probe/TARGET/EBOOT.PBP"  key=(null)  param=filled  argv=(null)  apitype=0x141  absolute=yes

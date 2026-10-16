@@ -18,7 +18,9 @@ namespace Aurora
 			Destroyer();
 			~Destroyer();
 
-			void Update(float stad, CraftWorld* crft, int blockId);
+			// Cell coordinates, so the shape can be asked of the world: a button's box depends on the
+			// facing and pressed state stored in the cell, not just on the block id.
+			void Update(float stad, CraftWorld* crft, int blockId, int cellX, int cellY, int cellZ);
 			void Render(float stad);
 
 		private:

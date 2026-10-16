@@ -28,6 +28,11 @@ public:
 class InputHelper
 {
 public:
+	static const int ACTION_COUNT = 18;
+	static const int ACTION_CHAT = 16;
+	static const int ACTION_SNEAK = 17;
+	static const int BUTTON_COUNT = 16;
+
 	InputHelper();
 	~InputHelper();
 
@@ -51,9 +56,9 @@ public:
 
 private:
 
-	std::string actionNames[16];
-	std::string buttonNames[16];
-	InputConection connections[16];
+	std::string actionNames[ACTION_COUNT];
+	std::string buttonNames[BUTTON_COUNT];
+	InputConection connections[ACTION_COUNT];
 };
 
 #endif

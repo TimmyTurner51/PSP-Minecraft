@@ -1,0 +1,41 @@
+{
+  "obfuscatedClass": "big",
+  "jar": "C:\\Users\\minec\\AppData\\Roaming\\.minecraft\\versions\\1.7.3\\1.7.3.jar",
+  "note": "extracted from 1.7.3 bytecode; bone names are not recoverable, so boxes are reported in declaration order",
+  "boxes": [
+    {
+      "uv": [
+        0,
+        0
+      ],
+      "origin": [
+        -8.0,
+        -8.0,
+        -8.0
+      ],
+      "size": [
+        16,
+        16,
+        16
+      ],
+      "expand": 0.0
+    },
+    {
+      "uv": [
+        0,
+        0
+      ],
+      "origin": [
+        -1.0,
+        0.0,
+        -1.0
+      ],
+      "size": [
+        2,
+        null,
+        2
+      ],
+      "expand": 0.0
+    }
+  ]
+}

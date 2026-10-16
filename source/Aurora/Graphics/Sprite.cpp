@@ -304,6 +304,32 @@ namespace Aurora
 
 		void Sprite::Alpha(float _alpha)
 		{
+			alpha = _alpha;
+			if(alpha < 0.0f)
+				alpha = 0.0f;
+			if(alpha > 1.0f)
+				alpha = 1.0f;
+		}
+
+		// TextureManager::SetTexture leaves the texture function on GU_TFX_REPLACE, which replaces the
+		// fragment with the texel and so ignores the vertex colour -- including any alpha in it. A
+		// sprite that asked for an alpha therefore switches to MODULATE for its own draw and tints the
+		// texel by the current colour instead. That only works while the texture is already bound:
+		// SetTexture only touches the texture function when the texture number actually changes, so
+		// the state has to be put back by hand afterwards, or the next sprite to draw the same texture
+		// would inherit MODULATE with a stale colour.
+		void Sprite::ApplyAlpha(bool tint)
+		{
+			if(tint == true)
+			{
+				sceGuTexFunc(GU_TFX_MODULATE,GU_TCC_RGBA);
+				sceGuColor(GU_COLOR(1.0f,1.0f,1.0f,alpha));
+			}
+			else
+			{
+				sceGuTexFunc(GU_TFX_REPLACE,GU_TCC_RGBA);
+				sceGuColor(0xFFFFFFFF);
+			}
 		}
 
 		void Sprite::RGB(float _red, float _green, float _blue)
@@ -320,7 +346,14 @@ namespace Aurora
 			sceGuEnable(GU_TEXTURE_2D);
 			TextureManager::Instance()->SetTexture(imageNumber,GU_NEAREST,GU_NEAREST);
 
+			const bool tinted = (alpha < 1.0f);
+			if(tinted == true)
+				ApplyAlpha(true);
+
 			sceGumDrawArray(GU_TRIANGLE_STRIP,GU_TEXTURE_32BITF|GU_VERTEX_32BITF|GU_TRANSFORM_3D, 4, 0, vertices);
+
+			if(tinted == true)
+				ApplyAlpha(false);
 
 			sceGuDisable(GU_TEXTURE_2D);
 			sceGumPopMatrix();
@@ -336,7 +369,14 @@ namespace Aurora
 			sceGuEnable(GU_TEXTURE_2D);
 			TextureManager::Instance()->SetTexture(imageNumber,GU_LINEAR,GU_LINEAR);
 
+			const bool tinted = (alpha < 1.0f);
+			if(tinted == true)
+				ApplyAlpha(true);
+
 			sceGumDrawArray(GU_TRIANGLE_STRIP,GU_TEXTURE_32BITF|GU_VERTEX_32BITF|GU_TRANSFORM_3D, 4, 0, vertices);
+
+			if(tinted == true)
+				ApplyAlpha(false);
 
 			sceGuDisable(GU_TEXTURE_2D);
 			sceGumPopMatrix();
@@ -352,7 +392,14 @@ namespace Aurora
 			sceGuEnable(GU_TEXTURE_2D);
 			TextureManager::Instance()->SetConstTexture(imageNumber,GU_NEAREST,GU_NEAREST);
 
+			const bool tinted = (alpha < 1.0f);
+			if(tinted == true)
+				ApplyAlpha(true);
+
 			sceGumDrawArray(GU_TRIANGLE_STRIP,GU_TEXTURE_32BITF|GU_VERTEX_32BITF|GU_TRANSFORM_3D, 4, 0, vertices);
+
+			if(tinted == true)
+				ApplyAlpha(false);
 
 			sceGuDisable(GU_TEXTURE_2D);
 			sceGumPopMatrix();

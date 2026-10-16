@@ -14,6 +14,11 @@
 #include "oslib.h"
 #include "audio.h"
 
+// The mixer is the first float-heavy code that runs on a thread other than the main one, and COP1
+// control is per-thread: see Scripts/FpuControl.h for why the mixer thread has to clear the FPU
+// exception enables itself rather than relying on main() having done it.
+#include "Scripts/FpuControl.h"
+
 /*
 	*************************
 */
@@ -40,11 +45,11 @@ volatile int osl_audioActive[OSL_NUM_AUDIO_CHANNELS];
   osl_audioVoices[channel].volumeLeft  = left;
 }*/
 
-void oslAudioChannelThreadCallback(int channel, void *buf, unsigned int reqn)
-{
-	void (*callback)(unsigned int channel, void *buf, unsigned int reqn);
-	callback=AudioStatus[channel].callback;
-}
+/* oslAudioChannelThreadCallback() used to sit here. It had been gutted -- it declared a local function
+   pointer, assigned AudioStatus[channel].callback to it, and never called it -- and nothing referenced
+   it either. oslAudioChannelThread (below) does the invoke inline and correctly guards it with
+   "if (callback && ...)". Removed rather than left in place, because a function with exactly the right
+   name for the callback path that does nothing is worse than no function at all. */
 
 
 void oslAudioSetChannelCallback(int channel, void *callback)
@@ -63,8 +68,15 @@ int oslAudioOutBlocking(unsigned int channel, unsigned int vol1, unsigned int vo
 
 static int oslAudioChannelThread(int args, void *argp)
 {
+	MC_DisableFpuExceptions();
+
 	volatile int bufidx=0;
-	int channel=*(int *)argp;
+	// Read the argument byte-wise. sceKernelStartThread hands the block over on the new thread's stack
+	// and it is word-aligned in practice, but a plain *(int *) there is the same device-only fault class
+	// as the WAV header fields: an unaligned word load is an Address Error on an Allegrex and nothing at
+	// all under PPSSPP.
+	const unsigned char *ab = (const unsigned char *)argp;
+	int channel = ab[0] | (ab[1] << 8) | (ab[2] << 16) | (ab[3] << 24);
 //	int sample = 0;
 
 	//Allocate 2 buffers of num_samples * 2 channels * 2 bytes = num_samples * 8
@@ -78,7 +90,7 @@ static int oslAudioChannelThread(int args, void *argp)
 			void *bufptr = audio_sndbuf[channel] + bufidx * osl_audioVoices[channel].numSamples;
 			//Our callback function
 			void (*callback)(unsigned int channel, void *buf, unsigned int reqn) = AudioStatus[channel].callback;
-			//NE SERT A RIEN, NE FONCTIONNE PAS (pourquoi j'ai écrit ça moi?)
+			//NE SERT A RIEN, NE FONCTIONNE PAS (pourquoi j'ai Ã©crit Ã§a moi?)
 			AudioStatus[channel].inProgress = 1;
 			if (callback && osl_audioActive[channel]==1)
 				callback(channel, bufptr, osl_audioVoices[channel].numSamples);
@@ -87,12 +99,21 @@ static int oslAudioChannelThread(int args, void *argp)
 			AudioStatus[channel].inProgress = 0;
 //			if (sample++ <= 2)
 //				memset(bufptr, 0, osl_audioVoices[channel].numSamples << 2);
-			oslAudioOutBlocking(channel,osl_audioVoices[channel].sound->volumeLeft,osl_audioVoices[channel].sound->volumeRight,bufptr);
+			{
+				unsigned int volL = OSL_VOLUME_MAX;
+				unsigned int volR = OSL_VOLUME_MAX;
+				if (osl_audioVoices[channel].sound)
+				{
+					volL = osl_audioVoices[channel].sound->volumeLeft;
+					volR = osl_audioVoices[channel].sound->volumeRight;
+				}
+				oslAudioOutBlocking(channel, volL, volR, bufptr);
+			}
 			bufidx = (bufidx ? 0 : 1);
 		}
 	}
 
-	osl_audioActive[channel]=-2;				//Signale qu'on a terminé. Si le recreatechannel se produit juste entre le test (>0) et ceci, on n'aura pas de son!
+	osl_audioActive[channel]=-2;				//Signale qu'on a terminÃ©. Si le recreatechannel se produit juste entre le test (>0) et ceci, on n'aura pas de son!
 	//Fin
 
 	free(audio_sndbuf[channel]);
@@ -169,7 +190,7 @@ static void setChannelSound(int voice, OSL_SOUND *s)		{
 //	osl_audioVoices[voice].volumeLeft = s->volumeLeft;
 //	osl_audioVoices[voice].volumeRight = s->volumeRight;
 
-	//Les deux sont liés
+	//Les deux sont liÃ©s
 	osl_audioVoices[voice].sound = s;
 }
 
@@ -185,7 +206,7 @@ int oslAudioCreateChannel(int i, int format, int numSamples, OSL_SOUND *s)
 //    AudioStatus[i].volumeleft  = OSL_VOLUME_MAX;
     AudioStatus[i].callback = 0;
 
-	//Définit le bon son pour la channel
+	//DÃ©finit le bon son pour la channel
 	setChannelSound(i, s);
 
 	if ((AudioStatus[i].handle = sceAudioChReserve(i, osl_audioVoices[i].numSamples, format)) < 0)			{
@@ -244,16 +265,16 @@ int oslAudioRecreateChannel(int i, int format, int numSamples, OSL_SOUND *s)
 		return -1;
 	}*/
 
-	//Méthode originale, ne permet pas de redéfinir le nombre de samples :(
+	//MÃ©thode originale, ne permet pas de redÃ©finir le nombre de samples :(
 	if (osl_audioVoices[i].numSamples == numSamples && osl_audioVoices[i].sound == s)		{
 		sceAudioChangeChannelConfig(i, format);
-		//Les deux sont liés
+		//Les deux sont liÃ©s
 		setChannelSound(i, s);
 		osl_audioActive[i]=1;
 	}
 	else	{
 		oslAudioDeleteChannel(i);
-		//Attend qu'elle ait bien été désactivée
+		//Attend qu'elle ait bien Ã©tÃ© dÃ©sactivÃ©e
 		while (osl_audioActive[i] != 0);
 		sceKernelWaitThreadEnd(AudioStatus[i].threadhandle, NULL);
 		oslAudioCreateChannel(i, format, numSamples, s);
@@ -282,14 +303,14 @@ void oslDecodeWav(unsigned int i, void* buf, unsigned int length)		{
 	unsigned char *streambuffer;
 	int len;
 	if (wav->stream)		{
-		//Longueur du segment à lire sur la MS -> 16 bits = *2
+		//Longueur du segment Ã  lire sur la MS -> 16 bits = *2
 		len = (length * wav->fmt.bits_sample) >> 3;
 		if (samples == 1)
 			len <<= 1;
 		else	{
 			len>>=osl_audioVoices[i].divider;
 		}
-		if (osl_audioVoices[i].mono == 0)			//Stéréo
+		if (osl_audioVoices[i].mono == 0)			//StÃ©rÃ©o
 			len <<= 1;
 		streambuffer = (unsigned char*)alloca(len);
 		VirtualFileRead(streambuffer, len, 1, wav->fp);
@@ -307,7 +328,7 @@ void oslDecodeWav(unsigned int i, void* buf, unsigned int length)		{
 	else		{
 		length>>=osl_audioVoices[i].divider;
 		if (osl_audioVoices[i].mono == 0)		{
-			//Stéréo
+			//StÃ©rÃ©o
 			for (j=0;j<length;j++)			{
 				cur1 = get_next_wav_sample(wav);
 				cur2 = get_next_wav_sample(wav);
@@ -326,7 +347,7 @@ void oslDecodeWav(unsigned int i, void* buf, unsigned int length)		{
 			}
 		}
 	}
-	//Terminé, les poteaux
+	//TerminÃ©, les poteaux
 	if (wav->chunk_left <= 0)			{
 		if (osl_audioVoices[i].sound->endCallback)		{
 			if (osl_audioVoices[i].sound->endCallback(osl_audioVoices[i].sound, i))
@@ -336,7 +357,7 @@ void oslDecodeWav(unsigned int i, void* buf, unsigned int length)		{
 	}
 }
 
-/* Fonction utilisée pour remplir le buffer audio (44'100 Hz, 16 bits, Mono) */
+/* Fonction utilisÃ©e pour remplir le buffer audio (44'100 Hz, 16 bits, Mono) */
 void oslAudioCallback(unsigned int i, void* buf, unsigned int length) {
 	if (!osl_audioVoices[i].sound->audioCallback(i, buf, length))		{
 		//Fin du channel
@@ -350,7 +371,6 @@ void oslAudioCallback(unsigned int i, void* buf, unsigned int length) {
 
 #ifdef PSP
 int oslAudioPowerCallback(int unknown, int pwrflags,void *common)			{
-	static signed char audio[OSL_NUM_AUDIO_CHANNELS];
 	OSL_SOUND *s;
 	VIRTUAL_FILE *f = NULL;
 	int i;
@@ -361,8 +381,11 @@ int oslAudioPowerCallback(int unknown, int pwrflags,void *common)			{
 			s = osl_audioVoices[i].sound;
 			if (s)			{
 				if (s->isStreamed)		{
-					audio[i] = osl_audioActive[i];
-					osl_audioActive[i] = 3;					//3 = suspendu/invalide
+				// The voice's previous state was saved here into a file-local array that nothing ever
+				// read back, so it could not have been restored. Resuming is done by the 3 sentinel and
+				// oslAudioVSync() further down this file (called once a frame from SoundManager), not by
+				// restoring a saved value -- the array was a leftover from the other design.
+				osl_audioActive[i] = 3;					//3 = suspendu/invalide
 					f = s->standBySound(s);
 					osl_filesave[i] = VirtualFileTell(f);
 				}
@@ -413,7 +436,7 @@ int oslInitAudio()			{
 		AudioStatus[i].callback = 0;
 	}
 	memset(osl_audioVoices, 0, sizeof(osl_audioVoices));
-	osl_suspendNumber = 0;				//Peut-être ne pas le refaire à chaque fois...
+	osl_suspendNumber = 0;				//Peut-Ãªtre ne pas le refaire Ã  chaque fois...
 #ifdef PSP
 	osl_audioOldPowerCallback = osl_powerCallback;
 	osl_powerCallback = oslAudioPowerCallback;
@@ -422,7 +445,7 @@ int oslInitAudio()			{
 	return 0;
 }
 
-//Supprime le système son, mais vous devriez supprimer tous vos sons avant!
+//Supprime le systÃ¨me son, mais vous devriez supprimer tous vos sons avant!
 void oslDeinitAudio()		{
 	int i;
 	//Stoppe toutes les voies actives
@@ -442,19 +465,19 @@ OSL_SOUND *oslLoadSoundFile(const char *filename, int stream)		{
 }
 
 void oslDeleteSound(OSL_SOUND *s)			{
-	//Vérifie que le son n'est pas en train d'être joué!
+	//VÃ©rifie que le son n'est pas en train d'Ãªtre jouÃ©!
 	oslStopSound(s);
 	s->deleteSound(s);
 	free(s);
 }
 
-//Retour: 0=pas réactivé, 1=réactivé, 2=réactivé, mais il faut recommencer le son depuis le début
+//Retour: 0=pas rÃ©activÃ©, 1=rÃ©activÃ©, 2=rÃ©activÃ©, mais il faut recommencer le son depuis le dÃ©but
 int oslAudioReactiveSound(OSL_SOUND *s)		{
-	//Le son est en streaming et la PSP a été mise en veille -> on ne peut pas jouer le son directement puisque le kernel ferme tous les fichiers.
+	//Le son est en streaming et la PSP a Ã©tÃ© mise en veille -> on ne peut pas jouer le son directement puisque le kernel ferme tous les fichiers.
 	if (s->isStreamed && s->suspendNumber < osl_suspendNumber)		{
 		VIRTUAL_FILE *f, **w=NULL;
 		int i;
-		//On réouvre le fichier - ATTENTION!!!! SI LES PARAMETRES DU SYSTEME DE FICHIERS VIRTUEL ONT CHANGÉ, CA PEUT MERDER!
+		//On rÃ©ouvre le fichier - ATTENTION!!!! SI LES PARAMETRES DU SYSTEME DE FICHIERS VIRTUEL ONT CHANGÃ‰, CA PEUT MERDER!
 		f = VirtualFileOpen(s->filename, 0, VF_AUTO, VF_O_READ);
 		if (!f)
 			return 0;
@@ -500,13 +523,13 @@ void oslPlaySound(OSL_SOUND *s, int voice)			{
 	//A VERIFIER: SI ELLE EST OCCUPEE, ON ATTEND UN PEU
 	while(osl_audioActive[voice]==-2);
 
-	//Crée la channel si elle n'existe pas déjà
+	//CrÃ©e la channel si elle n'existe pas dÃ©jÃ 
 	if (!osl_audioActive[voice])
 		oslAudioCreateChannel(voice, s->mono, osl_audioVoices[voice].numSamples, s);
 	else
 		oslAudioRecreateChannel(voice, s->mono, osl_audioVoices[voice].numSamples, s);
 
-	//Essaie de réactiver le son (après une mise en veille), sinon recommence à zéro
+	//Essaie de rÃ©activer le son (aprÃ¨s une mise en veille), sinon recommence Ã  zÃ©ro
 	if (oslAudioReactiveSound(s) != 1)		{
 		s->playSound(s);
 	}
@@ -516,14 +539,14 @@ void oslPlaySound(OSL_SOUND *s, int voice)			{
 void oslStopSound(OSL_SOUND *s)			{
 	int voice = oslGetSoundChannel(s);
 	s->stopSound(s);
-	//Vérifie qu'il est bien en train d'être joué...
+	//VÃ©rifie qu'il est bien en train d'Ãªtre jouÃ©...
 	if (voice >= 0)
 		oslAudioDeleteChannel(voice);
 }
 
 void oslPauseSound(OSL_SOUND *s, int pause)			{
 	int voice = oslGetSoundChannel(s);
-	//Vérifie qu'il est bien en train d'être joué...
+	//VÃ©rifie qu'il est bien en train d'Ãªtre jouÃ©...
 	if (voice >= 0)		{
 		if (pause == -1)
 			osl_audioActive[voice] = 3 - osl_audioActive[voice];

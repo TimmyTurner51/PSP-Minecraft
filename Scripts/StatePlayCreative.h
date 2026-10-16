@@ -6,6 +6,7 @@
 
 #include <math.h>
 #include <psptypes.h>
+#include <vector>
 
 #include <Aurora/Graphics/RenderManager.h>
 #include <Aurora/Utils/Logger.h>
@@ -21,6 +22,7 @@
 #include <Aurora/Graphics/Effects/Destroyer.h>
 #include <Aurora/Graphics/Effects/StarsBox.h>
 #include <Aurora/Graphics/Effects/Drop.h>
+#include <Aurora/Graphics/Effects/InventoryPlayer.h>
 #include <Aurora/Graphics/Effects/TNT.h>
 #include <Aurora/Graphics/Effects/Particle.h>
 
@@ -29,11 +31,14 @@
 #include "Zombie2.h"
 #include "Cow2.h"
 #include "Creeper2.h"
+#include "Pig2.h"
 #include "Sheep2.h"
 #include "LameMob.h"
 
 #include "CraftWorld2.h"
 #include "InputHelper.h"
+#include "ChatSystem.h"
+#include "DebugMenu.h"
 #include "SoundManager.h"
 #include "Chest2.h"
 #include "Furnace2.h"
@@ -95,6 +100,10 @@ private:
 
 	int FindChestId(int x, int y, int z);
 
+	// Fires the held bow from the accumulated bowCharge. Creative spends no arrow, so this is the
+	// same shot as the survival state's with the ammo check removed.
+	void FireBowArrow();
+
 
 private:
 
@@ -102,7 +111,12 @@ private:
 	SystemManager *mSystemMgr;
 	SoundManager *mSoundMgr;
 	InputHelper *mIhelper;
+	ChatSystem mChat;
 	Camera *fppCam;
+
+	// Third-person view only: the player's own model standing in the world. Survival keeps this as a
+	// member already; creative had no use for one until now, so it gets its own.
+	InventoryPlayer *invPlayer;
 
 	std::string saveFileName;
 	int freeMemory;
@@ -123,6 +137,11 @@ private:
     bool cycle;
 
 	bool startDt;
+	int pendingCrackId;
+	float pendingCrackX, pendingCrackY, pendingCrackZ;
+	int pendingBreakStage;
+	bool pendingBreakWasLight;
+	int pendingBreakChunk;
     float dT;
     float dET;
     char dStd;
@@ -182,6 +201,7 @@ private:
 	bool walkingOnGround;
 	bool moving;
 	bool jumping;
+	bool sneaking;
 	bool headInWater;
 	bool footInWater;
 	bool headInLava;
@@ -193,8 +213,48 @@ private:
 	bool chestEn;
 	bool furnaceEn;
 
-	bool usingSlider; // craive vars
+    // Third-person view ------------------------------------------------------
+    // 0 = first person, 1 = behind the player, 2 = in front of them looking back at the face; a
+    // double tap of the chat button cycles the three. A single press is held for one double-tap
+    // window so the second tap can be recognised before the on-screen keyboard takes the input.
+    int thirdPersonView;
+    float chatTapTimer;
+    bool chatTapPending;
+
+    // Body yaw for the third-person model (degrees, same scale as Camera::horAngle) and the amount
+    // the head is turned past it. See StatePlay.h for why the two are separate.
+    float bodyYaw;
+    float headYawOffset;
+
+    // bobWalk is the limb amplitude (ground, air and flight), bobCycle the phase both share, and
+    // bobCamera Java's cameraYaw -- the camera bob amplitude in blocks per tick, speed-driven and zero
+    // whenever the player is not on the ground. See StatePlay.h.
+    float bobCamera;
+
+    // Sprint, on a double tap of Forward as in Java -- and on the ground it is a different thing from
+    // the fly sprint above (flySprint), which only applies while canFly. See StatePlay.h.
+    bool sprinting;
+    float sprintTapTimer;
+    bool sprintTapArm;
+    bool sprintTapPending;
+    bool sprintFwdWasHeld;
+    float sprintFovBoost;
+
+    float guiScale;
+    float guiInvW, guiInvH;
+    float guiCrtW, guiCrtH;
+    float guiChtW, guiChtH;
+    float guiFurW, guiFurH;
+    float guiCreativeW, guiCreativeH;
+    float guiCreativeScale;
+
+	bool usingSlider; // unused; analog mouse + d-pad paging
 	bool onDestroySlot;
+	bool creativeHeldFromHotbar;
+    int creativeTab;
+    float creativeMouseX;
+    float creativeMouseY;
+    bool creativeMouseFree;
 
 	bool showSlotName;
 	float showSlotTimer;
@@ -202,8 +262,8 @@ private:
 	int slotId;
 
     char barPosition;
-    char invXPosition;
-    char invYPosition;
+    int invXPosition;
+    int invYPosition;
 
     char tempXFurnace;
     char tempYFurnace;
@@ -274,6 +334,7 @@ private:
 
     Sprite *invCellSprite;
 	Sprite *invSprite;
+	Sprite *creativeTabSelSprite[5];
 	Sprite *sliderSprite;
 	Sprite *sliderLightedSprite;
     Sprite *crtSprite;
@@ -302,9 +363,38 @@ private:
 	int optionsMenuPos;
 	int selectPos;
 
+	// The debug stick. Same members and same contract as StatePlay's -- see the comment there. Kept
+	// per state rather than shared because each state owns its own mob lists through mWorld, and a
+	// menu that outlived a state change would be pointing at a dead world.
+	DebugMenu debugMenu;
+	LameMob* debugTarget;
+	void CheckDebugStickUse();
+	void ApplyDebugMenuResult();
+
+	// The purple wash drawn over the screen while a portal pulls the player through. Built on first use
+	// rather than in the constructor, for the same reason the debug menu builds its sprites lazily: the
+	// play states are constructed before the texture pack has been opened, so GetTexture would be -1.
+	int portalFadeTex;
+
+	// Whether the world simulation should advance this frame. Same contract as StatePlay's -- see the
+	// comment there.
+	bool WorldRunning();
+
     char statisticsPage;
 	//some settings
 	bool canFly;
+	float flyJumpTimer;
+	bool flyJumpWasHeld;
+	float flyBoost;
+	float flyForwardTimer;
+	bool flyForwardWasHeld;
+	bool flyForwardPending;
+	bool flySprintArm;
+	bool flySprint;
+	float flyFovBoost;
+	// Fly carries momentum: releasing the stick decelerates instead of stopping dead, which is what
+	// real Minecraft does. This is the velocity the glide decays from; walking never uses it.
+	Vector3 flyGlideVelocity;
 	bool devMode;
 	bool analogLeft,analogRight,analogUp,analogDown;
 
@@ -316,6 +406,10 @@ private:
 	bool canHeadBob;
 	float bobCycle;
 	bool bobType;
+	float bobWalk;
+	float camFollowY;
+	bool camFollowYInit;
+	float lookDt;
 	float cubeLight;
 
     float shift_x;
@@ -327,6 +421,12 @@ private:
     bool animGo;
 
     bool anim[3];
+
+    // Bow draw, same split as the survival state and for the same reason: HandleEvents starts it on
+    // the use button going down, Update accumulates it and fires on the release edge (the engine has
+    // keyPressed/keyHold, no keyReleased). Creative needs no arrow, so the draw never comes up dry.
+    bool bowCharging;
+    float bowCharge;
 	bool makeScreen;
 	bool dieFactor;
 
@@ -334,14 +434,19 @@ private:
 
     void SetCreativePage(char page);
     void InitCreativeInventory();
+    void SetCreativeTab(int tab);
+    void RefreshCreativePageMax();
+    std::vector<int>& CreativeItems();
 
     void DrawText(int x,int y, unsigned int color, float size, const char *message, ...);
     void DrawText2(int x,int y, unsigned int color, float size, const char *message, ...);
     void DrawAmount(int x,int y, int amount);
+    void UpdateInvCursorPos();
+    void CreativeUpdateAnalogMouse();
+    void CreativePickSlotFromMouse();
 
 	std::vector<SnowBall2*> mSnowBalls;
-	std::vector<int> inventoryItems;
-	std::vector<Particle*> mParticles;
+	std::vector<int> creativeTabItems[5];
 
     int creativePage;
     int creativePageMax;

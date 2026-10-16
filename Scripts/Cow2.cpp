@@ -9,8 +9,8 @@
 
 Cow::Cow(Vector3 position1, int number1) : LameMob(position1, number1)
 {
-    SPD = 1.0f;
-    HP = 10.0f;
+    ApplyProfile(MobProfiles::Cow);
+    debugName = "Cow";
 
     legs = Vector3(0,-6*PIXEL,0);
 
@@ -34,6 +34,7 @@ Cow::Cow(Vector3 position1, int number1) : LameMob(position1, number1)
     rotate1 = false;
 
     handItemId = -1;
+    breedItemId = Wheat::getID();
 
     UpdateBBox();
     myLight = 1.0f;
@@ -68,522 +69,91 @@ void Cow::BoxCollision()
 
 void Cow::TakeDamage(float damage, float power, float dt)
 {
-    HP -= damage;
-
-    kicked = true;
-    damaged = true;
-    damagedTimer = power*0.6f+0.15;
-    velocity.y = (power+0.15f) * JUMPVELOCITY;
-    walkingOnGround = false;
-
-    position += velocity * dt;
-    playHurtSound = true;
-
-    lastKickType = 1; //by player
+    ApplyKickDamage(damage, power, dt, 1, &animLegAngleT);
 }
 
 void Cow::TakeDamageFromPointExplosion(float damage, float power, float dt, Vector3 point)
 {
     explosionPos = point;
-
-    HP -= damage;
-
-    kicked = true;
-    damaged = true;
-    damagedTimer = power*0.6f+0.15;
-    velocity.y = (power+0.25f) * JUMPVELOCITY;
-    walkingOnGround = false;
-
-    position += velocity * dt;
-    playHurtSound = true;
-
-    lastKickType = 2; //by explosion
+    ApplyKickDamage(damage, power, dt, 2, NULL);
 }
 
 void Cow::Update(CraftWorld *myWorld, Vector3 playerPos, float dt)
 {
-    world = myWorld;
-    relPlayerPos = playerPos;
-    BoundingBox playerHitBox = BoundingBox(Vector3(playerPos.x - 0.35f,playerPos.y - 1.65f,playerPos.z - 0.35f),Vector3(playerPos.x + 0.35f,playerPos.y + 0.2f,playerPos.z + 0.35f));
+    if(!BeginMobUpdate(myWorld, playerPos, dt))
+        return;
 
-    distanceToPlayer = DistanceToPlayer();
-    fastDistanceToPlayer = FastDistanceToPlayer();
-
-    if(killed == true)
-    {
-        if(deathAngle < PI/2)
-        {
-            deathAngle += (PI/2)*dt*1.75+((PI/2-deathAngle)/24);
-        }
-
-        if(deathAngle > PI/2)
-        {
-            deathAngle = PI/2;
-        }
-
-        deathTimer -= dt;
-    }
+    UpdateDeathPose(dt);
 
     if(toDestroy == false)
     {
-        relPlayerPos = playerPos;
+        BoundingBox playerHitBox = BoundingBox(Vector3(playerPos.x - 0.35f,playerPos.y - 1.65f,playerPos.z - 0.35f),Vector3(playerPos.x + 0.35f,playerPos.y + 0.2f,playerPos.z + 0.35f));
+
         if(fastDistanceToPlayer < world->mainOptions.horizontalViewDistance*14+5)
         {
             freezedTimer = 0.0f;
-            if(HP <= 0.0f && killed == false)
+            if(CheckJustKilled())
             {
-                killed = true;
                 SetCollideBox(Vector3(PIXEL*7,PIXEL*6,PIXEL*7),Vector3(PIXEL*7,PIXEL*10,PIXEL*7));
                 return;
             }
 
             UpdateBBox();
+            UpdateMobTimers(dt, playerHitBox);
 
-
-            /// TIMERS --- *
-            if(dt < 0.1f)
+            // Cow-only: occasional random jumps while idle.
+            if(killed == false)
             {
-                sayTimer += dt;
-                if(sayTimer > 10.0f)
+                senselessJumpsTimer += dt;
+                if(senselessJumpsTimer >= senselessJumpsTimerMax)
                 {
-                    if(rand() % 2 == 0)
+                    senselessJumpsTimer = 0.0f;
+                    if(senselessJumps == true)
                     {
-                        playSaySound = true;
-                    }
-                    sayTimer = 0.0f;
-                }
-
-                jumpTimer += dt;
-                if(jumpTimer > 0.2f)
-                {
-                    jumpReady = true;
-                    jumpTimer = 0.0f;
-                }
-
-                if(damaged == true)
-                {
-                    if(damagedTimer > 0.0f)
-                    {
-                        damagedTimer -= dt;
+                        senselessJumps = false;
+                        senselessJumpsTimerMax = 15.0f + (rand() % 21) * 1.5f;
+                        if(rand() % 3 == 0)
+                            senselessJumpsTimerMax = 60.0f + rand() % 80;
                     }
                     else
                     {
-                        damagedTimer = 0.0f;
-                        damaged = false;
+                        senselessJumps = true;
+                        senselessJumpsTimerMax = 2.0f + (rand() % 21) / 10.0f;
                     }
                 }
-
-                if(playerHitBox.intersect(bBox))
-                {
-                    float angle2 = ATAN2_fast(position.x-relPlayerPos.x,position.z-relPlayerPos.z);
-                    TryToMove(Vector3(sinf(angle2),0.0f,cosf(angle2)),1.0*dt);
-                }
-                if(distanceToPlayer < 1.5)
-                {
-                    nearToPlayer = true;
-                }
-                else
-                {
-                    nearToPlayer = false;
-                }
-                /// * --- END
-
-
-                /// SWIMING --- *
-                if(world->PlayerInWater(position) == true && jumpReady == true && killed == false)
+                if(senselessJumps && jumpReady)
                 {
                     TryToJump();
                     jumpReady = false;
                 }
-                /// * --- END
-
-
-                /// HAUNTING --- *
-                moving = false;
-
-                if(killed == false)
-                {
-                    senselessJumpsTimer += dt;
-                    if(senselessJumpsTimer >= senselessJumpsTimerMax)
-                    {
-                        senselessJumpsTimer = 0.0f;
-                        if(senselessJumps == true)
-                        {
-                            senselessJumps = false;
-                            senselessJumpsTimerMax = 15.0f + (rand() % 21) * 1.5f;
-
-                            if(rand() % 3 == 0)
-                            {
-                                senselessJumpsTimerMax = 60.0f + rand() % 80;
-                            }
-                        }
-                        else
-                        {
-                            senselessJumps = true;
-                            senselessJumpsTimerMax = 2.0f + (rand() % 21) / 10.0f;
-                        }
-                    }
-
-                    if(senselessJumps && jumpReady)
-                    {
-                        TryToJump();
-                        jumpReady = false;
-                    }
-
-					/*if(handItemId != SnowBallItem::getID() || fastDistanceToPlayer >= 10)
-                    {
-						if(jumping == false)
-						{
-							damaged = true;
-							damagedTimer = 0.55f;
-						}
-					}*/
-
-                    if(handItemId != Wheat::getID() || fastDistanceToPlayer >= 10)
-                    {
-						headAngleY = 0.0f;
-                        if(hauntingTimer < hauntingTimerMax)
-                        {
-                            hauntingTimer += dt;
-                        }
-                        if(hauntingTimer >= hauntingTimerMax)
-                        {
-                            rotate1 = false;
-                            hauntingTimer = 0.0f;
-
-                            int percent = 50;
-                            if(lastCommand == 0)
-                            {
-                                percent = 75+rand()%10;
-                            }
-                            else
-                            {
-                                percent = 30+rand()%20;
-                            }
-
-                            if(rand()%100 < percent)
-                            {
-                                hauntingTimerMax = 4.0f + rand() % 4;
-
-                                hauntingPos.x = position.x - 6 + ((rand() % 120)/10.0f);
-                                hauntingPos.z = position.z - 6 + ((rand() % 120)/10.0f);
-
-                                if(hauntingPos.x > 252)
-                                {
-                                    hauntingPos.x = 252;
-                                }
-                                if(hauntingPos.x < 2)
-                                {
-                                    hauntingPos.x = 2;
-                                }
-
-                                if(hauntingPos.z > 252)
-                                {
-                                    hauntingPos.z = 252;
-                                }
-                                if(hauntingPos.z < 2)
-                                {
-                                    hauntingPos.z = 2;
-                                }
-
-                                hauntingAngle = ATAN2_fast(position.x-hauntingPos.x,position.z-hauntingPos.z)+PI;
-
-                                lastCommand = 0;
-                            }
-                            else // just rotate about its own position
-                            {
-                                hauntingTimerMax = 2.0f+(rand()%30)/10.0f;
-                                hauntingAngle = (rand() % 360)/180.0f*PI;
-
-                                hauntingPos = Vector3(-1,-1,-1);
-
-                                lastCommand = 1;
-                            }
-                        }
-
-
-                        if(hauntingPos.x != 0 && hauntingPos.z != 0)
-                        {
-                            if(DistanceToHauntingPos() > 0.5f)
-                            {
-                                if(hauntingPos != Vector3(-1,-1,-1))
-                                {
-                                    if(mainAngle != hauntingAngle)
-                                    {
-                                        mainAngle += sinf(hauntingAngle-mainAngle)*0.07f;
-                                    }
-
-                                   // mainAngle = hauntingAngle;
-                                    TryToMove(Vector3(sinf(mainAngle),0.0f,cosf(mainAngle)),SPD*dt);
-                                }
-                                else
-                                {
-                                    if(mainAngle != hauntingAngle)
-                                    {
-                                        mainAngle += sinf(hauntingAngle-mainAngle)*0.07f;
-                                    }
-
-                                   /* if(abs(mainAngle - hauntingAngle) < 0.02f)
-                                    {
-                                        mainAngle = hauntingAngle;
-                                    } */
-                                }
-                            }
-                            else
-                            {
-                                hauntingPos.x = 0;
-                                hauntingPos.z = 0;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        hauntingTimer = 0.0f;
-
-                        float playerAngle = ATAN2_fast(position.x-playerPos.x,position.z-playerPos.z)+PI;
-                        if(mainAngle != playerAngle)
-                        {
-                            mainAngle += sinf(playerAngle-mainAngle)*0.07f;
-                        }
-                        headAngleY = playerAngle-mainAngle;
-
-                        if(distanceToPlayer > 2.3f)
-                        {
-                            TryToMove(Vector3(sinf(mainAngle),0.0f,cosf(mainAngle)),SPD*dt);
-                        }
-                    }
-                }
-
-                if(kicked == true || handItemId == Wheat::getID())
-                {
-                    checkCollisionTimer += dt;
-                    if(checkCollisionTimer >= 0.1f)
-                    {
-                        BoxCollision();
-                        checkCollisionTimer = 0.0f;
-                    }
-                }
-                /// * --- END
-
-
-
-                /// MOVING WHEN KICKED ---- *
-                if(kicked == true)
-                {
-                    haunting = false;
-                    hauntingTimer = 0.0f;
-                    hauntingPos.x = 0;
-                    hauntingPos.z = 0;
-
-                    float mainAngle2; // super secret function
-                    if(lastKickType != 2)
-                    {
-                        mainAngle2 = ATAN2_fast(position.x-relPlayerPos.x,position.z-relPlayerPos.z)+PI;
-                    }
-                    else
-                    {
-                        mainAngle2 = ATAN2_fast(position.x-explosionPos.x,position.z-explosionPos.z)+PI;
-                    }
-                    TryToMoveWithoutJump(Vector3(sinf(mainAngle2+PI),0.0f,cosf(mainAngle2+PI)),(SPD+0.18f)*9.2f*(damagedTimer*damagedTimer)*dt);
-
-                    if((walkingOnGround == true || footInLava || footInWater) && damagedTimer <= 0.17f)
-                    {
-                        kicked = false;
-
-                        hauntingTimerMax = 3.0f + rand() % 3;
-
-                        hauntingPos.x = position.x - 5 + (rand() % 100)/10.0f;
-                        hauntingPos.z = position.z - 5 + (rand() % 100)/10.0f;
-
-                        if(hauntingPos.x > world->WORLD_SIZE-3)
-                        {
-                            hauntingPos.x = world->WORLD_SIZE-3;
-                        }
-                        if(hauntingPos.x < 2)
-                        {
-                            hauntingPos.x = 2;
-                        }
-
-                        if(hauntingPos.z > world->WORLD_SIZE-3)
-                        {
-                            hauntingPos.z = world->WORLD_SIZE-3;
-                        }
-                        if(hauntingPos.z < 2)
-                        {
-                            hauntingPos.z = 2;
-                        }
-					}
-                }
-                /// * --- END
-
-                /// ANIMATIONS  --- *
-                if(moving == true && kicked == false)
-                {
-                    animLegAngleT += PI*dt*1.6;
-                    if(animLegAngleT >= PI*2)
-                    {
-                        animLegAngleT = 0.0f;
-                    }
-                }
-                else
-                {
-                    if (animLegAngleT > 0 && animLegAngleT < PI/2)
-                    {
-                        animLegAngleT -= animLegAngleT * 0.3f;
-                        if (animLegAngleT < 0.05)
-                        {
-                            animLegAngleT = 0;
-                        }
-                    }
-                    if (animLegAngleT >= PI/2 && animLegAngleT < PI)
-                    {
-                        animLegAngleT += (PI-animLegAngleT) * 0.3f;
-                        if (animLegAngleT > PI - 0.05)
-                        {
-                            animLegAngleT = 0;
-                        }
-                    }
-                    if (animLegAngleT > PI && animLegAngleT < PI*1.5)
-                    {
-                        animLegAngleT -= (animLegAngleT-PI) * 0.3f;
-                        if (animLegAngleT < PI + 0.05)
-                        {
-                            animLegAngleT = 0;
-                        }
-                    }
-                    if (animLegAngleT >= PI*1.5 && animLegAngleT < PI*2)
-                    {
-                        animLegAngleT += (2*PI-animLegAngleT) * 0.3f;
-                        if (animLegAngleT > 2*PI - 0.05)
-                        {
-                            animLegAngleT = 0;
-                        }
-                    }
-                }
-                animLegAngle = sinf(animLegAngleT) * 0.8f;
-                /// * --- END
-
-
-                /// SIMEPLE MOB PHYSICS --- *
-
-                Vector3 footPosition = position + foot;
-                Vector3 legsPosition = position + legs;
-                Vector3 headPosition = position + head;
-
-                if(world->PlayerInWater(legsPosition))
-                    footInWater = true;
-                else
-                    footInWater = false;
-
-                if(world->PlayerInWater(headPosition))
-                {
-                    if (velocity.y > -3)
-                    {
-                        velocity.y += (GRAVITY/3.0f) * dt;
-                    }
-                    else
-                    {
-                        velocity.y = -3;
-                    }
-                    headInWater = true;
-                }
-                else
-                {
-                    headInWater = false;
-                    velocity.y += (GRAVITY*1.3 * dt) * 1.6f;
-                }
-
-                if(world->PlayerInLava(legsPosition))
-                {
-                    footInLava = true;
-                    HP -= 0.5f;
-                    damaged = true;
-                    damagedTimer = 0.55f;
-                }
-                else
-                {
-                    footInLava = false;
-                }
-
-                if(world->PlayerInLava(headPosition))
-                {
-                    velocity.y += (GRAVITY/3.0f) * dt;
-                    headInLava = true;
-                    HP -= 1;
-                    damaged = true;
-                    damagedTimer = 0.55f;
-                }
-                else
-                {
-                    headInLava = false;
-                    velocity.y += GRAVITY * dt;
-                }
-
-                if(world->SolidAtPointForEntity(footPosition,colliderD) || world->SolidAtPointForEntity(headPosition,colliderU))
-                {
-                    walkingOnGround = true;
-                    if (world->SolidAtPointForEntity(headPosition,colliderU))
-                    {
-                        int blockIn = (int)(headPosition.y);
-                        position.y = (float)(blockIn - colliderU.y - 0.05);
-                    }
-                    if (world->SolidAtPointForEntity(footPosition,colliderD))
-                    {
-                        int blockOn = (int)(footPosition.y);
-                        position.y = (float)(blockOn + 1 + colliderD.y - 0.05);
-                    }
-
-                    if(velocity.y != 0.0f) /// FALL DAMAGE
-                    {
-                        if (!world->PlayerInWater(footPosition))
-                        {
-                            if(velocity.y < -12 && velocity.y > -19)
-                            {
-                                HP -= (int)((velocity.y*-1) - 11) / 1.4;
-
-                                damaged = true;
-                                damagedTimer = 0.5f;
-                                playHurtSound = true;
-                            }
-                            if(velocity.y < -19)
-                            {
-                                HP -= (int)((velocity.y*-1) - 11) * 1.3f;
-
-                                damaged = true;
-                                damagedTimer = 0.5f;
-                                playHurtSound = true;
-                            }
-                        }
-                    }
-
-                    velocity.y = 0.0f;
-
-                    if(jumping == true)
-                    {
-                        velocity.y = 1.55f * JUMPVELOCITY;
-                        jumping = false;
-                        walkingOnGround = false;
-                    }
-                }
-                else
-                {
-                    walkingOnGround = false;
-                }
-                position += velocity * dt;
-
-                /// * --- END
             }
+
+            Cow* mate = InLove() ? FindKin(world->mCows, true, 8.0f) : NULL;
+            Cow* parent = IsBaby() ? FindKin(world->mCows, false, 8.0f) : NULL;
+            if(UpdatePassiveAI(dt, handItemId, mate, parent, &headAngleY) && mate != NULL && world->CanSpawnPassive())
+            {
+                world->SpawnCow((position.x + mate->position.x) * 0.5f, position.y + 0.3f, (position.z + mate->position.z) * 0.5f);
+                world->mCows.back()->SetAge(-1200.0f);
+                SpawnHearts(3);
+            }
+
+            if(kicked == true || panicTimer > 0.0f || InLove() || handItemId == breedItemId)
+            {
+                checkCollisionTimer += dt;
+                if(checkCollisionTimer >= 0.1f)
+                {
+                    BoxCollision();
+                    checkCollisionTimer = 0.0f;
+                }
+            }
+
+            UpdateKnockbackMove(dt);
+            UpdateLegAnim(dt, &animLegAngleT, &animLegAngle);
+            UpdateMobPhysics(dt);
         }
         else
         {
-            if(dt < 0.1f)
-            {
-                freezedTimer += dt;
-                if(freezedTimer >= freezedTimerMax)
-                {
-                    toDestroy = true;
-                }
-            }
+            UpdateOutOfRangeFreeze(dt);
         }
     }
 }
@@ -609,6 +179,12 @@ void Cow::Render(Frustum &camFrustum, float dt)
             else
             {
                 sceGumRotateX(0.0f);
+            }
+
+            if(IsBaby())
+            {
+                ScePspFVector3 babyScale = {0.5f,0.5f,0.5f};
+                sceGumScale(&babyScale);
             }
 
             updateLightTimer += dt;
@@ -650,6 +226,11 @@ void Cow::Render(Frustum &camFrustum, float dt)
             sceGumPushMatrix();
             ScePspFVector3 loc2 = {PIXEL*12,PIXEL*4,0};
             sceGumTranslate(&loc2);
+            if(IsBaby())
+            {
+                ScePspFVector3 babyHead = {1.6f,1.6f,1.6f};
+                sceGumScale(&babyHead);
+            }
 
             sceGumRotateX(0.0f);
             sceGumRotateY(headAngleY);
@@ -743,6 +324,8 @@ void Cow::Render(Frustum &camFrustum, float dt)
             sceGuColor(0xFFFFFFFF);
 
             sceGumPopMatrix();
+
+            RenderFire();
         }
     }
 }

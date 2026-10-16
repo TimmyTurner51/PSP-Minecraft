@@ -1,0 +1,194 @@
+{
+  "obfuscatedClass": "bjj",
+  "jar": "C:\\Users\\minec\\AppData\\Roaming\\.minecraft\\versions\\1.7.3\\1.7.3.jar",
+  "note": "extracted from 1.7.3 bytecode; bone names are not recoverable, so boxes are reported in declaration order",
+  "boxes": [
+    {
+      "uv": [
+        0,
+        0
+      ],
+      "origin": [
+        -3.0,
+        -3.0,
+        -2.0
+      ],
+      "size": [
+        6,
+        6,
+        4
+      ],
+      "expand": null
+    },
+    {
+      "uv": [
+        18,
+        14
+      ],
+      "origin": [
+        -4.0,
+        -2.0,
+        -3.0
+      ],
+      "size": [
+        6,
+        9,
+        6
+      ],
+      "expand": null
+    },
+    {
+      "uv": [
+        21,
+        0
+      ],
+      "origin": [
+        -4.0,
+        -3.0,
+        -3.0
+      ],
+      "size": [
+        8,
+        6,
+        7
+      ],
+      "expand": null
+    },
+    {
+      "uv": [
+        0,
+        18
+      ],
+      "origin": [
+        -1.0,
+        0.0,
+        -1.0
+      ],
+      "size": [
+        2,
+        8,
+        2
+      ],
+      "expand": null
+    },
+    {
+      "uv": [
+        0,
+        18
+      ],
+      "origin": [
+        -1.0,
+        0.0,
+        -1.0
+      ],
+      "size": [
+        2,
+        8,
+        2
+      ],
+      "expand": null
+    },
+    {
+      "uv": [
+        0,
+        18
+      ],
+      "origin": [
+        -1.0,
+        0.0,
+        -1.0
+      ],
+      "size": [
+        2,
+        8,
+        2
+      ],
+      "expand": null
+    },
+    {
+      "uv": [
+        0,
+        18
+      ],
+      "origin": [
+        -1.0,
+        0.0,
+        -1.0
+      ],
+      "size": [
+        2,
+        8,
+        2
+      ],
+      "expand": null
+    },
+    {
+      "uv": [
+        9,
+        18
+      ],
+      "origin": [
+        -1.0,
+        0.0,
+        -1.0
+      ],
+      "size": [
+        2,
+        8,
+        2
+      ],
+      "expand": null
+    },
+    {
+      "uv": [
+        9,
+        18
+      ],
+      "origin": [
+        -3.0,
+        -5.0,
+        0.0
+      ],
+      "size": [
+        2,
+        2,
+        1
+      ],
+      "expand": null
+    },
+    {
+      "uv": [
+        9,
+        18
+      ],
+      "origin": [
+        1.0,
+        -5.0,
+        0.0
+      ],
+      "size": [
+        2,
+        2,
+        1
+      ],
+      "expand": null
+    },
+    {
+      "uv": [
+        9,
+        18
+      ],
+      "origin": [
+        -1.5,
+        0.0,
+        -5.0
+      ],
+      "size": [
+        3,
+        3,
+        4
+      ],
+      "expand": null
+    }
+  ]
+}

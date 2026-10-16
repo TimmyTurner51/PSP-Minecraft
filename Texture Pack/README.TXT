@@ -1,0 +1,1 @@
+This texture pack has all assets. The one in "Minecraft - Compiled" has a simplified one only using assets the game uses.
