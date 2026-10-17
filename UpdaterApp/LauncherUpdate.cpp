@@ -823,6 +823,75 @@ int LauncherProbeRelease(std::string* version, unsigned int* files, double* kb, 
 	return 1;
 }
 
+bool LauncherFetchReleaseList()
+{
+	std::string baseUrl = ReadBaseUrl();
+	std::string root = LauncherRootPath();
+	if (baseUrl.empty() || root.empty() || !Update::NetIsConnected())
+	{
+		return false;
+	}
+
+	std::string path = Join(root, "versions.txt");
+	std::string body;
+	bool haveList = false;
+
+	if (Update::HttpGetToString(baseUrl + "versions.txt", &body, 0, 0) &&
+		body.find("version|") != std::string::npos)
+	{
+		haveList = true;
+		Logger::Instance()->LogMessage("launcher: fetched versions.txt from the server\n");
+	}
+	else
+	{
+		body.clear();
+		ReadTextFile(path, &body);
+	}
+
+	std::string offerBody;
+	Update::Offer offer;
+	if (Update::HttpGetToString(baseUrl + "update.txt", &offerBody, 0, 0) &&
+		Update::ParseOffer(offerBody, &offer) &&
+		!offer.launcher &&
+		!offer.version.empty())
+	{
+		const std::string tag = std::string("version|") + offer.version;
+		if (body.find(tag) == std::string::npos)
+		{
+			if (!body.empty() && body[body.size() - 1] != '\n')
+			{
+				body += "\n";
+			}
+			if (!body.empty())
+			{
+				body += "\n";
+			}
+
+			char line[160];
+			snprintf(line, sizeof(line),
+				"version|%s\ncode|%d\nnotes|Available as an update.\n",
+				offer.version.c_str(), offer.versionCode);
+			body += line;
+			haveList = true;
+			Logger::Instance()->LogMessage("launcher: added v%s from update.txt to the version list\n",
+				offer.version.c_str());
+		}
+	}
+
+	if (!haveList || body.find("version|") == std::string::npos)
+	{
+		return false;
+	}
+
+	if (!WriteTextFile(path, body))
+	{
+		Logger::Instance()->LogMessage("launcher: could not write versions.txt\n");
+		return false;
+	}
+
+	return true;
+}
+
 void LauncherRunUpdate(const std::string& baseInstallFolder, bool repair)
 {
 	std::string root = LauncherRootPath();

@@ -79,4 +79,17 @@ bool LauncherServerReachable(bool (*pump)(void*), void* ctx);
  */
 bool LauncherAddressCouldReachServer(const std::string& address);
 
+/*
+ * Refresh the launcher's version catalog from the server.
+ *
+ * The dropdown is built from versions.txt next to the launcher. Check for updates already knew about
+ * a newer game because it reads update.txt; the list did not, so a version the server was offering
+ * never appeared on the left until it was already installed. This writes a fresh versions.txt from
+ * the same folder as update.txt, and if that file is missing it still adds the version update.txt
+ * names so the dropdown and the update button agree.
+ *
+ * The network has to be up. Returns true when the file on the card was rewritten.
+ */
+bool LauncherFetchReleaseList();
+
 #endif

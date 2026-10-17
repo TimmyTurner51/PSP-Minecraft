@@ -5,6 +5,7 @@
 #include <pspkernel.h>
 #include <pspctrl.h>
 #include <pspdisplay.h>
+#include <pspgu.h>
 #include <pspiofilemgr.h>
 #include <pspdebug.h>
 
@@ -834,6 +835,8 @@ static void ClampDropdown()
 		gVersionTop = 0;
 	}
 }
+
+static void RefreshCatalogFromServer();
 
 static void MoveSelection(int delta)
 {
@@ -2458,6 +2461,7 @@ static void DoUpdate(bool repair)
 	// Rescanned rather than patched in place: the update flow can create an install, change the
 	// selected one's contents, or do neither, and asking the card is the only way to be sure which.
 	Logger::Instance()->LogMessage("launcher: update finished, rescanning\n");
+	RefreshCatalogFromServer();
 	LoadReleases();
 	SelectRelease(gVersionSel);
 	ClampDropdown();
@@ -2556,6 +2560,71 @@ static void Activate()
 // The one thing it writes is which saved connection worked, so the next boot tries that first.
 
 #define NET_PROFILE_FILE "net_profile.txt"
+
+// Display list for the system network dialog at boot. Same reason LauncherUpdate has its own: Screen
+// does not publish the list it is drawing with, and the dialog has to clear on a list that is not
+// already in use.
+static unsigned int sBootDialogList[16] __attribute__((aligned(64)));
+
+static bool BootDialogClear(void* ctx)
+{
+	(void)ctx;
+	sceGuStart(GU_DIRECT, sBootDialogList);
+	sceGuClearColor(0xFF000000);
+	sceGuClearDepth(0);
+	sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
+	sceGuFinish();
+	sceGuSync(0, 0);
+	return true;
+}
+
+static bool BootDialogPresent(void* ctx)
+{
+	(void)ctx;
+	sceDisplayWaitVblankStart();
+	sceGuSwapBuffers();
+	return true;
+}
+
+static bool AskForNetwork()
+{
+	Logger::Instance()->LogMessage("launcher: boot connect -- asking the player to pick a network\n");
+	if (Screen::Instance()->Ready())
+	{
+		Screen::Instance()->Frame("Choose a network...", 0, 0, -1.0f);
+	}
+
+	if (Update::NetConnectDialog(BootDialogClear, BootDialogPresent, 0) && Update::NetIsConnected())
+	{
+		Logger::Instance()->LogMessage("launcher: boot connect -- online via the network dialog\n");
+		return true;
+	}
+
+	Logger::Instance()->LogMessage("launcher: boot connect -- no network was chosen\n");
+	return false;
+}
+
+static void RefreshCatalogFromServer()
+{
+	if (!Update::NetIsConnected())
+	{
+		return;
+	}
+
+	if (Screen::Instance()->Ready())
+	{
+		Screen::Instance()->Frame("Checking for versions...", 0, 0, -1.0f);
+	}
+
+	if (!LauncherFetchReleaseList())
+	{
+		return;
+	}
+
+	LoadReleases();
+	SelectRelease(0);
+	ClampDropdown();
+}
 
 // Whether the boot attempt got an address. Read by the update offer, which is only worth making
 // when there is something to make it over.
@@ -2681,8 +2750,8 @@ static bool AutoConnectAtBoot()
 		// empty console and wrong for a firmware that answers every id with an error, and only this line
 		// distinguishes the two on the hardware where it happens.
 		Update::NetLogConnections();
-		Logger::Instance()->LogMessage("launcher: no saved connections, no boot check\n");
-		return false;
+		Logger::Instance()->LogMessage("launcher: no saved connections, opening the network dialog\n");
+		return AskForNetwork();
 	}
 
 	Logger::Instance()->LogMessage("launcher: %d saved connection(s) to try\n", count);
@@ -2836,7 +2905,11 @@ static bool AutoConnectAtBoot()
 			"launcher: boot connect -- nothing came up after %d profile(s), %d ms total\n",
 			tried, (int)((sceKernelGetSystemTimeLow() / 1000) - bootStartedMs));
 	}
-	return false;
+
+	// Silent tries exhausted. The system dialog is how the player picks a network the console has not
+	// remembered, or one the silent walk could not join. Without it, Check for updates was the only
+	// way onto Wi-Fi, and the version list stayed stale until then.
+	return AskForNetwork();
 }
 
 // Asks the server whether the release it offers differs from what is on the card, and raises the same
@@ -2997,6 +3070,7 @@ void LauncherMain()
 		gBootOnline = AutoConnectAtBoot();
 		if (gBootOnline)
 		{
+			RefreshCatalogFromServer();
 			BootUpdateCheck();
 		}
 		LauncherPhase("boot: entering the main loop");
