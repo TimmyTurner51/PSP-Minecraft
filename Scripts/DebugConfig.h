@@ -143,7 +143,7 @@
 // Named mob planted a few blocks in front of the camera after the test world boots. Empty
 // (the default) plants nothing. Pass the mob's ordinary name:
 //
-//   -DMC_TEST_MOB=chicken
+//   -DMC_TEST_MOB=villager
 //
 // The mob is pose-locked: it does not walk, panic, or get parked. It faces you and stays
 // there so a screenshot or a walk-around can look at the model. Off in every playable build.

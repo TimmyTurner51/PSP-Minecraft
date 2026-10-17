@@ -1834,7 +1834,7 @@ static void DrawMenu()
 	// control, and at this size the glyph sat low and to the right in a way a real arrow never would.
 	char ddLabel[64];
 	snprintf(ddLabel, sizeof(ddLabel), "%s", (rel != 0) ? rel->version.c_str() : "none");
-	screen->ButtonW(DD_CX, ROW_Y, DD_W, ddLabel, gFocus == FOCUS_DROPDOWN);
+	screen->ButtonW(DD_CX, ROW_Y, DD_W, ddLabel, gLevel == LEVEL_BUTTONS && gFocus == FOCUS_DROPDOWN);
 
 	// The install state, over the button that chose the version. Drawn before the dropdown, which opens
 	// upwards across this line and covers it while it is open -- which is right, because while choosing
@@ -1891,7 +1891,7 @@ static void DrawMenu()
 	bool canPlay = (rel != 0);
 	bool needsUpdate = (rel != 0) && (rel->installIndex < 0 || integrity == CHECK_BROKEN);
 	const char* playLabel = needsUpdate ? "Update" : "Play";
-	screen->ButtonW(PLAY_CX, ROW_Y, PLAY_W, playLabel, gFocus == FOCUS_PLAY, canPlay);
+	screen->ButtonW(PLAY_CX, ROW_Y, PLAY_W, playLabel, gLevel == LEVEL_BUTTONS && gFocus == FOCUS_PLAY, canPlay);
 
 	// Manage is about the card, and it is a LIST rather than a screen now: pressing it opens the menu the
 	// way the version button opens its own, and the rows are the actions rather than the installs.
@@ -1901,7 +1901,7 @@ static void DrawMenu()
 	// once Check for updates is one of its rows, because "get me a version onto this empty card" is
 	// exactly the case where that action matters most. The rows themselves handle applicability: with
 	// nothing installed the Delete row is simply not built (see ManageRowCount).
-	screen->ButtonW(MANAGE_CX, ROW_Y, MANAGE_W, "Manage", gFocus == FOCUS_MANAGE, true);
+	screen->ButtonW(MANAGE_CX, ROW_Y, MANAGE_W, "Manage", gLevel == LEVEL_BUTTONS && gFocus == FOCUS_MANAGE, true);
 
 	/*
 	 * Say the decision out loud, once, when it changes.

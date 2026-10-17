@@ -1,8 +1,18 @@
-# Minecraft PSP 4.0.0
+# Minecraft PSP 4.0.1
 
 A Minecraft-style game for the PlayStation Portable.
 
 This is a revival of the old PSP homebrew, kept free. It is not an official Minecraft product and is not affiliated with Mojang or Microsoft.
+
+## What's new in 4.0.1
+
+- Fixed bugs with Redstone Dust
+- Fixed Redstone Blocks
+- Fixed Redstone Torches
+- Fixed Repeaters
+- Fixed Sticky Piston texture
+- Fixed Bow hitboxes
+- Fixed Spider head texture
 
 ## What's new in 4.0.0
 
@@ -19,11 +29,11 @@ This is a revival of the old PSP homebrew, kept free. It is not an official Mine
 
 ## Play
 
-You need a PSP (or PPSSPP) and a copy of the 4.0.0 launcher pack.
+You need a PSP (or PPSSPP) and a copy of the launcher pack.
 
 1. Copy the launcher folder onto the memory stick at `PSP/GAME/`.
 2. Start it from the XMB.
-3. Pick **4.0.0** and press Play.
+3. Pick **4.0.1** and press Play.
 
 On a real PSP, a Memory Stick with a few hundred megabytes free is enough for the game. Worlds keep growing until the stick fills up.
 

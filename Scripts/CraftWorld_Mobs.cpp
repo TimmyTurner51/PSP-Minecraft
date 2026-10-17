@@ -279,27 +279,13 @@ void CraftWorld::UpdateArrows(float dt)
             removeArrow = true;
             arrowStop = UseArrow->position;
         }
-        else if(UseArrow->CheckCollision(this) == true)
-        {
-            // A block stops an arrow, it does not delete one. It lands against the face it hit and
-            // stays in the world, so a shot can be walked over and picked back up -- see Stick().
-            UseArrow->Stick(this);
-            arrowStop = UseArrow->position;
-
-            if(Particle::ActiveCount() <= 52)
-            {
-                for(int k = 0; k <= 3; k++) // 4 particles
-                {
-                    Particle* ArrowPart = Particle::Spawn(this,"item crack",Vector3(arrowStop.x,arrowStop.y+0.1f,arrowStop.z));
-                    ArrowPart->var1 = Arrow::getID()-250;
-                    ArrowPart->SetScale(0.06f, 0.12f);
-                }
-            }
-        }
         else
         {
-            // The step the arrow just took, swept against a target. A fast shot covers more
-            // than a block per frame, so testing only the end point would let it pass through.
+            // Bodies before blocks. A shot that reaches a mob standing against a wall used to
+            // stick in the wall and skip the hit test entirely, which is the "arrow went through
+            // them" report: the mob is air as far as CheckCollision is concerned, and the wall
+            // behind them is not. The step is swept, because a full-charge shot covers close to
+            // a block per frame on 30 Hz.
             Vector3 seg(UseArrow->position.x - UseArrow->prevPosition.x,
                         UseArrow->position.y - UseArrow->prevPosition.y,
                         UseArrow->position.z - UseArrow->prevPosition.z);
@@ -332,82 +318,43 @@ void CraftWorld::UpdateArrows(float dt)
             }
             else
             {
-                // A player shot: sweep the hostiles. Each list is walked as the shared LameMob
-                // base so one hit test covers all of them; the arrow stops at the first hit.
-                for(int m = 0; m < (int)mZombies.size() && removeArrow == false; m++)
+                // One walk, one box: HitBox() is the living size plus a little slack,
+                // so a zombie and a spider do not need their own numbers here.
+                float tHit = 0.0f;
+                LameMob* hit = FindMobAlongSegment(this, UseArrow->prevPosition, UseArrow->position, &tHit);
+                if(hit != 0)
                 {
-                    LameMob* mob = mZombies[m];
-                    if(mob->killed == true || mob->toDestroy == true) continue;
-                    Vector3 c(mob->position.x, mob->position.y + 0.9f, mob->position.z);
-                    Vector3 toC(c.x - UseArrow->prevPosition.x, c.y - UseArrow->prevPosition.y, c.z - UseArrow->prevPosition.z);
-                    float t = (segLen2 > 0.0001f) ? ((toC.x*seg.x + toC.y*seg.y + toC.z*seg.z) / segLen2) : 0.0f;
-                    if(t < 0.0f) t = 0.0f;
-                    if(t > 1.0f) t = 1.0f;
-                    Vector3 closest(UseArrow->prevPosition.x + seg.x*t, UseArrow->prevPosition.y + seg.y*t, UseArrow->prevPosition.z + seg.z*t);
-                    float dx = closest.x - c.x, dy = closest.y - c.y, dz = closest.z - c.z;
-                    if(dx*dx + dy*dy + dz*dz < 0.49f)
+                    removeArrow = true;
+                    hitBody = true;
+                    if(segLen2 > 0.0001f)
                     {
-                        removeArrow = true;
-                        arrowStop = closest;
-                        hitBody = true;
-                        mob->TakeDamage(UseArrow->damage, 1.0f, dt);
+                        float inv = 1.0f / sqrtf(segLen2);
+                        arrowStop = Vector3(UseArrow->prevPosition.x + seg.x * inv * tHit,
+                                            UseArrow->prevPosition.y + seg.y * inv * tHit,
+                                            UseArrow->prevPosition.z + seg.z * inv * tHit);
                     }
-                }
-                for(int m = 0; m < (int)mCreepers.size() && removeArrow == false; m++)
-                {
-                    LameMob* mob = mCreepers[m];
-                    if(mob->killed == true || mob->toDestroy == true) continue;
-                    Vector3 c(mob->position.x, mob->position.y + 0.9f, mob->position.z);
-                    Vector3 toC(c.x - UseArrow->prevPosition.x, c.y - UseArrow->prevPosition.y, c.z - UseArrow->prevPosition.z);
-                    float t = (segLen2 > 0.0001f) ? ((toC.x*seg.x + toC.y*seg.y + toC.z*seg.z) / segLen2) : 0.0f;
-                    if(t < 0.0f) t = 0.0f;
-                    if(t > 1.0f) t = 1.0f;
-                    Vector3 closest(UseArrow->prevPosition.x + seg.x*t, UseArrow->prevPosition.y + seg.y*t, UseArrow->prevPosition.z + seg.z*t);
-                    float dx = closest.x - c.x, dy = closest.y - c.y, dz = closest.z - c.z;
-                    if(dx*dx + dy*dy + dz*dz < 0.49f)
+                    else
                     {
-                        removeArrow = true;
-                        arrowStop = closest;
-                        hitBody = true;
-                        mob->TakeDamage(UseArrow->damage, 1.0f, dt);
+                        arrowStop = UseArrow->position;
                     }
+                    hit->TakeDamage(UseArrow->damage, 1.0f, dt);
                 }
-                for(int m = 0; m < (int)mSpiders.size() && removeArrow == false; m++)
+            }
+
+            if(removeArrow == false && UseArrow->CheckCollision(this) == true)
+            {
+                // A block stops an arrow, it does not delete one. It lands against the face it hit
+                // and stays in the world, so a shot can be walked over and picked back up -- see Stick().
+                UseArrow->Stick(this);
+                arrowStop = UseArrow->position;
+
+                if(Particle::ActiveCount() <= 52)
                 {
-                    LameMob* mob = mSpiders[m];
-                    if(mob->killed == true || mob->toDestroy == true) continue;
-                    Vector3 c(mob->position.x, mob->position.y + 0.4f, mob->position.z);
-                    Vector3 toC(c.x - UseArrow->prevPosition.x, c.y - UseArrow->prevPosition.y, c.z - UseArrow->prevPosition.z);
-                    float t = (segLen2 > 0.0001f) ? ((toC.x*seg.x + toC.y*seg.y + toC.z*seg.z) / segLen2) : 0.0f;
-                    if(t < 0.0f) t = 0.0f;
-                    if(t > 1.0f) t = 1.0f;
-                    Vector3 closest(UseArrow->prevPosition.x + seg.x*t, UseArrow->prevPosition.y + seg.y*t, UseArrow->prevPosition.z + seg.z*t);
-                    float dx = closest.x - c.x, dy = closest.y - c.y, dz = closest.z - c.z;
-                    if(dx*dx + dy*dy + dz*dz < 0.81f)
+                    for(int k = 0; k <= 3; k++) // 4 particles
                     {
-                        removeArrow = true;
-                        arrowStop = closest;
-                        hitBody = true;
-                        mob->TakeDamage(UseArrow->damage, 1.0f, dt);
-                    }
-                }
-                for(int m = 0; m < (int)mSkeletons.size() && removeArrow == false; m++)
-                {
-                    LameMob* mob = mSkeletons[m];
-                    if(mob->killed == true || mob->toDestroy == true) continue;
-                    Vector3 c(mob->position.x, mob->position.y + 0.9f, mob->position.z);
-                    Vector3 toC(c.x - UseArrow->prevPosition.x, c.y - UseArrow->prevPosition.y, c.z - UseArrow->prevPosition.z);
-                    float t = (segLen2 > 0.0001f) ? ((toC.x*seg.x + toC.y*seg.y + toC.z*seg.z) / segLen2) : 0.0f;
-                    if(t < 0.0f) t = 0.0f;
-                    if(t > 1.0f) t = 1.0f;
-                    Vector3 closest(UseArrow->prevPosition.x + seg.x*t, UseArrow->prevPosition.y + seg.y*t, UseArrow->prevPosition.z + seg.z*t);
-                    float dx = closest.x - c.x, dy = closest.y - c.y, dz = closest.z - c.z;
-                    if(dx*dx + dy*dy + dz*dz < 0.49f)
-                    {
-                        removeArrow = true;
-                        arrowStop = closest;
-                        hitBody = true;
-                        mob->TakeDamage(UseArrow->damage, 1.0f, dt);
+                        Particle* ArrowPart = Particle::Spawn(this,"item crack",Vector3(arrowStop.x,arrowStop.y+0.1f,arrowStop.z));
+                        ArrowPart->var1 = Arrow::getID()-250;
+                        ArrowPart->SetScale(0.06f, 0.12f);
                     }
                 }
             }

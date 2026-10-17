@@ -1754,6 +1754,39 @@ void CraftWorld::GetSpecialBlock(int x,int y, int z,int &iVertex,SimpleMeshChunk
         connectRight = wireConnectsTo(x+1,y,z);
         connectBack  = wireConnectsTo(x,y,z-1);
         connectFront = wireConnectsTo(x,y,z+1);
+
+        // Java staircase: a line also reaches dust one step up or down, unless an opaque
+        // cube sits on the lower wire and cuts the climb. The flat strip still runs to
+        // the edge; a vertical piece is emitted below when the neighbour is the upper one.
+        auto dustAt = [&](int nx, int ny, int nz) -> bool
+        {
+            if(nx < 0 || ny < 0 || nz < 0 || nx >= worldLimit || ny >= WORLD_HEIGHT || nz >= worldLimit)
+            {
+                return false;
+            }
+            return GetBlock(nx,ny,nz) == Block;
+        };
+        auto climbCut = [&](int nx, int ny, int nz) -> bool
+        {
+            if(ny < 0 || ny >= WORLD_HEIGHT)
+            {
+                return true;
+            }
+            return BlockSolid(nx,ny,nz) && BlockTransparentOrSpecial(nx,ny,nz) == false;
+        };
+        const bool cutUp = climbCut(x, y+1, z);
+        const bool climbLeft  = (cutUp == false && dustAt(x-1, y+1, z));
+        const bool climbRight = (cutUp == false && dustAt(x+1, y+1, z));
+        const bool climbBack  = (cutUp == false && dustAt(x, y+1, z-1));
+        const bool climbFront = (cutUp == false && dustAt(x, y+1, z+1));
+        const bool dropLeft   = dustAt(x-1, y-1, z) && climbCut(x-1, y, z) == false;
+        const bool dropRight  = dustAt(x+1, y-1, z) && climbCut(x+1, y, z) == false;
+        const bool dropBack   = dustAt(x, y-1, z-1) && climbCut(x, y, z-1) == false;
+        const bool dropFront  = dustAt(x, y-1, z+1) && climbCut(x, y, z+1) == false;
+        connectLeft  = connectLeft  || climbLeft  || dropLeft;
+        connectRight = connectRight || climbRight || dropRight;
+        connectBack  = connectBack  || climbBack  || dropBack;
+        connectFront = connectFront || climbFront || dropFront;
         int connectsNum = 0;
 
         // One strip of wire: a flat plate at y = 1/16 covering the given rectangle in the XZ plane.
@@ -1835,6 +1868,37 @@ void CraftWorld::GetSpecialBlock(int x,int y, int z,int &iVertex,SimpleMeshChunk
                     BuildWorldBlockPlane(blockType,x,y,z,iVertex,MeshChunk,Block,transparent,6,Vector3(7,1,8),Vector3(9,1,8),Vector3(9,1,8),Vector3(7,1,8),true,false,0);
                 }
             }
+        }
+
+        // The climb itself: a vertical strip on the face toward the upper neighbour, so the
+        // line is seen running up the side of the block rather than stopping at the edge.
+        if(climbLeft)
+        {
+            BuildWorldBlockPlaneNoCheck(blockType,x,y,z,iVertex,MeshChunk,Block,transparent,1,
+                Vector3(0,1,9),Vector3(0,16,9),Vector3(0,16,7),Vector3(0,1,7));
+            BuildWorldBlockPlaneNoCheck(blockType,x,y,z,iVertex,MeshChunk,Block,transparent,2,
+                Vector3(0,1,7),Vector3(0,16,7),Vector3(0,16,9),Vector3(0,1,9));
+        }
+        if(climbRight)
+        {
+            BuildWorldBlockPlaneNoCheck(blockType,x,y,z,iVertex,MeshChunk,Block,transparent,1,
+                Vector3(16,1,7),Vector3(16,16,7),Vector3(16,16,9),Vector3(16,1,9));
+            BuildWorldBlockPlaneNoCheck(blockType,x,y,z,iVertex,MeshChunk,Block,transparent,2,
+                Vector3(16,1,9),Vector3(16,16,9),Vector3(16,16,7),Vector3(16,1,7));
+        }
+        if(climbBack)
+        {
+            BuildWorldBlockPlaneNoCheck(blockType,x,y,z,iVertex,MeshChunk,Block,transparent,5,
+                Vector3(7,1,0),Vector3(9,1,0),Vector3(9,16,0),Vector3(7,16,0));
+            BuildWorldBlockPlaneNoCheck(blockType,x,y,z,iVertex,MeshChunk,Block,transparent,6,
+                Vector3(9,1,0),Vector3(7,1,0),Vector3(7,16,0),Vector3(9,16,0));
+        }
+        if(climbFront)
+        {
+            BuildWorldBlockPlaneNoCheck(blockType,x,y,z,iVertex,MeshChunk,Block,transparent,5,
+                Vector3(9,1,16),Vector3(7,1,16),Vector3(7,16,16),Vector3(9,16,16));
+            BuildWorldBlockPlaneNoCheck(blockType,x,y,z,iVertex,MeshChunk,Block,transparent,6,
+                Vector3(7,1,16),Vector3(9,1,16),Vector3(9,16,16),Vector3(7,16,16));
         }
 
         int rsPower = GetRedstoneDustPower(x,y,z);

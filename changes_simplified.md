@@ -1,16 +1,9 @@
-Minecraft PSP 4.0.0
+Minecraft PSP 4.0.1
 
-- added The Nether
-- infinite world generation (limited to memory stick size)
-- biomes blend together
-- player skins
-- redstone (dust, torches, repeaters, buttons, levers, lamps)
-- pistons
-- bows and arrows
-- skeletons, spiders, and chickens
-- third person
-- sprint, sneak, and hunger
-- creative flight
-- new lighting
-- launcher with updates
-- crash and performance fixes
+- Fixed bugs with Redstone Dust
+- Fixed Redstone Blocks
+- Fixed Redstone Torches
+- Fixed Repeaters
+- Fixed Sticky Piston texture
+- Fixed Bow hitboxes
+- Fixed Spider head texture

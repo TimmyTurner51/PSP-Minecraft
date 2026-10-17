@@ -4633,6 +4633,17 @@ int CraftWorld::RepeaterDirZ(int facing)
     return kRepeaterDirZ[facing & 3];
 }
 
+// Java BlockRedstoneWire: a line also runs one step up or down unless an opaque full cube
+// sits on the lower wire and cuts the climb. Glass and other non-cubes do not cut.
+static bool RedstoneClimbCut(CraftWorld* w, int x, int y, int z)
+{
+    if(y < 0 || y >= w->WORLD_HEIGHT)
+    {
+        return true;
+    }
+    return w->BlockSolid(x,y,z) && w->BlockTransparentOrSpecial(x,y,z) == false;
+}
+
 int CraftWorld::GetRedstoneDustPower(int x, int y, int z)
 {
     const block_t dustId = Redstoneoff::getID();
@@ -4714,11 +4725,14 @@ int CraftWorld::GetRedstoneDustPower(int x, int y, int z)
             else if(b != dustId && IsRedstoneConductive(b))
             {
                 // A conductive block only carries the signal on if something is strongly powering *it*.
-                // Two things can: a pressed button mounted on it, and a powered repeater facing it.
-                // `RepeaterOutputAt` is used here rather than the whole of `GetBlockRedstonePower`
-                // deliberately -- that function asks this very wire cell for its power, so calling it
-                // here would recurse into the walk currently being computed.
-                feedsWire = GetButtonPowerAt(nx,ny,nz) > 0 || RepeaterOutputAt(nx,ny,nz) > 0;
+                // Three things can: a pressed button mounted on it, a powered repeater facing it, and
+                // a lit torch touching it (the block above a standing torch is the usual case).
+                // `RepeaterOutputAt` / `RedstoneTorchPowerAt` are used rather than the whole of
+                // `GetBlockRedstonePower` deliberately -- that function asks this very wire cell for
+                // its power, so calling it here would recurse into the walk currently being computed.
+                feedsWire = GetButtonPowerAt(nx,ny,nz) > 0
+                    || RepeaterOutputAt(nx,ny,nz) > 0
+                    || RedstoneTorchPowerAt(nx,ny,nz) > 0;
             }
             if(feedsWire)
             {
@@ -4754,6 +4768,57 @@ int CraftWorld::GetRedstoneDustPower(int x, int y, int z)
                 cd.push_back(dist + 1);
             }
         }
+
+        // Staircase: dust at (hx, y±1, hz). The 6-neighbour walk above never sees these -- they
+        // are diagonal -- and without them a line cannot climb a block. Java cuts the climb when
+        // an opaque cube sits on the lower wire.
+        const int hx[4] = {1,-1,0,0};
+        const int hz[4] = {0,0,1,-1};
+        for(int d = 0; d < 4; d++)
+        {
+            int sx = cx[i] + hx[d];
+            int sz = cz[i] + hz[d];
+            if(sx < 0 || sz < 0 || sx >= worldLimit || sz >= worldLimit)
+            {
+                continue;
+            }
+            int stairY[2];
+            int nStair = 0;
+            int uy = cy[i] + 1;
+            if(uy < WORLD_HEIGHT && RedstoneClimbCut(this, cx[i], uy, cz[i]) == false)
+            {
+                stairY[nStair++] = uy;
+            }
+            int dy2 = cy[i] - 1;
+            if(dy2 >= 0 && RedstoneClimbCut(this, sx, cy[i], sz) == false)
+            {
+                stairY[nStair++] = dy2;
+            }
+            for(int c = 0; c < nStair; c++)
+            {
+                int sy = stairY[c];
+                if(GetBlock(sx,sy,sz) != dustId || dist + 1 >= 15)
+                {
+                    continue;
+                }
+                bool seen = false;
+                for(unsigned int j = 0; j < cx.size(); j++)
+                {
+                    if(cx[j] == sx && cy[j] == sy && cz[j] == sz)
+                    {
+                        seen = true;
+                        break;
+                    }
+                }
+                if(!seen)
+                {
+                    cx.push_back(sx);
+                    cy.push_back(sy);
+                    cz.push_back(sz);
+                    cd.push_back(dist + 1);
+                }
+            }
+        }
     }
     return best;
 }
@@ -4774,9 +4839,12 @@ bool CraftWorld::IsRedstoneConductive(block_t b)
 }
 
 // The raw union: what power do the sources touching this cell provide to it? Dust resting on it or
-// pointing into it, a neighbouring block of redstone, a neighbouring live switch, a powered repeater
-// facing it, a lit torch beside it. Deliberately says nothing about what kind of block the cell is --
-// that is the caller's business, and the two callers below want the same union for different reasons.
+// pointing into it, a neighbouring live switch, a powered repeater facing it, a lit torch beside it.
+// A block of redstone is deliberately not in this list: Java's block of redstone activates adjacent
+// *mechanisms* and feeds adjacent dust, but it does not power adjacent opaque blocks. Mechanisms
+// pick it up in GetRedstonePowerTo instead. Deliberately says nothing about what kind of block the
+// cell is -- that is the caller's business, and the two callers below want the same union for
+// different reasons.
 int CraftWorld::GetPowerProvidedToCell(int x, int y, int z)
 {
     if(x < 0 || y < 0 || z < 0 || x >= worldLimit || y >= WORLD_HEIGHT || z >= worldLimit)
@@ -4785,7 +4853,6 @@ int CraftWorld::GetPowerProvidedToCell(int x, int y, int z)
     }
 
     const block_t dustId = Redstoneoff::getID();
-    const block_t sourceId = RedstoneBlock::getID();
     const int hx[4] = {1,-1,0,0};
     const int hz[4] = {0,0,1,-1};
     int best = 0;
@@ -4816,28 +4883,6 @@ int CraftWorld::GetPowerProvidedToCell(int x, int y, int z)
         if(p > best)
         {
             best = p;
-        }
-    }
-    // A block of redstone strongly powers the six blocks around it
-    if(best < 15)
-    {
-        const int dx[6] = {1,-1,0,0,0,0};
-        const int dy[6] = {0,0,1,-1,0,0};
-        const int dz[6] = {0,0,0,0,1,-1};
-        for(int dir = 0; dir < 6; dir++)
-        {
-            int nx = x + dx[dir];
-            int ny = y + dy[dir];
-            int nz = z + dz[dir];
-            if(nx < 0 || ny < 0 || nz < 0 || nx >= worldLimit || ny >= WORLD_HEIGHT || nz >= worldLimit)
-            {
-                continue;
-            }
-            if(GetBlock(nx,ny,nz) == sourceId)
-            {
-                best = 15;
-                break;
-            }
         }
     }
     // A pressed button touching this block powers it (Java: weak power 15, which also covers the
@@ -4924,6 +4969,7 @@ int CraftWorld::GetRedstonePowerTo(int x, int y, int z)
     }
 
     const block_t dustId = Redstoneoff::getID();
+    const block_t sourceId = RedstoneBlock::getID();
     const int dx[6] = {1,-1,0,0,0,0};
     const int dy[6] = {0,0,1,-1,0,0};
     const int dz[6] = {0,0,0,0,1,-1};
@@ -4946,6 +4992,13 @@ int CraftWorld::GetRedstonePowerTo(int x, int y, int z)
             {
                 best = p;
             }
+        }
+        else if(nb == sourceId)
+        {
+            // A block of redstone activates adjacent mechanisms (lamps, TNT, pistons, doors)
+            // without powering adjacent opaque blocks. That second part is why it is not in
+            // GetPowerProvidedToCell -- a stone next to one must stay unpowered.
+            best = 15;
         }
         else if(IsRedstoneConductive(nb))
         {
@@ -6923,9 +6976,25 @@ void CraftWorld::SetRepeaterPowered(int x, int y, int z, bool powered)
     // which is how a repeater fires a cannon stage.
     UpdateRedstonePower(x,y,z);
     int f = RepeaterFacingFromState(GetRepeaterState(x,y,z));
-    if(powered)
+    int ox = x + kRepeaterDirX[f];
+    int oz = z + kRepeaterDirZ[f];
+    if(ox >= 0 && oz >= 0 && ox < worldLimit && oz < worldLimit)
     {
-        TryIgniteTNT(x + kRepeaterDirX[f], y, z + kRepeaterDirZ[f]);
+        if(powered)
+        {
+            TryIgniteTNT(ox, y, oz);
+        }
+        // The cell a repeater faces is strongly powered. UpdateRedstonePower already walks a
+        // 5x5x5, but a lamp or piston sitting in that cell is the one thing a player tests
+        // with "does this repeater power the block?", so re-decide it here by name.
+        if(IsRedstoneLampBlock(GetBlock(ox,y,oz)))
+        {
+            EvaluateRedstoneLamp(ox, y, oz);
+        }
+        if(IsPistonBaseBlock(GetBlock(ox,y,oz)))
+        {
+            SchedulePiston(ox, y, oz);
+        }
     }
 
     // Refresh the block itself, and only the block itself. A repeater flip changes one cell of geometry
@@ -7583,10 +7652,13 @@ void CraftWorld::UpdateRedstonePower(int x, int y, int z)
                 }
                 else if(nb != dustId && IsRedstoneConductive(nb))
                 {
-                    // Same two "something is strongly powering this block" cases as GetRedstoneDustPower:
-                    // a pressed button on it, or a powered repeater facing it. Keep the two in step --
-                    // this BFS is what tells a cell whether it is live for TNT priming.
-                    feedsWire = GetButtonPowerAt(nx,ny,nz) > 0 || RepeaterOutputAt(nx,ny,nz) > 0;
+                    // Same "something is strongly powering this block" cases as GetRedstoneDustPower:
+                    // a pressed button on it, a powered repeater facing it, or a lit torch touching it.
+                    // Keep the two in step -- this BFS is what tells a cell whether it is live for TNT
+                    // priming.
+                    feedsWire = GetButtonPowerAt(nx,ny,nz) > 0
+                        || RepeaterOutputAt(nx,ny,nz) > 0
+                        || RedstoneTorchPowerAt(nx,ny,nz) > 0;
                 }
                 if(feedsWire)
                 {
@@ -7605,11 +7677,8 @@ void CraftWorld::UpdateRedstonePower(int x, int y, int z)
                 continue;
             }
             int nextp = pwr[i] - 1;
-            for(int dir = 0; dir < 6; dir++)
+            auto tryProp = [&](int nx, int ny, int nz)
             {
-                int nx = cx[i] + dx[dir];
-                int ny = cy[i] + dy[dir];
-                int nz = cz[i] + dz[dir];
                 for(unsigned int j = 0; j < cx.size(); j++)
                 {
                     if(cx[j] == nx && cy[j] == ny && cz[j] == nz && GetBlock(nx,ny,nz) == dustId)
@@ -7620,6 +7689,34 @@ void CraftWorld::UpdateRedstonePower(int x, int y, int z)
                             q.push_back((int)j);
                         }
                     }
+                }
+            };
+            for(int dir = 0; dir < 6; dir++)
+            {
+                tryProp(cx[i] + dx[dir], cy[i] + dy[dir], cz[i] + dz[dir]);
+            }
+            // Same staircase edges GetRedstoneDustPower walks, so a climb carries charge
+            // into the TNT-priming BFS rather than lighting the artwork and leaving the
+            // cannon dark.
+            const int hx[4] = {1,-1,0,0};
+            const int hz[4] = {0,0,1,-1};
+            for(int d = 0; d < 4; d++)
+            {
+                int sx = cx[i] + hx[d];
+                int sz = cz[i] + hz[d];
+                if(sx < 0 || sz < 0 || sx >= worldLimit || sz >= worldLimit)
+                {
+                    continue;
+                }
+                int uy = cy[i] + 1;
+                int dy2 = cy[i] - 1;
+                if(uy < WORLD_HEIGHT && RedstoneClimbCut(this, cx[i], uy, cz[i]) == false)
+                {
+                    tryProp(sx, uy, sz);
+                }
+                if(dy2 >= 0 && RedstoneClimbCut(this, sx, cy[i], sz) == false)
+                {
+                    tryProp(sx, dy2, sz);
                 }
             }
         }
@@ -7758,28 +7855,15 @@ void CraftWorld::UpdateRedstonePower(int x, int y, int z)
                 continue;
             }
 
-            // Dust or a block of redstone touching TNT lights it directly
+            // Dust or a block of redstone touching TNT lights it directly. A block of
+            // redstone does *not* power the solids around it -- Java activates adjacent
+            // mechanisms only -- so TNT sitting on a neighbour of the source (the
+            // x1 / 23 layout) must stay dark. The 5x5x5 TryIgniteTNT pass below is
+            // what lights a charge through a block that is *actually* powered (a
+            // repeater facing it, dust pointing into it).
             primeTNTNextTo(cx[i],cy[i],cz[i]);
 
-            if(b == sourceId)
-            {
-                // A block of redstone strongly powers the six blocks around it
-                for(int dir = 0; dir < 6; dir++)
-                {
-                    int nx = cx[i] + dx[dir];
-                    int ny = cy[i] + dy[dir];
-                    int nz = cz[i] + dz[dir];
-                    if(nx < 0 || ny < 0 || nz < 0 || nx >= worldLimit || ny >= WORLD_HEIGHT || nz >= worldLimit)
-                    {
-                        continue;
-                    }
-                    if(IsRedstoneConductive(GetBlock(nx,ny,nz)))
-                    {
-                        primeTNTNextTo(nx,ny,nz);
-                    }
-                }
-            }
-            else
+            if(b != sourceId)
             {
                 // Dust weakly powers the block it is sitting on ...
                 int by = cy[i] - 1;

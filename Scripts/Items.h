@@ -1690,4 +1690,12 @@ public:
 	static item_t getID();
 };
 
+class VillagerSpawnEgg : public BaseItem
+{
+public:
+
+	VillagerSpawnEgg();
+	static item_t getID();
+};
+
 #endif

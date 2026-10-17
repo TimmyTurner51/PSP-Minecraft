@@ -301,6 +301,40 @@ void LameMob::UpdateBBox()
     bBox = BoundingBox(Vector3(position.x-colliderD.x*1.45,position.y-colliderD.y*1.3,position.z-colliderD.z*1.45),Vector3(position.x+colliderU.x*1.45,position.y+colliderU.y*1.3,position.z+colliderU.z*1.45));
 }
 
+BoundingBox LameMob::HitBox() const
+{
+    // A little larger than the body so a glancing shot still counts, without
+    // becoming the punch pad (MobAttackBox) that is meant for a short melee ray.
+    const float pad = 0.15f;
+    const float s = ModelScale();
+
+    float minx = position.x - colliderD.x;
+    float miny = position.y - colliderD.y;
+    float minz = position.z - colliderD.z;
+    float maxx = position.x + colliderU.x;
+    float maxy = position.y + colliderU.y;
+    float maxz = position.z + colliderU.z;
+
+    // Vanilla living size, standing on the feet. The spider's collider is narrower
+    // than the model (0.75 vs 1.4); fireWidth/Height are the Java setSize numbers
+    // and are what you actually aim at.
+    const float halfW = profile.fireWidth * s * 0.5f;
+    const float tall = profile.fireHeight * s;
+    const float feetY = position.y - colliderD.y;
+    if(halfW > 0.0f && tall > 0.0f)
+    {
+        if(position.x - halfW < minx) minx = position.x - halfW;
+        if(position.z - halfW < minz) minz = position.z - halfW;
+        if(position.x + halfW > maxx) maxx = position.x + halfW;
+        if(position.z + halfW > maxz) maxz = position.z + halfW;
+        if(feetY < miny) miny = feetY;
+        if(feetY + tall > maxy) maxy = feetY + tall;
+    }
+
+    return BoundingBox(Vector3(minx - pad, miny - pad, minz - pad),
+                       Vector3(maxx + pad, maxy + pad, maxz + pad));
+}
+
 void LameMob::BoxCollision()
 {
 
@@ -1134,6 +1168,64 @@ static void ConsiderPunchMob(LameMob* mob, float power, const Vector3& origin, c
         *best = mob;
         *bestPower = power;
     }
+}
+
+static void ConsiderArrowMob(LameMob* mob, const Vector3& origin, const Vector3& dir, float reach, LameMob** best, float* bestT)
+{
+    if(mob == NULL || mob->killed == true || mob->toDestroy == true)
+        return;
+
+    float tHit = 0.0f;
+    if(RayIntersectAABB(origin, dir, mob->HitBox(), reach, &tHit) && tHit < *bestT)
+    {
+        *bestT = tHit;
+        *best = mob;
+    }
+}
+
+LameMob* FindMobAlongSegment(CraftWorld* world, const Vector3& a, const Vector3& b, float* hitT)
+{
+    LameMob* best = NULL;
+    float bestT = 1.0e9f;
+    Vector3 delta(b.x - a.x, b.y - a.y, b.z - a.z);
+    const float len = sqrtf(delta.x*delta.x + delta.y*delta.y + delta.z*delta.z);
+    Vector3 dir;
+    float reach;
+    if(len > 0.0001f)
+    {
+        dir = Vector3(delta.x / len, delta.y / len, delta.z / len);
+        reach = len;
+    }
+    else
+    {
+        // A step that did not move still has to hit a body it is sitting inside.
+        dir = Vector3(0.0f, 1.0f, 0.0f);
+        reach = 0.02f;
+    }
+
+    if(world != NULL)
+    {
+        for(unsigned int f = 0; f < world->mZombies.size(); f++)
+            ConsiderArrowMob(world->mZombies[f], a, dir, reach, &best, &bestT);
+        for(unsigned int f = 0; f < world->mCows.size(); f++)
+            ConsiderArrowMob(world->mCows[f], a, dir, reach, &best, &bestT);
+        for(unsigned int f = 0; f < world->mSheeps.size(); f++)
+            ConsiderArrowMob(world->mSheeps[f], a, dir, reach, &best, &bestT);
+        for(unsigned int f = 0; f < world->mCreepers.size(); f++)
+            ConsiderArrowMob(world->mCreepers[f], a, dir, reach, &best, &bestT);
+        for(unsigned int f = 0; f < world->mPigs.size(); f++)
+            ConsiderArrowMob(world->mPigs[f], a, dir, reach, &best, &bestT);
+        for(unsigned int f = 0; f < world->mChickens.size(); f++)
+            ConsiderArrowMob(world->mChickens[f], a, dir, reach, &best, &bestT);
+        for(unsigned int f = 0; f < world->mSpiders.size(); f++)
+            ConsiderArrowMob(world->mSpiders[f], a, dir, reach, &best, &bestT);
+        for(unsigned int f = 0; f < world->mSkeletons.size(); f++)
+            ConsiderArrowMob(world->mSkeletons[f], a, dir, reach, &best, &bestT);
+    }
+
+    if(hitT != NULL)
+        *hitT = bestT;
+    return best;
 }
 
 LameMob* FindMobAlongRay(CraftWorld* world, const Vector3& origin, const Vector3& dir, float reach, float* hitT, float* knockPower)

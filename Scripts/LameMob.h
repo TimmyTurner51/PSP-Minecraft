@@ -31,6 +31,11 @@ public:
     void SetPosition(Vector3 newPosition);
     void SetCollideBox(Vector3 collider1, Vector3 collider2);
     void UpdateBBox();
+    // The box a projectile should test: the living size (profile.fireWidth/Height,
+    // same numbers the fire overlay uses) unioned with the physics collider, then
+    // grown a little. A new mob that calls SetCollideBox + ApplyProfile gets this
+    // for free -- no per-type arrow table.
+    BoundingBox HitBox() const;
 
     virtual void BoxCollision();
     virtual void TakeDamage(float damage, float power, float dt);
@@ -293,6 +298,9 @@ private:
 
 class SoundManager;
 LameMob* FindMobAlongRay(CraftWorld* world, const Vector3& origin, const Vector3& dir, float reach, float* hitT, float* knockPower);
+// Nearest living mob whose HitBox() the segment a→b crosses. Used by arrows so a
+// shot cannot pass through a body between two physics steps.
+LameMob* FindMobAlongSegment(CraftWorld* world, const Vector3& a, const Vector3& b, float* hitT);
 // Nearest mob along the look ray that is not behind a block (right-click use).
 LameMob* FindMobForUse(CraftWorld* world, const Vector3& origin, const Vector3& dir, float reach);
 void ApplyMeleeHit(CraftWorld* world, SoundManager* sounds, int barSlot, LameMob* mob, float power, float dt, bool wearWeapon);

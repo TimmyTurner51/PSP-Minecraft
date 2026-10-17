@@ -2194,3 +2194,11 @@ SkeletonSpawnEgg::SkeletonSpawnEgg():BaseItem()
     name = "Spawn Skeleton";
 }
 item_t SkeletonSpawnEgg::getID(){ return 420;}
+
+VillagerSpawnEgg::VillagerSpawnEgg():BaseItem()
+{
+    textureRow = 6;
+    plane = 6;
+    name = "Spawn Villager";
+}
+item_t VillagerSpawnEgg::getID(){ return 425;}

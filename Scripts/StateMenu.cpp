@@ -48,21 +48,13 @@ using namespace Aurora;
  */
 static const char* kNewsLines[] =
 {
-	"-Added The Nether",
-	"-Infinite World Generation",
-	"-Biomes Blend Together",
-	"-Added Player Skins",
-	"-Added Redstone",
-	"-Added Pistons",
-	"-Added Bows And Arrows",
-	"-Added Skeletons",
-	"-Added Spiders And Chickens",
-	"-Added Third Person",
-	"-Added Sprint, Sneak And Hunger",
-	"-Added Creative Flight",
-	"-New Lighting",
-	"-Added Launcher Updates",
-	"-Crash And Performance Fixes",
+	"-Fixed Redstone Dust",
+	"-Fixed Redstone Blocks",
+	"-Fixed Redstone Torches",
+	"-Fixed Repeaters",
+	"-Fixed Sticky Pistons",
+	"-Fixed Bow Hitboxes",
+	"-Fixed Spider Head",
 };
 static const int kNewsLineCount = (int)(sizeof(kNewsLines) / sizeof(kNewsLines[0]));
 

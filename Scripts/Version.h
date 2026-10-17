@@ -20,9 +20,9 @@
 // still being worked on. See the note on SelectedIntegrity in UpdaterApp/Launcher.cpp.
 #define MC_VERSION_MAJOR 4
 #define MC_VERSION_MINOR 0
-#define MC_VERSION_PATCH 0
+#define MC_VERSION_PATCH 1
 
-#define MC_VERSION_STRING "4.0.0"
+#define MC_VERSION_STRING "4.0.1"
 
 // The string the title screen draws. Literal concatenation, so it stays a compile-time constant and
 // costs nothing to build at runtime.

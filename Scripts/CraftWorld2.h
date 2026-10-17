@@ -731,7 +731,7 @@ public:
 
     bool IsSpawnEgg(int itemId);
     bool SpawnFromEgg(int itemId, float x, float y, float z);
-    // cow / sheep / pig / chicken / zombie / creeper / spider / skeleton.
+    // cow / sheep / pig / chicken / zombie / creeper / spider / skeleton / villager.
     // Returns the new mob, or NULL if the name is unknown. Does not pose-lock; the caller does.
     LameMob* SpawnMobByName(const char* name, float x, float y, float z);
 

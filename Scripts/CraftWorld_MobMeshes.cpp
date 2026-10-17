@@ -5691,8 +5691,9 @@ void CraftWorld::buildmobVerts()
     iVertex += 4;
     points += 6;
 
-    // -Z  (ModelBox right 8x8)
-    left = textureXpixel*32;
+    // -Z  (ModelBox right 8x8). These two side tiles were swapped: 32 is the
+    // left of the unwrap and 48 is the right, so the head's cheeks were mirrored.
+    left = textureXpixel*48;
     right = left + textureXpixel*8;
     down = textureYpixel*12;
     up = down + textureYpixel*8;
@@ -5712,7 +5713,7 @@ void CraftWorld::buildmobVerts()
     points += 6;
 
     // +Z  (ModelBox left 8x8)
-    left = textureXpixel*48;
+    left = textureXpixel*32;
     right = left + textureXpixel*8;
     down = textureYpixel*12;
     up = down + textureYpixel*8;
@@ -6464,4 +6465,6 @@ void CraftWorld::buildmobVerts()
         delete mTriangle[aa];
     }
     mTriangle.clear();
+
+
 }

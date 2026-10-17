@@ -9872,12 +9872,12 @@ static void InitPistonHead(BaseBlock& b, bool sticky)
 	b.leftPlane_x = 15;  b.leftPlane_y = 3;
 	b.rightPlane_x = 15; b.rightPlane_y = 3;
 
-	// The plate's back face -- the ring of it that would be left visible around the rod -- takes the
-	// same head tile as its front, which is what vanilla's extension does and what `botPlane` cannot
-	// mean for a model this one does not share with the base. The rod's own flanks come out of
-	// `piston_side`'s arm band, which is why the side fields above point at the same cell: the mesher
-	// reads one of them for the flanks and ignores the rest.
-	b.botPlane_x = 15;   b.botPlane_y = sticky ? 2 : 1;
+	// The plate's back face -- the ring of it that would be left visible around the rod -- is the
+	// ordinary head tile even on a sticky piston. Vanilla puts slime on the push face only; the
+	// inner face stays piston_head. The mesher reads `forPlane` for the front and `botPlane` for
+	// that back cap, so they must be allowed to differ. The rod's own flanks come out of
+	// `piston_side`'s arm band, which is why the side fields above point at the same cell.
+	b.botPlane_x = 15;   b.botPlane_y = 1;
 
 	b.editable = true;
 	b.blockModel = 18;

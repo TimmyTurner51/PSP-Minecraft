@@ -11082,6 +11082,7 @@ void StatePlayCreative::Draw(StateManager* sManager)
         }
     }
 
+
     /// SPIDERS. The survival block, copied: the class owns the eight-legged walk, the wall climb and
     /// the melee kick, so the loop only feeds it the player and the frame time. The two states fork
     /// gameplay and their mob blocks are duplicated by design.

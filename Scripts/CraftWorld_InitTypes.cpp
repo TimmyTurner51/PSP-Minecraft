@@ -624,4 +624,5 @@ itemTypes.push_back(DebugStick());
 itemTypes.push_back(BowPulling0());
 itemTypes.push_back(BowPulling1());
 itemTypes.push_back(BowPulling2());
+itemTypes.push_back(VillagerSpawnEgg()); // id 425
 }
